@@ -12,4 +12,7 @@
 - Validate wrapper/runtime assumptions explicitly. When this repo launches or orchestrates `pi`, details like argv shape, env inheritance, required flags, and bootstrap discovery should be enforced here rather than assumed.
 - For process-launch contracts, environment is part of the API. Command resolution, args, cwd, env inheritance, and extension wiring must be validated together.
 - For persisted launch contracts, path syntax is not enough. If execution depends on a path existing now, validate it against the real filesystem instead of only checking that it looks absolute.
+- When two artifacts define one runtime, validate both shape and cross-artifact consistency. Independent validation of each side is not enough if they can drift from each other.
+- For bind/create endpoints, validate availability, not just syntax. A path can be absolute and well-formed but still be unusable because the target is already occupied.
 - Lifecycle contracts need chronology checks, not just timestamp format checks. Well-formed timestamps can still describe impossible runtime histories.
+- Treat contract-boundary tickets as hardening work, not ordinary feature work. Start with an edge-case matrix covering shape, presence, filesystem reality, lifecycle state, and chronology, and expect a longer review tail than a normal feature ticket.
