@@ -833,6 +833,29 @@ describe("SubagentManager", () => {
 		}
 	});
 
+	it("fails connected agents that never complete the ready handshake", () => {
+		vi.useFakeTimers();
+		try {
+			const { manager, sidecars, processes } = createManager(
+				["2026-03-11T12:05:40.000Z", "2026-03-11T12:05:45.000Z"],
+				{ connectingTimeoutMs: 5_000 },
+			);
+			expectOk(manager.spawn(makeSpawnRequest("agt_handshake_timeout")));
+			expectOk(sidecars.get("agt_handshake_timeout").connect());
+			expect(sidecars.get("agt_handshake_timeout").sent.map((message) => message.type)).toEqual(["hello"]);
+
+			vi.advanceTimersByTime(5_000);
+
+			const record = expectOk(manager.getRecord("agt_handshake_timeout"));
+			expect(record.state).toBe("failed");
+			expect(record.error?.message).toBe("sidecar did not connect before timeout");
+			expect(processes.get("agt_handshake_timeout").terminateReasons).toEqual(["shutdown"]);
+			expect(sidecars.get("agt_handshake_timeout").closeCount).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("marks pre-ready disconnects and unexpected exits as failures", () => {
 		const first = createManager([
 			"2026-03-11T12:06:00.000Z",

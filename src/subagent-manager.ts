@@ -328,7 +328,6 @@ export class SubagentManager<TData = unknown> {
 			return fail(`failed to send hello: ${this.describeError(error)}`);
 		}
 
-		this.clearConnectingTimeout(runtime);
 		runtime.lastOutboundSeq = helloResult.value.seq;
 		runtime.lastHello = helloResult.value as SidecarControlMessage<TData> & { type: "hello" };
 		runtime.connectionOpen = true;
@@ -902,7 +901,7 @@ export class SubagentManager<TData = unknown> {
 		const runtime = runtimeResult.value;
 		this.clearConnectingTimeout(runtime);
 
-		if (runtime.connectionOpen || runtime.record.state !== "connecting" || this.isTerminal(runtime.record.state)) {
+		if (runtime.record.state !== "connecting" || this.isTerminal(runtime.record.state)) {
 			return ok(cloneValue(runtime.record));
 		}
 
