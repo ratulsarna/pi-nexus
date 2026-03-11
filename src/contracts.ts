@@ -562,6 +562,13 @@ function validateRequiredText(field: string, value: unknown): ValidationError | 
 	return undefined;
 }
 
+function validateNonNegativeSafeInteger(field: string, value: unknown): ValidationError | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
+		return fail(`${field} must be a non-negative safe integer`);
+	}
+	return undefined;
+}
+
 export function validateRuntimeBootstrapConfig(input: unknown): ValidationOutcome<RuntimeBootstrapConfig> {
 	if (!isRecord(input)) {
 		return fail("bootstrap config must be an object");
@@ -1112,9 +1119,8 @@ export function validateSidecarProtocolEnvelope<TData = unknown>(
 		return fail(`sidecar envelope type must be one of: ${SIDECAR_MESSAGE_KINDS.join(", ")}`);
 	}
 
-	if (typeof input.seq !== "number" || !Number.isSafeInteger(input.seq) || input.seq < 0) {
-		return fail("sidecar envelope seq must be a non-negative safe integer");
-	}
+	const seqError = validateNonNegativeSafeInteger("sidecar envelope seq", input.seq);
+	if (seqError) return seqError;
 
 	if (typeof input.time !== "string" || !isIsoTimestamp(input.time)) {
 		return fail("sidecar envelope time must be an ISO timestamp");
@@ -1197,6 +1203,30 @@ export function validateSidecarHandshake(
 	if (readyIdentityError) return readyIdentityError;
 
 	return ok({ hello, ready });
+}
+
+export function validateMonotonicSeqAcceptance(seq: unknown, lastAcceptedSeq?: unknown): ValidationOutcome<number> {
+	const seqError = validateNonNegativeSafeInteger("seq", seq);
+	if (seqError) return seqError;
+
+	const normalizedSeq = seq as number;
+
+	if (lastAcceptedSeq === undefined) {
+		return ok(normalizedSeq);
+	}
+
+	const lastAcceptedSeqError = validateNonNegativeSafeInteger("lastAcceptedSeq", lastAcceptedSeq);
+	if (lastAcceptedSeqError) return lastAcceptedSeqError;
+
+	const normalizedLastAcceptedSeq = lastAcceptedSeq as number;
+	if (normalizedSeq === normalizedLastAcceptedSeq) {
+		return fail("seq must be greater than lastAcceptedSeq (duplicate seq)");
+	}
+	if (normalizedSeq < normalizedLastAcceptedSeq) {
+		return fail("seq must be greater than lastAcceptedSeq (stale or out-of-order seq)");
+	}
+
+	return ok(normalizedSeq);
 }
 
 export function shouldEmitUserIntervened(event: ChildInputEvent): boolean {

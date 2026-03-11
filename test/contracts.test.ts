@@ -16,6 +16,7 @@ import {
 	validateRuntimeBootstrapConfig,
 	validateRuntimeLaunchSpec,
 	validateSidecarHandshake,
+	validateMonotonicSeqAcceptance,
 	validateSidecarProtocolEnvelope,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
@@ -1688,6 +1689,62 @@ describe("sidecar handshake validation", () => {
 		expect(validateSidecarHandshake(helloEnvelope, readyEnvelope, expectedIdentity)).toEqual({
 			ok: false,
 			error: expectedError,
+		});
+	});
+});
+
+describe("delivery ordering seq acceptance", () => {
+	it.each([
+		["negative", -1],
+		["fractional", 3.14],
+		["infinite", Number.POSITIVE_INFINITY],
+		["string", "12"],
+		["null", null],
+	])("rejects malformed %s seq values", (_scenario, seq) => {
+		expect(validateMonotonicSeqAcceptance(seq)).toEqual({
+			ok: false,
+			error: "seq must be a non-negative safe integer",
+		});
+	});
+
+	it("rejects malformed lastAcceptedSeq values", () => {
+		expect(validateMonotonicSeqAcceptance(3, "2")).toEqual({
+			ok: false,
+			error: "lastAcceptedSeq must be a non-negative safe integer",
+		});
+	});
+
+	it("accepts first delivery when no lastAcceptedSeq is recorded", () => {
+		expect(validateMonotonicSeqAcceptance(0)).toEqual({
+			ok: true,
+			value: 0,
+		});
+	});
+
+	it("rejects duplicate seq values", () => {
+		expect(validateMonotonicSeqAcceptance(12, 12)).toEqual({
+			ok: false,
+			error: "seq must be greater than lastAcceptedSeq (duplicate seq)",
+		});
+	});
+
+	it.each([
+		["stale", 11, 12],
+		["out-of-order", 7, 12],
+	])("rejects %s seq values", (_scenario, seq, lastAcceptedSeq) => {
+		expect(validateMonotonicSeqAcceptance(seq, lastAcceptedSeq)).toEqual({
+			ok: false,
+			error: "seq must be greater than lastAcceptedSeq (stale or out-of-order seq)",
+		});
+	});
+
+	it.each([
+		[13, 12],
+		[42, 12],
+	])("accepts increasing seq values (%d after %d)", (seq, lastAcceptedSeq) => {
+		expect(validateMonotonicSeqAcceptance(seq, lastAcceptedSeq)).toEqual({
+			ok: true,
+			value: seq,
 		});
 	});
 });
