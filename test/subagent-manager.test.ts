@@ -533,6 +533,61 @@ describe("SubagentManager", () => {
 		).toBe(false);
 	});
 
+	it("accepts final_result directly from ready and after completed state while the record is still ready", () => {
+		const direct = createManager([
+			"2026-03-11T12:03:20.000Z",
+			"2026-03-11T12:03:21.000Z",
+		]);
+		const directRequest = makeSpawnRequest("agt_ready_final_result");
+		expectOk(direct.manager.spawn(directRequest));
+		expectOk(direct.sidecars.get("agt_ready_final_result").connect());
+		expectOk(direct.sidecars.get("agt_ready_final_result").message(
+			makeEnvelope("agt_ready_final_result", "ready", 0, "2026-03-11T12:03:22.000Z", {
+				pid: 9103,
+				sessionPath: directRequest.launchSpec.sessionPath,
+				tmuxTarget: directRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(direct.sidecars.get("agt_ready_final_result").message(
+			makeEnvelope("agt_ready_final_result", "final_result", 1, "2026-03-11T12:03:23.000Z", {
+				summary: "done straight from ready",
+				data: null,
+			}),
+		));
+		const directRecord = expectOk(direct.manager.getRecord("agt_ready_final_result"));
+		expect(directRecord.state).toBe("completed");
+		expect(directRecord.finalResult?.summary).toBe("done straight from ready");
+
+		const late = createManager([
+			"2026-03-11T12:03:30.000Z",
+			"2026-03-11T12:03:31.000Z",
+		]);
+		const lateRequest = makeSpawnRequest("agt_ready_completed_then_result");
+		expectOk(late.manager.spawn(lateRequest));
+		expectOk(late.sidecars.get("agt_ready_completed_then_result").connect());
+		expectOk(late.sidecars.get("agt_ready_completed_then_result").message(
+			makeEnvelope("agt_ready_completed_then_result", "ready", 0, "2026-03-11T12:03:32.000Z", {
+				pid: 9104,
+				sessionPath: lateRequest.launchSpec.sessionPath,
+				tmuxTarget: lateRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(late.sidecars.get("agt_ready_completed_then_result").message(
+			makeEnvelope("agt_ready_completed_then_result", "state", 1, "2026-03-11T12:03:33.000Z", {
+				status: "completed",
+			}),
+		));
+		expectOk(late.sidecars.get("agt_ready_completed_then_result").message(
+			makeEnvelope("agt_ready_completed_then_result", "final_result", 2, "2026-03-11T12:03:34.000Z", {
+				summary: "done after completed state",
+				data: null,
+			}),
+		));
+		const lateRecord = expectOk(late.manager.getRecord("agt_ready_completed_then_result"));
+		expect(lateRecord.state).toBe("completed");
+		expect(lateRecord.finalResult?.summary).toBe("done after completed state");
+	});
+
 	it("ignores duplicate and stale child seq values without mutating authoritative state", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:04:00.000Z",
@@ -830,6 +885,36 @@ describe("SubagentManager", () => {
 				}),
 			).ok,
 		).toBe(false);
+	});
+
+	it("does not persist terminal child state when a terminal state event is rejected", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:05:06.000Z",
+			"2026-03-11T12:05:07.000Z",
+			"2026-03-11T12:05:09.000Z",
+		]);
+		const request = makeSpawnRequest("agt_rejected_terminal_state");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_rejected_terminal_state").connect());
+		expectOk(sidecars.get("agt_rejected_terminal_state").message(
+			makeEnvelope("agt_rejected_terminal_state", "ready", 0, "2026-03-11T12:05:08.000Z", {
+				pid: 1358,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+
+		const rejected = sidecars.get("agt_rejected_terminal_state").message(
+			makeEnvelope("agt_rejected_terminal_state", "state", 1, "2026-03-11T12:05:07.500Z", {
+				status: "stopped",
+			}),
+		);
+		expect(rejected.ok).toBe(false);
+
+		expectOk(sidecars.get("agt_rejected_terminal_state").disconnect("lost socket"));
+		const record = expectOk(manager.getRecord("agt_rejected_terminal_state"));
+		expect(record.state).toBe("degraded");
+		expect(record.degradedAt).toBe("2026-03-11T12:05:09.000Z");
 	});
 
 	it("clears degradedAt when degraded agents later fail or stop", () => {

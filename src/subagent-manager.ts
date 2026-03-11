@@ -662,6 +662,10 @@ export class SubagentManager<TData = unknown> {
 		const cloneableDataResult = ensureCloneable(reportResult.value.data ?? null, "final_result.data");
 		if (!cloneableDataResult.ok) return cloneableDataResult;
 
+		const currentState =
+			runtime.record.state === "ready" && !runtime.record.finalResult
+				? ("running" as RuntimeState)
+				: runtime.record.state;
 		const nextState: RuntimeState = "completed";
 		const nextRecord = {
 			...runtime.record,
@@ -675,7 +679,14 @@ export class SubagentManager<TData = unknown> {
 			),
 			pendingInputRequest: undefined,
 		};
-		const normalizedResult = this.normalizeWithTransition(runtime.record, nextState, nextRecord);
+		const normalizedResult =
+			currentState === runtime.record.state
+				? this.normalizeWithTransition(runtime.record, nextState, nextRecord)
+				: this.normalizeWithTransition(
+					{ ...runtime.record, state: currentState },
+					nextState,
+					nextRecord,
+				);
 		if (!normalizedResult.ok) return normalizedResult;
 
 		runtime.record = normalizedResult.value;
@@ -720,10 +731,9 @@ export class SubagentManager<TData = unknown> {
 			return ok(cloneValue(runtime.record));
 		}
 
-		runtime.lastReportedState = event.payload.status;
-
 		switch (event.payload.status) {
 			case "starting":
+				runtime.lastReportedState = event.payload.status;
 				return ok(cloneValue(runtime.record));
 			case "running":
 			case "waiting": {
@@ -736,6 +746,7 @@ export class SubagentManager<TData = unknown> {
 				if (!normalizedResult.ok) return normalizedResult;
 
 				runtime.record = normalizedResult.value;
+				runtime.lastReportedState = event.payload.status;
 				return ok(cloneValue(runtime.record));
 			}
 			case "failed": {
@@ -752,6 +763,7 @@ export class SubagentManager<TData = unknown> {
 				if (!normalizedResult.ok) return normalizedResult;
 
 				runtime.record = normalizedResult.value;
+				runtime.lastReportedState = event.payload.status;
 				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
 			}
@@ -762,10 +774,12 @@ export class SubagentManager<TData = unknown> {
 				if (!normalizedResult.ok) return normalizedResult;
 
 				runtime.record = normalizedResult.value;
+				runtime.lastReportedState = event.payload.status;
 				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
 			}
 			case "completed":
+				runtime.lastReportedState = event.payload.status;
 				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
 		}
