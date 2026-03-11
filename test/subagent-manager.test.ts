@@ -188,7 +188,12 @@ function makeEnvelope(
 	};
 }
 
-function createManager(times: string[]) {
+function createManager(
+	times: string[],
+	options: {
+		throwOnSessionOpened?: boolean;
+	} = {},
+) {
 	const sidecars = new FakeSidecarSessions();
 	const processes = new FakeProcesses();
 	const clock = createTimeCursor(...times);
@@ -202,6 +207,9 @@ function createManager(times: string[]) {
 		},
 		runtimeProcesses: processes,
 		onSessionOpened(agentId, handle) {
+			if (options.throwOnSessionOpened) {
+				throw new Error("session registration exploded");
+			}
 			sidecars.register(agentId, handle);
 		},
 	});
@@ -535,6 +543,52 @@ describe("SubagentManager", () => {
 		).toBe(false);
 	});
 
+	it("clears degradedAt when degraded agents later fail or stop", () => {
+		const first = createManager([
+			"2026-03-11T12:05:10.000Z",
+			"2026-03-11T12:05:11.000Z",
+			"2026-03-11T12:05:14.000Z",
+			"2026-03-11T12:05:15.000Z",
+		]);
+		const firstRequest = makeSpawnRequest("agt_degraded_fail");
+		expectOk(first.manager.spawn(firstRequest));
+		expectOk(first.sidecars.get("agt_degraded_fail").connect());
+		expectOk(first.sidecars.get("agt_degraded_fail").message(
+			makeEnvelope("agt_degraded_fail", "ready", 0, "2026-03-11T12:05:12.000Z", {
+				pid: 1111,
+				sessionPath: firstRequest.launchSpec.sessionPath,
+				tmuxTarget: firstRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(first.sidecars.get("agt_degraded_fail").disconnect("lost trust"));
+		expectOk(first.processes.get("agt_degraded_fail").exit({ code: 1, signal: null }));
+		const failedRecord = expectOk(first.manager.getRecord("agt_degraded_fail"));
+		expect(failedRecord.state).toBe("failed");
+		expect(failedRecord.degradedAt).toBeUndefined();
+
+		const second = createManager([
+			"2026-03-11T12:05:20.000Z",
+			"2026-03-11T12:05:21.000Z",
+			"2026-03-11T12:05:24.000Z",
+			"2026-03-11T12:05:25.000Z",
+		]);
+		const secondRequest = makeSpawnRequest("agt_degraded_stop");
+		expectOk(second.manager.spawn(secondRequest));
+		expectOk(second.sidecars.get("agt_degraded_stop").connect());
+		expectOk(second.sidecars.get("agt_degraded_stop").message(
+			makeEnvelope("agt_degraded_stop", "ready", 0, "2026-03-11T12:05:22.000Z", {
+				pid: 2222,
+				sessionPath: secondRequest.launchSpec.sessionPath,
+				tmuxTarget: secondRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(second.sidecars.get("agt_degraded_stop").disconnect("lost trust"));
+		expectOk(second.manager.shutdownAll());
+		const stoppedRecord = expectOk(second.manager.getRecord("agt_degraded_stop"));
+		expect(stoppedRecord.state).toBe("stopped");
+		expect(stoppedRecord.degradedAt).toBeUndefined();
+	});
+
 	it("marks pre-ready disconnects and unexpected exits as failures", () => {
 		const first = createManager([
 			"2026-03-11T12:06:00.000Z",
@@ -553,6 +607,22 @@ describe("SubagentManager", () => {
 		expectOk(second.processes.get("agt_fail_exit").exit({ code: 1, signal: null }));
 		expect(expectOk(second.manager.getRecord("agt_fail_exit")).state).toBe("failed");
 		expect(expectOk(second.manager.getRecord("agt_fail_exit")).error?.message).toContain("exited");
+	});
+
+	it("returns a validation error and cleans up when onSessionOpened throws", () => {
+		const { manager, processes } = createManager(
+			["2026-03-11T12:06:20.000Z"],
+			{ throwOnSessionOpened: true },
+		);
+		const request = makeSpawnRequest("agt_session_hook");
+		const spawnResult = manager.spawn(request);
+
+		expect(spawnResult.ok).toBe(false);
+		if (!spawnResult.ok) {
+			expect(spawnResult.error).toContain("onSessionOpened failed");
+		}
+		expect(processes.get("agt_session_hook").terminateReasons).toEqual(["shutdown"]);
+		expect(manager.getRecord("agt_session_hook").ok).toBe(false);
 	});
 
 	it("normalizes intentional shutdown to stopped and treats empty cleanup as a no-op", () => {

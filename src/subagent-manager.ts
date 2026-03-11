@@ -221,7 +221,22 @@ export class SubagentManager<TData = unknown> {
 			trusted: false,
 		};
 		this.runtimes.set(launchSpec.agentId, runtime);
-		this.options.onSessionOpened?.(launchSpec.agentId, sidecar);
+		try {
+			this.options.onSessionOpened?.(launchSpec.agentId, sidecar);
+		} catch (error) {
+			this.runtimes.delete(launchSpec.agentId);
+			try {
+				process.terminate("shutdown");
+			} catch {
+				// Best-effort cleanup after session registration failure.
+			}
+			try {
+				sidecar.close();
+			} catch {
+				// Best-effort cleanup after session registration failure.
+			}
+			return fail(`onSessionOpened failed: ${this.describeError(error)}`);
+		}
 
 		return ok(cloneValue(runtime.record));
 	}
@@ -696,6 +711,7 @@ export class SubagentManager<TData = unknown> {
 	): ValidationOutcome<SubagentRecord<TData>> {
 		const nextRecord = {
 			...record,
+			degradedAt: nextState === "degraded" ? record.degradedAt : undefined,
 			...extras,
 			state: nextState,
 		};
