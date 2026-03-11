@@ -103,9 +103,11 @@ SubagentRecord
 - sessionPath
 - createdAt
 - startedAt
+- stoppedAt?
 - completedAt?
 - userIntervenedAt?
 - lastProgressReport?
+- pendingInputRequest?
 - finalReport?
 - error?
 ```

@@ -30,6 +30,7 @@ The child runtime is not:
 ## Launch contract
 
 The parent resolves all runtime inputs before launch and writes them into a bootstrap config file.
+The persisted launch spec must also carry the same initial prompt so validation can detect drift between the saved launch record and the bootstrap file the child will actually read.
 
 Required bootstrap fields:
 
@@ -46,7 +47,7 @@ Required bootstrap fields:
 The parent then launches:
 
 ```text
-<absolute-pi-path> --session <sessionPath> --extension <bootstrapExtensionPath> -- <initialPrompt>
+<absolute-pi-path> --session <sessionPath> --extension <bootstrapExtensionPath>
 ```
 
 And sets:
@@ -56,8 +57,11 @@ PI_SUBAGENT_BOOTSTRAP_CONFIG=<bootstrapConfigPath>
 ```
 
 The child environment inherits the parent process environment and adds `PI_SUBAGENT_BOOTSTRAP_CONFIG=<bootstrapConfigPath>`.
+That inheritance rule applies at creation time. Persisted launch-spec validation checks the serialized env needed to launch, not whether it still exactly matches the validator's current process environment after a restart.
 
-The bootstrap extension reads that env var to discover the config file containing `agentId`, `socketPath`, and tmux metadata.
+The bootstrap extension reads that env var to discover the config file containing `agentId`, `socketPath`, tmux metadata, and the initial prompt.
+
+V1 does not rely on positional argv for `initialPrompt`. The real `pi-mono` parser does not support `--` as a general end-of-options transport for arbitrary startup text, so the initial prompt must be injected by the bootstrap extension after startup using the bootstrap config as the source of truth.
 
 V1 child mode is always:
 
@@ -112,6 +116,8 @@ Rules:
 
 - `summary` must be non-empty after trim
 - `data` is optional and may be `null`
+- reports are not accepted while the child is still `starting` or `connecting`
+- reports are not accepted once the runtime is `degraded`
 - `final_result` is terminal and may be sent once only
 - after terminal completion, later reports are ignored or treated as violations by the parent
 
@@ -190,6 +196,7 @@ The parent-side record is the source of truth for:
 
 - lifecycle state
 - latest explicit progress report
+- latest explicit needs-input request
 - final result
 - user intervention metadata
 

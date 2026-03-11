@@ -1,4 +1,4 @@
-# pi-subagents-tmux
+# pi-nexus
 
 ## Learning
 
