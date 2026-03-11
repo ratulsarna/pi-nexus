@@ -304,6 +304,19 @@ describe("SubagentManager", () => {
 		expect(expectOk(manager.getRecord("agt_spawn")).connectedAt).toBeUndefined();
 	});
 
+	it("rejects malformed spawn input without throwing", () => {
+		const { manager } = createManager(["2026-03-11T11:59:59.000Z"]);
+
+		expect(manager.spawn(null as unknown as ManagedSubagentSpawnRequest)).toEqual({
+			ok: false,
+			error: "spawn request must be an object",
+		});
+		expect(manager.spawn("bad" as unknown as ManagedSubagentSpawnRequest)).toEqual({
+			ok: false,
+			error: "spawn request must be an object",
+		});
+	});
+
 	it("requires a valid ready handshake before trusting progress", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:01:00.000Z",
@@ -772,6 +785,61 @@ describe("SubagentManager", () => {
 
 		const emptyManager = createManager(["2026-03-11T12:07:10.000Z"]).manager;
 		expect(expectOk(emptyManager.shutdownAll())).toEqual([]);
+	});
+
+	it("still terminates and closes terminal runtimes during shutdownAll", () => {
+		const completed = createManager([
+			"2026-03-11T12:07:20.000Z",
+			"2026-03-11T12:07:21.000Z",
+		]);
+		const completedRequest = makeSpawnRequest("agt_shutdown_completed");
+		expectOk(completed.manager.spawn(completedRequest));
+		expectOk(completed.sidecars.get("agt_shutdown_completed").connect());
+		expectOk(completed.sidecars.get("agt_shutdown_completed").message(
+			makeEnvelope("agt_shutdown_completed", "ready", 0, "2026-03-11T12:07:22.000Z", {
+				pid: 4444,
+				sessionPath: completedRequest.launchSpec.sessionPath,
+				tmuxTarget: completedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(completed.sidecars.get("agt_shutdown_completed").message(
+			makeEnvelope("agt_shutdown_completed", "progress", 1, "2026-03-11T12:07:23.000Z", {
+				summary: "done",
+			}),
+		));
+		expectOk(completed.sidecars.get("agt_shutdown_completed").message(
+			makeEnvelope("agt_shutdown_completed", "final_result", 2, "2026-03-11T12:07:24.000Z", {
+				summary: "finished",
+				data: null,
+			}),
+		));
+
+		const failed = createManager([
+			"2026-03-11T12:07:30.000Z",
+			"2026-03-11T12:07:33.000Z",
+		]);
+		const failedRequest = makeSpawnRequest("agt_shutdown_failed");
+		expectOk(failed.manager.spawn(failedRequest));
+		expectOk(failed.sidecars.get("agt_shutdown_failed").connect());
+		expectOk(failed.sidecars.get("agt_shutdown_failed").message(
+			makeEnvelope("agt_shutdown_failed", "ready", 0, "2026-03-11T12:07:32.000Z", {
+				pid: 5555,
+				sessionPath: failedRequest.launchSpec.sessionPath,
+				tmuxTarget: failedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(failed.processes.get("agt_shutdown_failed").exit({ code: 1, signal: null }));
+
+		expectOk(completed.manager.shutdownAll());
+		expectOk(failed.manager.shutdownAll());
+
+		expect(completed.processes.get("agt_shutdown_completed").terminateReasons).toEqual(["shutdown"]);
+		expect(completed.sidecars.get("agt_shutdown_completed").closeCount).toBe(1);
+		expect(expectOk(completed.manager.getRecord("agt_shutdown_completed")).state).toBe("completed");
+
+		expect(failed.processes.get("agt_shutdown_failed").terminateReasons).toEqual(["shutdown"]);
+		expect(failed.sidecars.get("agt_shutdown_failed").closeCount).toBe(1);
+		expect(expectOk(failed.manager.getRecord("agt_shutdown_failed")).state).toBe("failed");
 	});
 
 	it("fails deterministically for unknown agent activity", () => {

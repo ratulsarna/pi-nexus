@@ -92,6 +92,10 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function cloneValue<T>(value: T): T {
 	return structuredClone(value);
 }
@@ -152,6 +156,9 @@ export class SubagentManager<TData = unknown> {
 	}
 
 	public spawn(request: ManagedSubagentSpawnRequest): ValidationOutcome<SubagentRecord<TData>> {
+		if (!isRecord(request)) {
+			return fail("spawn request must be an object");
+		}
 		if (!isNonEmptyTrimmedString(request.type)) {
 			return fail("spawn request type must be a non-empty string");
 		}
@@ -418,18 +425,6 @@ export class SubagentManager<TData = unknown> {
 		const stoppedRecords: SubagentRecord<TData>[] = [];
 
 		for (const runtime of this.runtimes.values()) {
-			if (this.isTerminal(runtime.record.state)) {
-				stoppedRecords.push(cloneValue(runtime.record));
-				continue;
-			}
-
-			const stoppedResult = this.transitionRecord(runtime.record, "stopped", { stoppedAt });
-			if (!stoppedResult.ok) return stoppedResult;
-
-			runtime.record = stoppedResult.value;
-			runtime.connectionOpen = false;
-			runtime.trusted = false;
-
 			try {
 				runtime.process.terminate("shutdown");
 			} catch {
@@ -441,6 +436,20 @@ export class SubagentManager<TData = unknown> {
 			} catch {
 				// Best-effort shutdown.
 			}
+
+			if (this.isTerminal(runtime.record.state)) {
+				runtime.connectionOpen = false;
+				runtime.trusted = false;
+				stoppedRecords.push(cloneValue(runtime.record));
+				continue;
+			}
+
+			const stoppedResult = this.transitionRecord(runtime.record, "stopped", { stoppedAt });
+			if (!stoppedResult.ok) return stoppedResult;
+
+			runtime.record = stoppedResult.value;
+			runtime.connectionOpen = false;
+			runtime.trusted = false;
 
 			stoppedRecords.push(cloneValue(runtime.record));
 		}
