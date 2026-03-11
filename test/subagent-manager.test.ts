@@ -708,6 +708,30 @@ describe("SubagentManager", () => {
 		const completedRecord = expectOk(completed.manager.getRecord("agt_state_completed"));
 		expect(completedRecord.state).toBe("stopped");
 		expect(completedRecord.error).toBeUndefined();
+
+		const completedFailure = createManager([
+			"2026-03-11T12:05:10.000Z",
+			"2026-03-11T12:05:14.000Z",
+		]);
+		const completedFailureRequest = makeSpawnRequest("agt_state_completed_fail");
+		expectOk(completedFailure.manager.spawn(completedFailureRequest));
+		expectOk(completedFailure.sidecars.get("agt_state_completed_fail").connect());
+		expectOk(completedFailure.sidecars.get("agt_state_completed_fail").message(
+			makeEnvelope("agt_state_completed_fail", "ready", 0, "2026-03-11T12:05:12.000Z", {
+				pid: 1115,
+				sessionPath: completedFailureRequest.launchSpec.sessionPath,
+				tmuxTarget: completedFailureRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(completedFailure.sidecars.get("agt_state_completed_fail").message(
+			makeEnvelope("agt_state_completed_fail", "state", 1, "2026-03-11T12:05:13.000Z", {
+				status: "completed",
+			}),
+		));
+		expectOk(completedFailure.processes.get("agt_state_completed_fail").exit({ code: 1, signal: null }));
+		const completedFailureRecord = expectOk(completedFailure.manager.getRecord("agt_state_completed_fail"));
+		expect(completedFailureRecord.state).toBe("failed");
+		expect(completedFailureRecord.error?.message).toContain("code 1");
 	});
 
 	it("marks a ready agent degraded on disconnect and rejects further trusted controls", () => {

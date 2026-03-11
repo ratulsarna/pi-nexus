@@ -398,7 +398,11 @@ export class SubagentManager<TData = unknown> {
 			return ok(cloneValue(runtime.record));
 		}
 
-		if (runtime.lastReportedState === "completed") {
+		if (
+			runtime.lastReportedState === "completed"
+			&& exitResult.value.code === 0
+			&& exitResult.value.signal === null
+		) {
 			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
 				stoppedAt: this.now(),
 			});
