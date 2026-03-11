@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, beforeAll, afterAll } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
 	createRuntimeLaunchSpec,
@@ -220,6 +220,7 @@ function makeEnvelope(
 function createManager(
 	times: string[],
 	options: {
+		connectingTimeoutMs?: number;
 		throwOnSessionOpened?: boolean;
 		fireConnectOnOpen?: boolean;
 		fireExitOnLaunch?: ManagedProcessExit;
@@ -235,6 +236,7 @@ function createManager(
 	});
 	const clock = createTimeCursor(...times);
 	const manager = new SubagentManager({
+		connectingTimeoutMs: options.connectingTimeoutMs,
 		now: () => clock.next(),
 		sidecarSessions: {
 			openSession(socketPath, handlers) {
@@ -487,7 +489,7 @@ describe("SubagentManager", () => {
 		expect(expectOk(manager.getRecord("agt_events")).finalResult?.summary).toBe("all done");
 	});
 
-	it("rejects duplicate and stale child seq values without mutating authoritative state", () => {
+	it("ignores duplicate and stale child seq values without mutating authoritative state", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:04:00.000Z",
 			"2026-03-11T12:04:01.000Z",
@@ -508,6 +510,7 @@ describe("SubagentManager", () => {
 				summary: "first",
 			}),
 		));
+		const before = expectOk(manager.getRecord("agt_seq"));
 		const duplicate = sidecars.get("agt_seq").message(
 			makeEnvelope("agt_seq", "progress", 1, "2026-03-11T12:04:04.000Z", {
 				summary: "duplicate",
@@ -519,9 +522,9 @@ describe("SubagentManager", () => {
 			}),
 		);
 
-		expect(duplicate.ok).toBe(false);
-		expect(stale.ok).toBe(false);
-		expect(expectOk(manager.getRecord("agt_seq")).lastProgressReport?.summary).toBe("first");
+		expect(duplicate).toEqual({ ok: true, value: before });
+		expect(stale).toEqual({ ok: true, value: before });
+		expect(expectOk(manager.getRecord("agt_seq"))).toEqual(before);
 	});
 
 	it("rejects malformed inbound child traffic without mutating authoritative state", () => {
@@ -807,6 +810,27 @@ describe("SubagentManager", () => {
 		const stoppedRecord = expectOk(second.manager.getRecord("agt_degraded_stop"));
 		expect(stoppedRecord.state).toBe("stopped");
 		expect(stoppedRecord.degradedAt).toBeUndefined();
+	});
+
+	it("fails connecting agents that never establish a sidecar session", () => {
+		vi.useFakeTimers();
+		try {
+			const { manager, sidecars, processes } = createManager(
+				["2026-03-11T12:05:30.000Z", "2026-03-11T12:05:35.000Z"],
+				{ connectingTimeoutMs: 5_000 },
+			);
+			expectOk(manager.spawn(makeSpawnRequest("agt_connect_timeout")));
+
+			vi.advanceTimersByTime(5_000);
+
+			const record = expectOk(manager.getRecord("agt_connect_timeout"));
+			expect(record.state).toBe("failed");
+			expect(record.error?.message).toBe("sidecar did not connect before timeout");
+			expect(processes.get("agt_connect_timeout").terminateReasons).toEqual(["shutdown"]);
+			expect(sidecars.get("agt_connect_timeout").closeCount).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("marks pre-ready disconnects and unexpected exits as failures", () => {

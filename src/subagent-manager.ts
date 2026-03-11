@@ -61,6 +61,7 @@ export interface SubagentProcessAdapter {
 }
 
 export interface SubagentManagerOptions<TData = unknown> {
+	connectingTimeoutMs?: number;
 	now?: () => string;
 	sidecarSessions: SidecarSessionAdapter<TData>;
 	runtimeProcesses: SubagentProcessAdapter;
@@ -76,6 +77,7 @@ interface ManagedRuntime<TData = unknown> {
 	lastOutboundSeq?: number;
 	lastHello?: SidecarControlMessage<TData> & { type: "hello" };
 	connectionOpen: boolean;
+	connectingTimeoutHandle?: ReturnType<typeof setTimeout>;
 	trusted: boolean;
 	lastReportedState?: SidecarStateStatus;
 }
@@ -158,13 +160,17 @@ function stripUndefinedFields(value: Record<string, unknown>): Record<string, un
 export class SubagentManager<TData = unknown> {
 	private readonly runtimes = new Map<string, ManagedRuntime<TData>>();
 
+	private readonly connectingTimeoutMs: number;
+
 	private readonly now: () => string;
 
 	public constructor(private readonly options: SubagentManagerOptions<TData>) {
+		this.connectingTimeoutMs = options.connectingTimeoutMs ?? 30_000;
 		this.now = options.now ?? (() => new Date().toISOString());
 	}
 
 	private cleanupRuntimeRegistration(agentId: string, runtime: ManagedRuntime<TData>): void {
+		this.clearConnectingTimeout(runtime);
 		this.runtimes.delete(agentId);
 		runtime.connectionOpen = false;
 		runtime.trusted = false;
@@ -270,6 +276,7 @@ export class SubagentManager<TData = unknown> {
 		};
 		this.runtimes.set(launchSpec.agentId, runtime);
 		runtimeRegistered = true;
+		this.scheduleConnectingTimeout(launchSpec.agentId, runtime);
 		try {
 			this.options.onSessionOpened?.(launchSpec.agentId, sidecar);
 		} catch (error) {
@@ -321,6 +328,7 @@ export class SubagentManager<TData = unknown> {
 			return fail(`failed to send hello: ${this.describeError(error)}`);
 		}
 
+		this.clearConnectingTimeout(runtime);
 		runtime.lastOutboundSeq = helloResult.value.seq;
 		runtime.lastHello = helloResult.value as SidecarControlMessage<TData> & { type: "hello" };
 		runtime.connectionOpen = true;
@@ -339,6 +347,10 @@ export class SubagentManager<TData = unknown> {
 			return fail(`sidecar event agentId does not match managed agent ${agentId}`);
 		}
 
+		if (runtime.lastInboundSeq !== undefined && event.seq <= runtime.lastInboundSeq) {
+			return ok(cloneValue(runtime.record));
+		}
+
 		const seqResult = validateMonotonicSeqAcceptance(event.seq, runtime.lastInboundSeq);
 		if (!seqResult.ok) return seqResult;
 
@@ -353,6 +365,7 @@ export class SubagentManager<TData = unknown> {
 		const runtimeResult = this.getRuntime(agentId);
 		if (!runtimeResult.ok) return runtimeResult;
 		const runtime = runtimeResult.value;
+		this.clearConnectingTimeout(runtime);
 		runtime.connectionOpen = false;
 		runtime.trusted = false;
 
@@ -394,6 +407,7 @@ export class SubagentManager<TData = unknown> {
 		const exitResult = normalizeProcessExit(exit);
 		if (!exitResult.ok) return exitResult;
 
+		this.clearConnectingTimeout(runtime);
 		if (this.isTerminal(runtime.record.state)) {
 			return ok(cloneValue(runtime.record));
 		}
@@ -450,6 +464,7 @@ export class SubagentManager<TData = unknown> {
 		const stoppedRecords: SubagentRecord<TData>[] = [];
 
 		for (const runtime of this.runtimes.values()) {
+			this.clearConnectingTimeout(runtime);
 			try {
 				runtime.process.terminate("shutdown");
 			} catch {
@@ -532,6 +547,7 @@ export class SubagentManager<TData = unknown> {
 		if (!readyRecordResult.ok) return readyRecordResult;
 
 		runtime.record = readyRecordResult.value;
+		this.clearConnectingTimeout(runtime);
 		runtime.trusted = true;
 		return ok(cloneValue(runtime.record));
 	}
@@ -857,6 +873,62 @@ export class SubagentManager<TData = unknown> {
 
 	private isTerminal(state: RuntimeState): boolean {
 		return state === "completed" || state === "failed" || state === "stopped";
+	}
+
+	private scheduleConnectingTimeout(agentId: string, runtime: ManagedRuntime<TData>): void {
+		if (!Number.isFinite(this.connectingTimeoutMs) || this.connectingTimeoutMs <= 0) {
+			return;
+		}
+
+		const handle = setTimeout(() => {
+			this.failConnectingRuntime(agentId);
+		}, this.connectingTimeoutMs);
+		handle.unref?.();
+		runtime.connectingTimeoutHandle = handle;
+	}
+
+	private clearConnectingTimeout(runtime: ManagedRuntime<TData>): void {
+		if (runtime.connectingTimeoutHandle === undefined) {
+			return;
+		}
+
+		clearTimeout(runtime.connectingTimeoutHandle);
+		runtime.connectingTimeoutHandle = undefined;
+	}
+
+	private failConnectingRuntime(agentId: string): ValidationOutcome<SubagentRecord<TData>> {
+		const runtimeResult = this.getRuntime(agentId);
+		if (!runtimeResult.ok) return runtimeResult;
+		const runtime = runtimeResult.value;
+		this.clearConnectingTimeout(runtime);
+
+		if (runtime.connectionOpen || runtime.record.state !== "connecting" || this.isTerminal(runtime.record.state)) {
+			return ok(cloneValue(runtime.record));
+		}
+
+		const failedResult = this.transitionRecord(runtime.record, "failed", {
+			error: {
+				message: "sidecar did not connect before timeout",
+				recordedAt: this.now(),
+				fatal: true,
+			},
+		});
+		if (!failedResult.ok) return failedResult;
+
+		runtime.record = failedResult.value;
+		runtime.connectionOpen = false;
+		runtime.trusted = false;
+		try {
+			runtime.process.terminate("shutdown");
+		} catch {
+			// Best-effort cleanup after connect timeout.
+		}
+		try {
+			runtime.sidecar.close();
+		} catch {
+			// Best-effort cleanup after connect timeout.
+		}
+		return ok(cloneValue(runtime.record));
 	}
 
 	private describeError(error: unknown): string {
