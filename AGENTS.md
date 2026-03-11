@@ -7,6 +7,11 @@
 - Validators must be total over malformed input. Rejecting bad external data is not enough if the validator can still throw before returning a `ValidationError`.
 - Return normalized typed values after validation. Do not hand unknown-shaped input back to callers just because it passed checks.
 - Terminal state must be monotonic. Once a subagent reaches a terminal outcome, later reports or conflicting record states should be rejected rather than tolerated.
+- Cleanup must be best-effort, even after validation or state-transition failures. Do not let one bad record or normalization error prevent terminating processes, closing sockets, or cleaning up sibling runtimes.
+- Register ownership before enabling re-entrant callbacks, and assume those callbacks may fire synchronously. Parent state should be able to observe connect, exit, or hook callbacks immediately without dropping lifecycle events.
+- Never persist partial lifecycle state from external input before the full event is validated. Rejected messages must not poison later handling by mutating trust, terminal markers, or other control-flow state first.
+- When deriving lifecycle timestamps, anchor them to accepted record chronology rather than raw wall-clock time. New failure, stop, or degrade timestamps must remain monotonic with already-accepted history.
+- Protocol handlers must define duplicate-delivery behavior explicitly. If retransmits or stale sequence numbers are expected, handle them as safe no-ops instead of escalating normal at-least-once delivery into failures.
 - Keep docs, contract helpers, and tests in sync. In this repo, a design is only real once the prose, validation logic, and edge-case tests all agree.
 - Constructors and validators must agree. Helpers that create contract objects should either guarantee validator-compatible output or fail early under the same rules.
 - Validate wrapper/runtime assumptions explicitly. When this repo launches or orchestrates `pi`, details like argv shape, env inheritance, required flags, and bootstrap discovery should be enforced here rather than assumed.
