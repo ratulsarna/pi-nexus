@@ -104,6 +104,14 @@ export interface SidecarHelloPayload {
 	mode: TmuxMode;
 }
 
+export interface SidecarSteerPayload {
+	message: string;
+}
+
+export interface SidecarFollowUpPayload {
+	message: string;
+}
+
 export interface SidecarReadyPayload {
 	pid: number;
 	sessionPath: string;
@@ -151,6 +159,9 @@ export type SidecarEmptyPayload = Record<string, never>;
 
 export interface SidecarPayloadByType<TData = unknown> {
 	hello: SidecarHelloPayload;
+	steer: SidecarSteerPayload;
+	follow_up: SidecarFollowUpPayload;
+	abort: SidecarEmptyPayload;
 	ready: SidecarReadyPayload;
 	progress: SidecarProgressPayload<TData>;
 	final_result: SidecarFinalResultPayload<TData>;
@@ -163,6 +174,7 @@ export interface SidecarPayloadByType<TData = unknown> {
 }
 
 export type SidecarMessageKind = keyof SidecarPayloadByType;
+export type SidecarEventKind = Exclude<SidecarMessageKind, ParentControlKind>;
 
 export interface SidecarEnvelope<TType extends SidecarMessageKind = SidecarMessageKind, TData = unknown> {
 	version: 1;
@@ -177,8 +189,8 @@ export type SidecarProtocolMessage<TData = unknown> = {
 	[TType in SidecarMessageKind]: SidecarEnvelope<TType, TData>;
 }[SidecarMessageKind];
 
-export type SidecarControlMessage = Extract<SidecarProtocolMessage, { type: "hello" | "ping" }>;
-export type SidecarEventMessage = Exclude<SidecarProtocolMessage, SidecarControlMessage>;
+export type SidecarControlMessage<TData = unknown> = Extract<SidecarProtocolMessage<TData>, { type: ParentControlKind }>;
+export type SidecarEventMessage<TData = unknown> = Extract<SidecarProtocolMessage<TData>, { type: SidecarEventKind }>;
 
 export interface SidecarHandshakeIdentity {
 	agentId: string;
@@ -239,8 +251,14 @@ const RUNTIME_STATES = new Set<RuntimeState>([
 	"degraded",
 ]);
 const REPORT_KINDS = new Set<ReportKind>(["progress", "final_result", "needs_input"]);
-const SIDECAR_MESSAGE_KINDS: ReadonlyArray<SidecarMessageKind> = [
+const SIDECAR_CONTROL_MESSAGE_KINDS: ReadonlyArray<ParentControlKind> = [
 	"hello",
+	"steer",
+	"follow_up",
+	"abort",
+	"ping",
+];
+const SIDECAR_EVENT_MESSAGE_KINDS: ReadonlyArray<SidecarEventKind> = [
 	"ready",
 	"progress",
 	"final_result",
@@ -248,10 +266,15 @@ const SIDECAR_MESSAGE_KINDS: ReadonlyArray<SidecarMessageKind> = [
 	"user_intervened",
 	"state",
 	"error",
-	"ping",
 	"pong",
 ];
+const SIDECAR_MESSAGE_KINDS: ReadonlyArray<SidecarMessageKind> = [
+	...SIDECAR_CONTROL_MESSAGE_KINDS,
+	...SIDECAR_EVENT_MESSAGE_KINDS,
+];
 const SIDECAR_MESSAGE_KIND_SET = new Set<SidecarMessageKind>(SIDECAR_MESSAGE_KINDS);
+const SIDECAR_CONTROL_MESSAGE_KIND_SET = new Set<ParentControlKind>(SIDECAR_CONTROL_MESSAGE_KINDS);
+const SIDECAR_EVENT_MESSAGE_KIND_SET = new Set<SidecarEventKind>(SIDECAR_EVENT_MESSAGE_KINDS);
 const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
 	"starting",
 	"running",
@@ -260,7 +283,7 @@ const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
 	"failed",
 	"stopped",
 ]);
-const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["ping", "pong"]);
+const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["abort", "ping", "pong"]);
 const STATES_REQUIRING_CONNECTED_AT = new Set<RuntimeState>([
 	"ready",
 	"running",
@@ -307,6 +330,10 @@ function ok<T>(value: T): ValidationResult<T> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && !Array.isArray(value);
 }
 
 function getParentProcessEnv(): Record<string, string> {
@@ -999,7 +1026,7 @@ function validateSidecarPayload<TData = unknown>(
 	type: SidecarMessageKind,
 	payload: unknown,
 ): ValidationOutcome<SidecarPayloadByType<TData>[SidecarMessageKind]> {
-	if (!isRecord(payload)) {
+	if (!isPlainRecord(payload)) {
 		return fail(`${type}.payload must be an object`);
 	}
 
@@ -1024,6 +1051,15 @@ function validateSidecarPayload<TData = unknown>(
 				sessionPath: payload.sessionPath as string,
 				tmuxTarget: (payload.tmuxTarget as string).trim(),
 				mode: payload.mode,
+			});
+		}
+		case "steer":
+		case "follow_up": {
+			const messageError = validateRequiredText(`${type}.payload.message`, payload.message);
+			if (messageError) return messageError;
+
+			return ok({
+				message: (payload.message as string).trim(),
 			});
 		}
 		case "ready": {
@@ -1097,13 +1133,15 @@ function validateSidecarPayload<TData = unknown>(
 				fatal: payload.fatal,
 			});
 		}
+		default:
+			return fail(`unsupported sidecar message type: ${type}`);
 	}
 }
 
 export function validateSidecarProtocolEnvelope<TData = unknown>(
 	input: unknown,
 ): ValidationOutcome<SidecarProtocolMessage<TData>> {
-	if (!isRecord(input)) {
+	if (!isPlainRecord(input)) {
 		return fail("sidecar envelope must be an object");
 	}
 
@@ -1143,8 +1181,32 @@ export function validateSidecarProtocolEnvelope<TData = unknown>(
 	} as SidecarProtocolMessage<TData>);
 }
 
+export function validateSidecarControlMessage<TData = unknown>(
+	input: unknown,
+): ValidationOutcome<SidecarControlMessage<TData>> {
+	const envelopeResult = validateSidecarProtocolEnvelope<TData>(input);
+	if (!envelopeResult.ok) return envelopeResult;
+	if (!SIDECAR_CONTROL_MESSAGE_KIND_SET.has(envelopeResult.value.type as ParentControlKind)) {
+		return fail(`sidecar control message type must be one of: ${SIDECAR_CONTROL_MESSAGE_KINDS.join(", ")}`);
+	}
+
+	return ok(envelopeResult.value as SidecarControlMessage<TData>);
+}
+
+export function validateSidecarEventMessage<TData = unknown>(
+	input: unknown,
+): ValidationOutcome<SidecarEventMessage<TData>> {
+	const envelopeResult = validateSidecarProtocolEnvelope<TData>(input);
+	if (!envelopeResult.ok) return envelopeResult;
+	if (!SIDECAR_EVENT_MESSAGE_KIND_SET.has(envelopeResult.value.type as SidecarEventKind)) {
+		return fail(`sidecar event message type must be one of: ${SIDECAR_EVENT_MESSAGE_KINDS.join(", ")}`);
+	}
+
+	return ok(envelopeResult.value as SidecarEventMessage<TData>);
+}
+
 function validateSidecarHandshakeIdentity(input: unknown): ValidationOutcome<SidecarHandshakeIdentity> {
-	if (!isRecord(input)) {
+	if (!isPlainRecord(input)) {
 		return fail("handshake identity must be an object");
 	}
 

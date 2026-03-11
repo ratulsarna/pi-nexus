@@ -15,6 +15,8 @@ import {
 	validateReportToParentInput,
 	validateRuntimeBootstrapConfig,
 	validateRuntimeLaunchSpec,
+	validateSidecarControlMessage,
+	validateSidecarEventMessage,
 	validateSidecarHandshake,
 	validateMonotonicSeqAcceptance,
 	validateSidecarProtocolEnvelope,
@@ -1293,6 +1295,19 @@ describe("sidecar protocol envelope", () => {
 				},
 			],
 			[
+				"steer",
+				{
+					message: "Stop searching and summarize the auth flow.",
+				},
+			],
+			[
+				"follow_up",
+				{
+					message: "After that, check tests too.",
+				},
+			],
+			["abort", {}],
+			[
 				"ready",
 				{
 					pid: 12345,
@@ -1392,6 +1407,11 @@ describe("sidecar protocol envelope", () => {
 			error: "sidecar envelope must be an object",
 		});
 
+		expect(validateSidecarProtocolEnvelope([])).toEqual({
+			ok: false,
+			error: "sidecar envelope must be an object",
+		});
+
 		expect(
 			validateSidecarProtocolEnvelope(
 				makeEnvelope({
@@ -1406,12 +1426,12 @@ describe("sidecar protocol envelope", () => {
 		expect(
 			validateSidecarProtocolEnvelope(
 				makeEnvelope({
-					type: "steer",
+					type: "launch",
 				}),
 			),
 		).toEqual({
 			ok: false,
-			error: "sidecar envelope type must be one of: hello, ready, progress, final_result, needs_input, user_intervened, state, error, ping, pong",
+			error: "sidecar envelope type must be one of: hello, steer, follow_up, abort, ping, ready, progress, final_result, needs_input, user_intervened, state, error, pong",
 		});
 
 		expect(
@@ -1446,6 +1466,36 @@ describe("sidecar protocol envelope", () => {
 	});
 
 	it.each([
+		[
+			"steer",
+			makeEnvelope({
+				type: "steer",
+				payload: {
+					message: " ",
+				},
+			}),
+			"steer.payload.message must be a non-empty string",
+		],
+		[
+			"follow_up",
+			makeEnvelope({
+				type: "follow_up",
+				payload: {
+					message: "",
+				},
+			}),
+			"follow_up.payload.message must be a non-empty string",
+		],
+		[
+			"abort",
+			makeEnvelope({
+				type: "abort",
+				payload: {
+					extra: true,
+				},
+			}),
+			"abort.payload must be an empty object",
+		],
 		[
 			"hello",
 			makeEnvelope({
@@ -1557,6 +1607,129 @@ describe("sidecar protocol envelope", () => {
 		expect(validateSidecarProtocolEnvelope(envelope)).toEqual({
 			ok: false,
 			error: expectedError,
+		});
+	});
+
+	it.each([
+		["abort", "abort"],
+		["ping", "ping"],
+		["pong", "pong"],
+	])("rejects array payloads for %s empty-object messages", (_scenario, type) => {
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					type,
+					payload: [],
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: `${type}.payload must be an object`,
+		});
+	});
+});
+
+describe("sidecar direction validation", () => {
+	function makeEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: "agt_123",
+			type: "progress",
+			seq: 12,
+			time: "2026-03-10T10:00:00.000Z",
+			payload: {
+				summary: "Mapped auth flow",
+				data: { files: 2 },
+			},
+			...overrides,
+		};
+	}
+
+	it("accepts documented parent control messages on the control path", () => {
+		for (const [type, payload] of [
+			[
+				"hello",
+				{
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			],
+			["steer", { message: "Steer the child" }],
+			["follow_up", { message: "Follow up after current work" }],
+			["abort", {}],
+			["ping", {}],
+		] as const) {
+			const result = validateSidecarControlMessage(
+				makeEnvelope({
+					type,
+					payload,
+				}),
+			);
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.value.type).toBe(type);
+		}
+	});
+
+	it("rejects event messages on the control path", () => {
+		expect(
+			validateSidecarControlMessage(
+				makeEnvelope({
+					type: "progress",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar control message type must be one of: hello, steer, follow_up, abort, ping",
+		});
+	});
+
+	it("accepts documented child event messages on the event path", () => {
+		for (const [type, payload] of [
+			[
+				"ready",
+				{
+					pid: 12345,
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			],
+			["progress", { summary: "Working", data: null }],
+			["final_result", { summary: "Done", data: { findings: 2 } }],
+			["needs_input", { question: "Proceed?", kind: "decision" }],
+			["user_intervened", { source: "tmux", mode: "direct-chat" }],
+			["state", { status: "running" }],
+			["error", { message: "bridge disconnected", fatal: true }],
+			["pong", {}],
+		] as const) {
+			const result = validateSidecarEventMessage(
+				makeEnvelope({
+					type,
+					payload,
+				}),
+			);
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.value.type).toBe(type);
+		}
+	});
+
+	it("rejects control messages on the event path", () => {
+		expect(
+			validateSidecarEventMessage(
+				makeEnvelope({
+					type: "steer",
+					payload: {
+						message: "Steer the child",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar event message type must be one of: ready, progress, final_result, needs_input, user_intervened, state, error, pong",
 		});
 	});
 });
