@@ -489,6 +489,50 @@ describe("SubagentManager", () => {
 		expect(expectOk(manager.getRecord("agt_events")).finalResult?.summary).toBe("all done");
 	});
 
+	it("accepts final_result after child completion state without reopening later activity", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:03:10.000Z",
+			"2026-03-11T12:03:11.000Z",
+		]);
+		const request = makeSpawnRequest("agt_completed_final_result");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_completed_final_result").connect());
+		expectOk(sidecars.get("agt_completed_final_result").message(
+			makeEnvelope("agt_completed_final_result", "ready", 0, "2026-03-11T12:03:12.000Z", {
+				pid: 9102,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_completed_final_result").message(
+			makeEnvelope("agt_completed_final_result", "state", 1, "2026-03-11T12:03:13.000Z", {
+				status: "running",
+			}),
+		));
+		expectOk(sidecars.get("agt_completed_final_result").message(
+			makeEnvelope("agt_completed_final_result", "state", 2, "2026-03-11T12:03:13.500Z", {
+				status: "completed",
+			}),
+		));
+		expect(manager.sendSteer("agt_completed_final_result", "too late").ok).toBe(false);
+		expectOk(sidecars.get("agt_completed_final_result").message(
+			makeEnvelope("agt_completed_final_result", "final_result", 3, "2026-03-11T12:03:14.000Z", {
+				summary: "authoritative completion",
+				data: { findings: 2 },
+			}),
+		));
+		const record = expectOk(manager.getRecord("agt_completed_final_result"));
+		expect(record.state).toBe("completed");
+		expect(record.finalResult?.summary).toBe("authoritative completion");
+		expect(
+			sidecars.get("agt_completed_final_result").message(
+				makeEnvelope("agt_completed_final_result", "progress", 4, "2026-03-11T12:03:15.000Z", {
+					summary: "too late",
+				}),
+			).ok,
+		).toBe(false);
+	});
+
 	it("ignores duplicate and stale child seq values without mutating authoritative state", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:04:00.000Z",

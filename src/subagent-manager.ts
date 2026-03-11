@@ -644,7 +644,8 @@ export class SubagentManager<TData = unknown> {
 		runtime: ManagedRuntime<TData>,
 		event: Extract<SidecarEventMessage<TData>, { type: "final_result" }>,
 	): ValidationOutcome<SubagentRecord<TData>> {
-		if (!runtime.trusted) {
+		const canAcceptAfterCompletedState = runtime.lastReportedState === "completed" && !runtime.record.finalResult;
+		if (!runtime.trusted && !canAcceptAfterCompletedState) {
 			return fail("cannot accept final_result before handshake is complete");
 		}
 
