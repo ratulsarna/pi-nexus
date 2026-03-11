@@ -659,6 +659,7 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted && !canAcceptAfterCompletedState) {
 			return fail("cannot accept final_result before handshake is complete");
 		}
+		const currentState = this.deriveAuthoritativeCompletionSourceState(runtime.record);
 
 		const reportResult = validateReportToParentInput<TData>(
 			{
@@ -666,22 +667,19 @@ export class SubagentManager<TData = unknown> {
 				summary: event.payload.summary,
 				data: event.payload.data,
 			},
-			runtime.record.state,
+			currentState,
 			Boolean(runtime.record.finalResult),
 		);
 		if (!reportResult.ok) return reportResult;
 		const cloneableDataResult = ensureCloneable(reportResult.value.data ?? null, "final_result.data");
 		if (!cloneableDataResult.ok) return cloneableDataResult;
 
-		const currentState =
-			runtime.record.state === "ready" && !runtime.record.finalResult
-				? ("running" as RuntimeState)
-				: runtime.record.state;
 		const nextState: RuntimeState = "completed";
 		const nextRecord = {
 			...runtime.record,
 			state: nextState,
 			completedAt: event.time,
+			stoppedAt: undefined,
 			finalResult: this.makeReport(
 				"final_result",
 				reportResult.value.summary,
@@ -790,6 +788,9 @@ export class SubagentManager<TData = unknown> {
 				return ok(cloneValue(runtime.record));
 			}
 			case "completed":
+				if (event.time < this.deriveAcceptedRecordTimestamp(runtime.record)) {
+					return fail("completed state time must be on or after accepted record chronology");
+				}
 				runtime.lastReportedState = event.payload.status;
 				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
@@ -929,8 +930,8 @@ export class SubagentManager<TData = unknown> {
 		return state === "completed" || state === "failed" || state === "stopped";
 	}
 
-	private deriveTerminalTimestamp(record: SubagentRecord<TData>): string {
-		let latest = maxIsoTimestamp(this.now(), record.createdAt);
+	private deriveAcceptedRecordTimestamp(record: SubagentRecord<TData>): string {
+		let latest = record.createdAt;
 		const candidates = [
 			record.startedAt,
 			record.connectedAt,
@@ -950,6 +951,17 @@ export class SubagentManager<TData = unknown> {
 		}
 
 		return latest;
+	}
+
+	private deriveTerminalTimestamp(record: SubagentRecord<TData>): string {
+		return maxIsoTimestamp(this.now(), this.deriveAcceptedRecordTimestamp(record));
+	}
+
+	private deriveAuthoritativeCompletionSourceState(record: SubagentRecord<TData>): RuntimeState {
+		if (record.pendingInputRequest) {
+			return "waiting";
+		}
+		return "running";
 	}
 
 	private scheduleConnectingTimeout(agentId: string, runtime: ManagedRuntime<TData>): void {
