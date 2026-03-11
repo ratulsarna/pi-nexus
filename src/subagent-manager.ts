@@ -396,6 +396,16 @@ export class SubagentManager<TData = unknown> {
 		});
 		if (!failedResult.ok) return failedResult;
 		runtime.record = failedResult.value;
+		try {
+			runtime.process.terminate("shutdown");
+		} catch {
+			// Best-effort cleanup after pre-ready sidecar disconnect.
+		}
+		try {
+			runtime.sidecar.close();
+		} catch {
+			// Best-effort cleanup after pre-ready sidecar disconnect.
+		}
 		return ok(cloneValue(runtime.record));
 	}
 
@@ -695,6 +705,10 @@ export class SubagentManager<TData = unknown> {
 			return fail("cannot accept state before handshake is complete");
 		}
 
+		if (this.isTerminalReportedState(runtime.lastReportedState)) {
+			return ok(cloneValue(runtime.record));
+		}
+
 		runtime.lastReportedState = event.payload.status;
 
 		switch (event.payload.status) {
@@ -871,6 +885,10 @@ export class SubagentManager<TData = unknown> {
 	}
 
 	private isTerminal(state: RuntimeState): boolean {
+		return state === "completed" || state === "failed" || state === "stopped";
+	}
+
+	private isTerminalReportedState(state?: SidecarStateStatus): boolean {
 		return state === "completed" || state === "failed" || state === "stopped";
 	}
 

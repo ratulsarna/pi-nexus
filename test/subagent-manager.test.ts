@@ -707,6 +707,13 @@ describe("SubagentManager", () => {
 				status: "completed",
 			}),
 		));
+		const completedBeforeNonTerminal = expectOk(completed.manager.getRecord("agt_state_completed"));
+		expectOk(completed.sidecars.get("agt_state_completed").message(
+			makeEnvelope("agt_state_completed", "state", 2, "2026-03-11T12:05:01.500Z", {
+				status: "running",
+			}),
+		));
+		expect(expectOk(completed.manager.getRecord("agt_state_completed"))).toEqual(completedBeforeNonTerminal);
 		expectOk(completed.processes.get("agt_state_completed").exit({ code: 0, signal: null }));
 		const completedRecord = expectOk(completed.manager.getRecord("agt_state_completed"));
 		expect(completedRecord.state).toBe("stopped");
@@ -865,6 +872,8 @@ describe("SubagentManager", () => {
 		expectOk(first.sidecars.get("agt_fail_disconnect").disconnect("no handshake"));
 		expect(expectOk(first.manager.getRecord("agt_fail_disconnect")).state).toBe("failed");
 		expect(expectOk(first.manager.getRecord("agt_fail_disconnect")).error?.message).toContain("before ready");
+		expect(first.processes.get("agt_fail_disconnect").terminateReasons).toEqual(["shutdown"]);
+		expect(first.sidecars.get("agt_fail_disconnect").closeCount).toBe(1);
 
 		const second = createManager([
 			"2026-03-11T12:06:10.000Z",
