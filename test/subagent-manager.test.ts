@@ -330,6 +330,43 @@ describe("SubagentManager", () => {
 		});
 	});
 
+	it("rejects a socket path already owned by another managed runtime", () => {
+		const { manager } = createManager([
+			"2026-03-11T12:00:10.000Z",
+			"2026-03-11T12:00:11.000Z",
+		]);
+		const first = makeSpawnRequest("agt_socket_one");
+		const second = makeSpawnRequest("agt_socket_two");
+		second.launchSpec = {
+			...second.launchSpec,
+			socketPath: first.launchSpec.socketPath,
+		};
+		fs.writeFileSync(
+			second.launchSpec.bootstrapConfigPath,
+			`${JSON.stringify(
+				{
+					agentId: second.launchSpec.agentId,
+					sessionPath: second.launchSpec.sessionPath,
+					socketPath: second.launchSpec.socketPath,
+					tmuxMode: second.launchSpec.tmuxMode,
+					tmuxTarget: second.launchSpec.tmuxTarget,
+					initialPrompt: second.launchSpec.initialPrompt,
+					bootstrapExtensionPath: second.launchSpec.bootstrapExtensionPath,
+					cwd: second.launchSpec.cwd,
+					childMode: second.launchSpec.childMode,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+
+		expectOk(manager.spawn(first));
+		expect(manager.spawn(second)).toEqual({
+			ok: false,
+			error: "socketPath is already managed by agent agt_socket_one",
+		});
+	});
+
 	it("requires a valid ready handshake before trusting progress", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:01:00.000Z",

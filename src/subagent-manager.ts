@@ -198,6 +198,11 @@ export class SubagentManager<TData = unknown> {
 		if (this.runtimes.has(launchSpec.agentId)) {
 			return fail(`agent is already managed: ${launchSpec.agentId}`);
 		}
+		for (const runtime of this.runtimes.values()) {
+			if (runtime.launchSpec.socketPath === launchSpec.socketPath) {
+				return fail(`socketPath is already managed by agent ${runtime.launchSpec.agentId}`);
+			}
+		}
 
 		const createdAt = this.now();
 		const startingRecordResult = normalizeRecord<TData>({
