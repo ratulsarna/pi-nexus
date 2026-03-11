@@ -15,6 +15,7 @@ import {
 	validateReportToParentInput,
 	validateRuntimeBootstrapConfig,
 	validateRuntimeLaunchSpec,
+	validateSidecarHandshake,
 	validateSidecarProtocolEnvelope,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
@@ -1553,6 +1554,138 @@ describe("sidecar protocol envelope", () => {
 		],
 	])("rejects invalid %s payloads", (_type, envelope, expectedError) => {
 		expect(validateSidecarProtocolEnvelope(envelope)).toEqual({
+			ok: false,
+			error: expectedError,
+		});
+	});
+});
+
+describe("sidecar handshake validation", () => {
+	const expectedIdentity = {
+		agentId: "agt_123",
+		sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+	};
+
+	function makeHelloEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: expectedIdentity.agentId,
+			type: "hello",
+			seq: 1,
+			time: "2026-03-10T10:00:00.000Z",
+			payload: {
+				sessionPath: expectedIdentity.sessionPath,
+				tmuxTarget: "main:2.1",
+				mode: "pane",
+			},
+			...overrides,
+		};
+	}
+
+	function makeReadyEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: expectedIdentity.agentId,
+			type: "ready",
+			seq: 2,
+			time: "2026-03-10T10:00:01.000Z",
+			payload: {
+				pid: 12345,
+				sessionPath: expectedIdentity.sessionPath,
+				tmuxTarget: "main:2.1",
+			},
+			...overrides,
+		};
+	}
+
+	it("accepts a hello -> ready handshake with matching identity", () => {
+		const result = validateSidecarHandshake(
+			makeHelloEnvelope({
+				agentId: " agt_123 ",
+			}),
+			makeReadyEnvelope(),
+			{
+				agentId: "  agt_123 ",
+				sessionPath: expectedIdentity.sessionPath,
+			},
+		);
+
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.value.hello.type).toBe("hello");
+		expect(result.value.ready.type).toBe("ready");
+		expect(result.value.hello.agentId).toBe(expectedIdentity.agentId);
+		expect(result.value.ready.agentId).toBe(expectedIdentity.agentId);
+		expect(result.value.hello.payload.sessionPath).toBe(expectedIdentity.sessionPath);
+		expect(result.value.ready.payload.sessionPath).toBe(expectedIdentity.sessionPath);
+	});
+
+	it("rejects handshake identities that are malformed", () => {
+		expect(validateSidecarHandshake(makeHelloEnvelope(), makeReadyEnvelope(), null)).toEqual({
+			ok: false,
+			error: "handshake identity must be an object",
+		});
+	});
+
+	it("rejects handshakes that do not begin with hello", () => {
+		expect(validateSidecarHandshake(makeReadyEnvelope(), makeReadyEnvelope(), expectedIdentity)).toEqual({
+			ok: false,
+			error: "handshake first message must be hello",
+		});
+	});
+
+	it("rejects handshakes whose second message is not ready", () => {
+		expect(validateSidecarHandshake(makeHelloEnvelope(), makeHelloEnvelope(), expectedIdentity)).toEqual({
+			ok: false,
+			error: "handshake second message must be ready",
+		});
+	});
+
+	it.each([
+		[
+			"hello agentId mismatch",
+			makeHelloEnvelope({ agentId: "agt_other" }),
+			makeReadyEnvelope(),
+			"hello agentId must match handshake agentId",
+		],
+		[
+			"ready sessionPath mismatch",
+			makeHelloEnvelope(),
+			makeReadyEnvelope({
+				payload: {
+					pid: 12345,
+					sessionPath: path.join(fakeRuntimeDir, "other-session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			}),
+			"ready sessionPath must match handshake sessionPath",
+		],
+		[
+			"malformed hello payload",
+			makeHelloEnvelope({
+				payload: {
+					sessionPath: "session.jsonl",
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			}),
+			makeReadyEnvelope(),
+			"hello.payload.sessionPath must be an absolute path",
+		],
+		[
+			"malformed ready payload",
+			makeHelloEnvelope(),
+			makeReadyEnvelope({
+				payload: {
+					pid: 0,
+					sessionPath: expectedIdentity.sessionPath,
+					tmuxTarget: "main:2.1",
+				},
+			}),
+			"ready.payload.pid must be a positive safe integer",
+		],
+	])("rejects %s", (_scenario, helloEnvelope, readyEnvelope, expectedError) => {
+		expect(validateSidecarHandshake(helloEnvelope, readyEnvelope, expectedIdentity)).toEqual({
 			ok: false,
 			error: expectedError,
 		});

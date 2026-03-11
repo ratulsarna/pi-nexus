@@ -180,6 +180,16 @@ export type SidecarProtocolMessage<TData = unknown> = {
 export type SidecarControlMessage = Extract<SidecarProtocolMessage, { type: "hello" | "ping" }>;
 export type SidecarEventMessage = Exclude<SidecarProtocolMessage, SidecarControlMessage>;
 
+export interface SidecarHandshakeIdentity {
+	agentId: string;
+	sessionPath: string;
+}
+
+export interface SidecarHandshake {
+	hello: SidecarEnvelope<"hello">;
+	ready: SidecarEnvelope<"ready">;
+}
+
 export type ChildInputOrigin =
 	| "interactive-user"
 	| "parent-steer"
@@ -1125,6 +1135,68 @@ export function validateSidecarProtocolEnvelope<TData = unknown>(
 		time: input.time,
 		payload: payloadResult.value,
 	} as SidecarProtocolMessage<TData>);
+}
+
+function validateSidecarHandshakeIdentity(input: unknown): ValidationOutcome<SidecarHandshakeIdentity> {
+	if (!isRecord(input)) {
+		return fail("handshake identity must be an object");
+	}
+
+	const agentIdError = validateRequiredText("handshake agentId", input.agentId);
+	if (agentIdError) return agentIdError;
+
+	const sessionPathError = validateRequiredPath("handshake sessionPath", input.sessionPath);
+	if (sessionPathError) return sessionPathError;
+
+	return ok({
+		agentId: (input.agentId as string).trim(),
+		sessionPath: input.sessionPath as string,
+	});
+}
+
+function validateHandshakeMessageIdentity(
+	step: "hello" | "ready",
+	message: SidecarEnvelope<"hello"> | SidecarEnvelope<"ready">,
+	identity: SidecarHandshakeIdentity,
+): ValidationError | undefined {
+	if (message.agentId !== identity.agentId) {
+		return fail(`${step} agentId must match handshake agentId`);
+	}
+
+	if (message.payload.sessionPath !== identity.sessionPath) {
+		return fail(`${step} sessionPath must match handshake sessionPath`);
+	}
+}
+
+export function validateSidecarHandshake(
+	helloInput: unknown,
+	readyInput: unknown,
+	expectedIdentity: unknown,
+): ValidationOutcome<SidecarHandshake> {
+	const identityResult = validateSidecarHandshakeIdentity(expectedIdentity);
+	if (!identityResult.ok) return identityResult;
+
+	const helloResult = validateSidecarProtocolEnvelope(helloInput);
+	if (!helloResult.ok) return helloResult;
+	if (helloResult.value.type !== "hello") {
+		return fail("handshake first message must be hello");
+	}
+
+	const hello = helloResult.value as SidecarEnvelope<"hello">;
+	const helloIdentityError = validateHandshakeMessageIdentity("hello", hello, identityResult.value);
+	if (helloIdentityError) return helloIdentityError;
+
+	const readyResult = validateSidecarProtocolEnvelope(readyInput);
+	if (!readyResult.ok) return readyResult;
+	if (readyResult.value.type !== "ready") {
+		return fail("handshake second message must be ready");
+	}
+
+	const ready = readyResult.value as SidecarEnvelope<"ready">;
+	const readyIdentityError = validateHandshakeMessageIdentity("ready", ready, identityResult.value);
+	if (readyIdentityError) return readyIdentityError;
+
+	return ok({ hello, ready });
 }
 
 export function shouldEmitUserIntervened(event: ChildInputEvent): boolean {
