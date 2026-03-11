@@ -484,6 +484,18 @@ export class SubagentManager<TData = unknown> {
 
 		for (const runtime of this.runtimes.values()) {
 			this.clearConnectingTimeout(runtime);
+			if (!this.isTerminal(runtime.record.state)) {
+				const stoppedResult = this.transitionRecord(runtime.record, "stopped", { stoppedAt });
+				if (!stoppedResult.ok) return stoppedResult;
+
+				runtime.record = stoppedResult.value;
+				runtime.connectionOpen = false;
+				runtime.trusted = false;
+			} else {
+				runtime.connectionOpen = false;
+				runtime.trusted = false;
+			}
+
 			try {
 				runtime.process.terminate("shutdown");
 			} catch {
@@ -495,20 +507,6 @@ export class SubagentManager<TData = unknown> {
 			} catch {
 				// Best-effort shutdown.
 			}
-
-			if (this.isTerminal(runtime.record.state)) {
-				runtime.connectionOpen = false;
-				runtime.trusted = false;
-				stoppedRecords.push(cloneValue(runtime.record));
-				continue;
-			}
-
-			const stoppedResult = this.transitionRecord(runtime.record, "stopped", { stoppedAt });
-			if (!stoppedResult.ok) return stoppedResult;
-
-			runtime.record = stoppedResult.value;
-			runtime.connectionOpen = false;
-			runtime.trusted = false;
 
 			stoppedRecords.push(cloneValue(runtime.record));
 		}

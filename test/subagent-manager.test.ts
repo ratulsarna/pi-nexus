@@ -113,10 +113,16 @@ class FakeProcessHandle implements SubagentProcessHandle {
 
 	public constructor(
 		private readonly exitHandler: (exit: ManagedProcessExit) => ValidationOutcome<unknown>,
+		private readonly options: {
+			fireExitOnShutdown?: ManagedProcessExit;
+		} = {},
 	) {}
 
 	public terminate(reason: "abort" | "shutdown"): void {
 		this.terminateReasons.push(reason);
+		if (reason === "shutdown" && this.options.fireExitOnShutdown) {
+			this.exitHandler(this.options.fireExitOnShutdown);
+		}
 	}
 
 	public exit(exit: ManagedProcessExit): ValidationOutcome<unknown> {
@@ -130,6 +136,7 @@ class FakeProcesses implements SubagentProcessAdapter {
 	public constructor(
 		private readonly options: {
 			fireExitOnLaunch?: ManagedProcessExit;
+			fireExitOnShutdown?: ManagedProcessExit;
 		} = {},
 	) {}
 
@@ -137,7 +144,9 @@ class FakeProcesses implements SubagentProcessAdapter {
 		launchSpec: RuntimeLaunchSpec,
 		handlers: { onExit: (exit: ManagedProcessExit) => ValidationOutcome<unknown> },
 	): SubagentProcessHandle {
-		const handle = new FakeProcessHandle(handlers.onExit);
+		const handle = new FakeProcessHandle(handlers.onExit, {
+			fireExitOnShutdown: this.options.fireExitOnShutdown,
+		});
 		this.handles.set(launchSpec.agentId, handle);
 		if (this.options.fireExitOnLaunch) {
 			handle.exit(this.options.fireExitOnLaunch);
@@ -224,6 +233,7 @@ function createManager(
 		throwOnSessionOpened?: boolean;
 		fireConnectOnOpen?: boolean;
 		fireExitOnLaunch?: ManagedProcessExit;
+		fireExitOnShutdown?: ManagedProcessExit;
 		throwOnSend?: boolean;
 	} = {},
 ) {
@@ -233,6 +243,7 @@ function createManager(
 	});
 	const processes = new FakeProcesses({
 		fireExitOnLaunch: options.fireExitOnLaunch,
+		fireExitOnShutdown: options.fireExitOnShutdown,
 	});
 	const clock = createTimeCursor(...times);
 	const manager = new SubagentManager({
@@ -1114,6 +1125,40 @@ describe("SubagentManager", () => {
 
 		const emptyManager = createManager(["2026-03-11T12:07:10.000Z"]).manager;
 		expect(expectOk(emptyManager.shutdownAll())).toEqual([]);
+	});
+
+	it("keeps intentional shutdown stopped even when terminate fires exit synchronously", () => {
+		const { manager, sidecars, processes } = createManager(
+			[
+				"2026-03-11T12:07:11.000Z",
+				"2026-03-11T12:07:12.000Z",
+				"2026-03-11T12:07:16.000Z",
+			],
+			{ fireExitOnShutdown: { code: 1, signal: null } },
+		);
+		const request = makeSpawnRequest("agt_shutdown_sync_exit");
+		expectOk(manager.spawn(request));
+		sidecars.get("agt_shutdown_sync_exit").connect();
+		expectOk(sidecars.get("agt_shutdown_sync_exit").message(
+			makeEnvelope("agt_shutdown_sync_exit", "ready", 0, "2026-03-11T12:07:14.000Z", {
+				pid: 3334,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_shutdown_sync_exit").message(
+			makeEnvelope("agt_shutdown_sync_exit", "progress", 1, "2026-03-11T12:07:15.000Z", {
+				summary: "running",
+			}),
+		));
+
+		expectOk(manager.shutdownAll());
+		const record = expectOk(manager.getRecord("agt_shutdown_sync_exit"));
+		expect(record.state).toBe("stopped");
+		expect(record.error).toBeUndefined();
+		expect(record.stoppedAt).toBe("2026-03-11T12:07:16.000Z");
+		expect(processes.get("agt_shutdown_sync_exit").terminateReasons).toEqual(["shutdown"]);
+		expect(sidecars.get("agt_shutdown_sync_exit").closeCount).toBe(1);
 	});
 
 	it("still terminates and closes terminal runtimes during shutdownAll", () => {
