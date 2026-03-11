@@ -98,6 +98,110 @@ export interface ReportToParentInput<TData = unknown> {
 	data?: TData | null;
 }
 
+export interface SidecarHelloPayload {
+	sessionPath: string;
+	tmuxTarget: string;
+	mode: TmuxMode;
+}
+
+export interface SidecarSteerPayload {
+	message: string;
+}
+
+export interface SidecarFollowUpPayload {
+	message: string;
+}
+
+export interface SidecarReadyPayload {
+	pid: number;
+	sessionPath: string;
+	tmuxTarget: string;
+}
+
+export interface SidecarProgressPayload<TData = unknown> {
+	summary: string;
+	data: TData | null;
+}
+
+export interface SidecarFinalResultPayload<TData = unknown> {
+	summary: string;
+	data: TData | null;
+}
+
+export interface SidecarNeedsInputPayload {
+	question: string;
+	kind: string;
+}
+
+export interface SidecarUserIntervenedPayload {
+	source: "tmux";
+	mode: "direct-chat";
+}
+
+export type SidecarStateStatus =
+	| "starting"
+	| "running"
+	| "waiting"
+	| "completed"
+	| "failed"
+	| "stopped";
+
+export interface SidecarStatePayload {
+	status: SidecarStateStatus;
+}
+
+export interface SidecarErrorPayload {
+	message: string;
+	fatal: boolean;
+}
+
+export type SidecarEmptyPayload = Record<string, never>;
+
+export interface SidecarPayloadByType<TData = unknown> {
+	hello: SidecarHelloPayload;
+	steer: SidecarSteerPayload;
+	follow_up: SidecarFollowUpPayload;
+	abort: SidecarEmptyPayload;
+	ready: SidecarReadyPayload;
+	progress: SidecarProgressPayload<TData>;
+	final_result: SidecarFinalResultPayload<TData>;
+	needs_input: SidecarNeedsInputPayload;
+	user_intervened: SidecarUserIntervenedPayload;
+	state: SidecarStatePayload;
+	error: SidecarErrorPayload;
+	ping: SidecarEmptyPayload;
+	pong: SidecarEmptyPayload;
+}
+
+export type SidecarMessageKind = keyof SidecarPayloadByType;
+export type SidecarEventKind = Exclude<SidecarMessageKind, ParentControlKind>;
+
+export interface SidecarEnvelope<TType extends SidecarMessageKind = SidecarMessageKind, TData = unknown> {
+	version: 1;
+	agentId: string;
+	type: TType;
+	seq: number;
+	time: string;
+	payload: SidecarPayloadByType<TData>[TType];
+}
+
+export type SidecarProtocolMessage<TData = unknown> = {
+	[TType in SidecarMessageKind]: SidecarEnvelope<TType, TData>;
+}[SidecarMessageKind];
+
+export type SidecarControlMessage<TData = unknown> = Extract<SidecarProtocolMessage<TData>, { type: ParentControlKind }>;
+export type SidecarEventMessage<TData = unknown> = Extract<SidecarProtocolMessage<TData>, { type: SidecarEventKind }>;
+
+export interface SidecarHandshakeIdentity {
+	agentId: string;
+	sessionPath: string;
+}
+
+export interface SidecarHandshake {
+	hello: SidecarEnvelope<"hello">;
+	ready: SidecarEnvelope<"ready">;
+}
+
 export type ChildInputOrigin =
 	| "interactive-user"
 	| "parent-steer"
@@ -147,6 +251,39 @@ const RUNTIME_STATES = new Set<RuntimeState>([
 	"degraded",
 ]);
 const REPORT_KINDS = new Set<ReportKind>(["progress", "final_result", "needs_input"]);
+const SIDECAR_CONTROL_MESSAGE_KINDS: ReadonlyArray<ParentControlKind> = [
+	"hello",
+	"steer",
+	"follow_up",
+	"abort",
+	"ping",
+];
+const SIDECAR_EVENT_MESSAGE_KINDS: ReadonlyArray<SidecarEventKind> = [
+	"ready",
+	"progress",
+	"final_result",
+	"needs_input",
+	"user_intervened",
+	"state",
+	"error",
+	"pong",
+];
+const SIDECAR_MESSAGE_KINDS: ReadonlyArray<SidecarMessageKind> = [
+	...SIDECAR_CONTROL_MESSAGE_KINDS,
+	...SIDECAR_EVENT_MESSAGE_KINDS,
+];
+const SIDECAR_MESSAGE_KIND_SET = new Set<SidecarMessageKind>(SIDECAR_MESSAGE_KINDS);
+const SIDECAR_CONTROL_MESSAGE_KIND_SET = new Set<ParentControlKind>(SIDECAR_CONTROL_MESSAGE_KINDS);
+const SIDECAR_EVENT_MESSAGE_KIND_SET = new Set<SidecarEventKind>(SIDECAR_EVENT_MESSAGE_KINDS);
+const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
+	"starting",
+	"running",
+	"waiting",
+	"completed",
+	"failed",
+	"stopped",
+]);
+const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["abort", "ping", "pong"]);
 const STATES_REQUIRING_CONNECTED_AT = new Set<RuntimeState>([
 	"ready",
 	"running",
@@ -193,6 +330,10 @@ function ok<T>(value: T): ValidationResult<T> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return isRecord(value) && !Array.isArray(value);
 }
 
 function getParentProcessEnv(): Record<string, string> {
@@ -445,6 +586,13 @@ function validateRequiredPath(field: string, value: unknown): ValidationError | 
 
 function validateRequiredText(field: string, value: unknown): ValidationError | undefined {
 	if (!isNonEmptyTrimmedString(value)) return fail(`${field} must be a non-empty string`);
+	return undefined;
+}
+
+function validateNonNegativeSafeInteger(field: string, value: unknown): ValidationError | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
+		return fail(`${field} must be a non-negative safe integer`);
+	}
 	return undefined;
 }
 
@@ -872,6 +1020,275 @@ export function validateReportToParentInput<TData = unknown>(
 		summary: summary.trim(),
 		data: normalizeOptionalData<TData>(input),
 	});
+}
+
+function validateSidecarPayload<TData = unknown>(
+	type: SidecarMessageKind,
+	payload: unknown,
+): ValidationOutcome<SidecarPayloadByType<TData>[SidecarMessageKind]> {
+	if (!isPlainRecord(payload)) {
+		return fail(`${type}.payload must be an object`);
+	}
+
+	if (SIDECAR_EMPTY_PAYLOAD_TYPES.has(type)) {
+		if (Object.keys(payload).length > 0) {
+			return fail(`${type}.payload must be an empty object`);
+		}
+		return ok({} as SidecarEmptyPayload);
+	}
+
+	switch (type) {
+		case "hello": {
+			const sessionPathError = validateRequiredPath("hello.payload.sessionPath", payload.sessionPath);
+			if (sessionPathError) return sessionPathError;
+			const tmuxTargetError = validateRequiredText("hello.payload.tmuxTarget", payload.tmuxTarget);
+			if (tmuxTargetError) return tmuxTargetError;
+			if (payload.mode !== "pane" && payload.mode !== "window") {
+				return fail("hello.payload.mode must be either \"pane\" or \"window\"");
+			}
+
+			return ok({
+				sessionPath: payload.sessionPath as string,
+				tmuxTarget: (payload.tmuxTarget as string).trim(),
+				mode: payload.mode,
+			});
+		}
+		case "steer":
+		case "follow_up": {
+			const messageError = validateRequiredText(`${type}.payload.message`, payload.message);
+			if (messageError) return messageError;
+
+			return ok({
+				message: (payload.message as string).trim(),
+			});
+		}
+		case "ready": {
+			if (typeof payload.pid !== "number" || !Number.isSafeInteger(payload.pid) || payload.pid <= 0) {
+				return fail("ready.payload.pid must be a positive safe integer");
+			}
+			const sessionPathError = validateRequiredPath("ready.payload.sessionPath", payload.sessionPath);
+			if (sessionPathError) return sessionPathError;
+			const tmuxTargetError = validateRequiredText("ready.payload.tmuxTarget", payload.tmuxTarget);
+			if (tmuxTargetError) return tmuxTargetError;
+
+			return ok({
+				pid: payload.pid,
+				sessionPath: payload.sessionPath as string,
+				tmuxTarget: (payload.tmuxTarget as string).trim(),
+			});
+		}
+		case "progress":
+		case "final_result": {
+			const summaryError = validateRequiredText(`${type}.payload.summary`, payload.summary);
+			if (summaryError) return summaryError;
+
+			return ok({
+				summary: (payload.summary as string).trim(),
+				data: normalizeOptionalData<TData>(payload),
+			});
+		}
+		case "needs_input": {
+			const questionError = validateRequiredText("needs_input.payload.question", payload.question);
+			if (questionError) return questionError;
+			const kindError = validateRequiredText("needs_input.payload.kind", payload.kind);
+			if (kindError) return kindError;
+
+			return ok({
+				question: (payload.question as string).trim(),
+				kind: (payload.kind as string).trim(),
+			});
+		}
+		case "user_intervened": {
+			if (payload.source !== "tmux") {
+				return fail("user_intervened.payload.source must be tmux");
+			}
+			if (payload.mode !== "direct-chat") {
+				return fail("user_intervened.payload.mode must be direct-chat");
+			}
+
+			return ok({
+				source: payload.source,
+				mode: payload.mode,
+			});
+		}
+		case "state": {
+			const status = payload.status;
+			if (typeof status !== "string" || !SIDECAR_STATE_STATUSES.has(status as SidecarStateStatus)) {
+				return fail("state.payload.status must be one of: starting, running, waiting, completed, failed, stopped");
+			}
+
+			return ok({
+				status: status as SidecarStateStatus,
+			});
+		}
+		case "error": {
+			const messageError = validateRequiredText("error.payload.message", payload.message);
+			if (messageError) return messageError;
+			if (typeof payload.fatal !== "boolean") {
+				return fail("error.payload.fatal must be a boolean");
+			}
+
+			return ok({
+				message: (payload.message as string).trim(),
+				fatal: payload.fatal,
+			});
+		}
+		default:
+			return fail(`unsupported sidecar message type: ${type}`);
+	}
+}
+
+export function validateSidecarProtocolEnvelope<TData = unknown>(
+	input: unknown,
+): ValidationOutcome<SidecarProtocolMessage<TData>> {
+	if (!isPlainRecord(input)) {
+		return fail("sidecar envelope must be an object");
+	}
+
+	if (input.version !== 1) {
+		return fail("sidecar envelope version must be 1");
+	}
+
+	const agentIdError = validateRequiredText("sidecar envelope agentId", input.agentId);
+	if (agentIdError) return agentIdError;
+
+	const type = input.type;
+	if (typeof type !== "string" || !SIDECAR_MESSAGE_KIND_SET.has(type as SidecarMessageKind)) {
+		return fail(`sidecar envelope type must be one of: ${SIDECAR_MESSAGE_KINDS.join(", ")}`);
+	}
+
+	const seqError = validateNonNegativeSafeInteger("sidecar envelope seq", input.seq);
+	if (seqError) return seqError;
+
+	if (typeof input.time !== "string" || !isIsoTimestamp(input.time)) {
+		return fail("sidecar envelope time must be an ISO timestamp");
+	}
+
+	if (!hasOwnField(input, "payload")) {
+		return fail("sidecar envelope payload is required");
+	}
+
+	const payloadResult = validateSidecarPayload<TData>(type as SidecarMessageKind, input.payload);
+	if (!payloadResult.ok) return payloadResult;
+
+	return ok({
+		version: 1,
+		agentId: (input.agentId as string).trim(),
+		type: type as SidecarMessageKind,
+		seq: input.seq,
+		time: input.time,
+		payload: payloadResult.value,
+	} as SidecarProtocolMessage<TData>);
+}
+
+export function validateSidecarControlMessage<TData = unknown>(
+	input: unknown,
+): ValidationOutcome<SidecarControlMessage<TData>> {
+	const envelopeResult = validateSidecarProtocolEnvelope<TData>(input);
+	if (!envelopeResult.ok) return envelopeResult;
+	if (!SIDECAR_CONTROL_MESSAGE_KIND_SET.has(envelopeResult.value.type as ParentControlKind)) {
+		return fail(`sidecar control message type must be one of: ${SIDECAR_CONTROL_MESSAGE_KINDS.join(", ")}`);
+	}
+
+	return ok(envelopeResult.value as SidecarControlMessage<TData>);
+}
+
+export function validateSidecarEventMessage<TData = unknown>(
+	input: unknown,
+): ValidationOutcome<SidecarEventMessage<TData>> {
+	const envelopeResult = validateSidecarProtocolEnvelope<TData>(input);
+	if (!envelopeResult.ok) return envelopeResult;
+	if (!SIDECAR_EVENT_MESSAGE_KIND_SET.has(envelopeResult.value.type as SidecarEventKind)) {
+		return fail(`sidecar event message type must be one of: ${SIDECAR_EVENT_MESSAGE_KINDS.join(", ")}`);
+	}
+
+	return ok(envelopeResult.value as SidecarEventMessage<TData>);
+}
+
+function validateSidecarHandshakeIdentity(input: unknown): ValidationOutcome<SidecarHandshakeIdentity> {
+	if (!isPlainRecord(input)) {
+		return fail("handshake identity must be an object");
+	}
+
+	const agentIdError = validateRequiredText("handshake agentId", input.agentId);
+	if (agentIdError) return agentIdError;
+
+	const sessionPathError = validateRequiredPath("handshake sessionPath", input.sessionPath);
+	if (sessionPathError) return sessionPathError;
+
+	return ok({
+		agentId: (input.agentId as string).trim(),
+		sessionPath: input.sessionPath as string,
+	});
+}
+
+function validateHandshakeMessageIdentity(
+	step: "hello" | "ready",
+	message: SidecarEnvelope<"hello"> | SidecarEnvelope<"ready">,
+	identity: SidecarHandshakeIdentity,
+): ValidationError | undefined {
+	if (message.agentId !== identity.agentId) {
+		return fail(`${step} agentId must match handshake agentId`);
+	}
+
+	if (message.payload.sessionPath !== identity.sessionPath) {
+		return fail(`${step} sessionPath must match handshake sessionPath`);
+	}
+}
+
+export function validateSidecarHandshake(
+	helloInput: unknown,
+	readyInput: unknown,
+	expectedIdentity: unknown,
+): ValidationOutcome<SidecarHandshake> {
+	const identityResult = validateSidecarHandshakeIdentity(expectedIdentity);
+	if (!identityResult.ok) return identityResult;
+
+	const helloResult = validateSidecarProtocolEnvelope(helloInput);
+	if (!helloResult.ok) return helloResult;
+	if (helloResult.value.type !== "hello") {
+		return fail("handshake first message must be hello");
+	}
+
+	const hello = helloResult.value as SidecarEnvelope<"hello">;
+	const helloIdentityError = validateHandshakeMessageIdentity("hello", hello, identityResult.value);
+	if (helloIdentityError) return helloIdentityError;
+
+	const readyResult = validateSidecarProtocolEnvelope(readyInput);
+	if (!readyResult.ok) return readyResult;
+	if (readyResult.value.type !== "ready") {
+		return fail("handshake second message must be ready");
+	}
+
+	const ready = readyResult.value as SidecarEnvelope<"ready">;
+	const readyIdentityError = validateHandshakeMessageIdentity("ready", ready, identityResult.value);
+	if (readyIdentityError) return readyIdentityError;
+
+	return ok({ hello, ready });
+}
+
+export function validateMonotonicSeqAcceptance(seq: unknown, lastAcceptedSeq?: unknown): ValidationOutcome<number> {
+	const seqError = validateNonNegativeSafeInteger("seq", seq);
+	if (seqError) return seqError;
+
+	const normalizedSeq = seq as number;
+
+	if (lastAcceptedSeq === undefined) {
+		return ok(normalizedSeq);
+	}
+
+	const lastAcceptedSeqError = validateNonNegativeSafeInteger("lastAcceptedSeq", lastAcceptedSeq);
+	if (lastAcceptedSeqError) return lastAcceptedSeqError;
+
+	const normalizedLastAcceptedSeq = lastAcceptedSeq as number;
+	if (normalizedSeq === normalizedLastAcceptedSeq) {
+		return fail("seq must be greater than lastAcceptedSeq (duplicate seq)");
+	}
+	if (normalizedSeq < normalizedLastAcceptedSeq) {
+		return fail("seq must be greater than lastAcceptedSeq (stale or out-of-order seq)");
+	}
+
+	return ok(normalizedSeq);
 }
 
 export function shouldEmitUserIntervened(event: ChildInputEvent): boolean {

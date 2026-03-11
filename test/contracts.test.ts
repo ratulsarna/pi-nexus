@@ -15,6 +15,11 @@ import {
 	validateReportToParentInput,
 	validateRuntimeBootstrapConfig,
 	validateRuntimeLaunchSpec,
+	validateSidecarControlMessage,
+	validateSidecarEventMessage,
+	validateSidecarHandshake,
+	validateMonotonicSeqAcceptance,
+	validateSidecarProtocolEnvelope,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
 	type RuntimeState,
@@ -1259,6 +1264,660 @@ describe("validateReportToParentInput", () => {
 		expect(result).toEqual({
 			ok: false,
 			error: `cannot accept ${kind} report after final_result has been recorded`,
+		});
+	});
+});
+
+describe("sidecar protocol envelope", () => {
+	function makeEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: "agt_123",
+			type: "progress",
+			seq: 12,
+			time: "2026-03-10T10:00:00.000Z",
+			payload: {
+				summary: "Mapped auth flow",
+				data: { files: 2 },
+			},
+			...overrides,
+		};
+	}
+
+	it("accepts all supported sidecar message kinds", () => {
+		const validCases: ReadonlyArray<[type: string, payload: Record<string, unknown>]> = [
+			[
+				"hello",
+				{
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			],
+			[
+				"steer",
+				{
+					message: "Stop searching and summarize the auth flow.",
+				},
+			],
+			[
+				"follow_up",
+				{
+					message: "After that, check tests too.",
+				},
+			],
+			["abort", {}],
+			[
+				"ready",
+				{
+					pid: 12345,
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			],
+			[
+				"progress",
+				{
+					summary: "Working",
+					data: { files: ["/repo/src/auth.ts"] },
+				},
+			],
+			[
+				"final_result",
+				{
+					summary: "Done",
+					data: { findings: 2 },
+				},
+			],
+			[
+				"needs_input",
+				{
+					question: "Proceed with migration?",
+					kind: "decision",
+				},
+			],
+			[
+				"user_intervened",
+				{
+					source: "tmux",
+					mode: "direct-chat",
+				},
+			],
+			[
+				"state",
+				{
+					status: "running",
+				},
+			],
+			[
+				"error",
+				{
+					message: "bridge disconnected",
+					fatal: true,
+				},
+			],
+			["ping", {}],
+			["pong", {}],
+		];
+
+		for (const [type, payload] of validCases) {
+			const result = validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					type,
+					payload,
+				}),
+			);
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.value.type).toBe(type);
+		}
+	});
+
+	it("normalizes trim-sensitive text fields", () => {
+		const result = validateSidecarProtocolEnvelope(
+			makeEnvelope({
+				agentId: "  agt_123  ",
+				type: "progress",
+				payload: {
+					summary: "  mapped auth flow  ",
+					data: undefined,
+				},
+			}),
+		);
+
+		expect(result).toEqual({
+			ok: true,
+			value: {
+				version: 1,
+				agentId: "agt_123",
+				type: "progress",
+				seq: 12,
+				time: "2026-03-10T10:00:00.000Z",
+				payload: {
+					summary: "mapped auth flow",
+					data: null,
+				},
+			},
+		});
+	});
+
+	it("rejects malformed envelopes with deterministic errors", () => {
+		expect(validateSidecarProtocolEnvelope(null)).toEqual({
+			ok: false,
+			error: "sidecar envelope must be an object",
+		});
+
+		expect(validateSidecarProtocolEnvelope([])).toEqual({
+			ok: false,
+			error: "sidecar envelope must be an object",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					version: 2,
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope version must be 1",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					type: "launch",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope type must be one of: hello, steer, follow_up, abort, ping, ready, progress, final_result, needs_input, user_intervened, state, error, pong",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					seq: -1,
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope seq must be a non-negative safe integer",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					time: "not-a-date",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope time must be an ISO timestamp",
+		});
+
+		const envelopeWithoutPayload = makeEnvelope();
+		delete (envelopeWithoutPayload as { payload?: unknown }).payload;
+
+		expect(validateSidecarProtocolEnvelope(envelopeWithoutPayload)).toEqual({
+			ok: false,
+			error: "sidecar envelope payload is required",
+		});
+	});
+
+	it.each([
+		[
+			"steer",
+			makeEnvelope({
+				type: "steer",
+				payload: {
+					message: " ",
+				},
+			}),
+			"steer.payload.message must be a non-empty string",
+		],
+		[
+			"follow_up",
+			makeEnvelope({
+				type: "follow_up",
+				payload: {
+					message: "",
+				},
+			}),
+			"follow_up.payload.message must be a non-empty string",
+		],
+		[
+			"abort",
+			makeEnvelope({
+				type: "abort",
+				payload: {
+					extra: true,
+				},
+			}),
+			"abort.payload must be an empty object",
+		],
+		[
+			"hello",
+			makeEnvelope({
+				type: "hello",
+				payload: {
+					sessionPath: "session.jsonl",
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			}),
+			"hello.payload.sessionPath must be an absolute path",
+		],
+		[
+			"ready",
+			makeEnvelope({
+				type: "ready",
+				payload: {
+					pid: 0,
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			}),
+			"ready.payload.pid must be a positive safe integer",
+		],
+		[
+			"progress",
+			makeEnvelope({
+				type: "progress",
+				payload: {
+					summary: "  ",
+				},
+			}),
+			"progress.payload.summary must be a non-empty string",
+		],
+		[
+			"final_result",
+			makeEnvelope({
+				type: "final_result",
+				payload: {
+					summary: "",
+				},
+			}),
+			"final_result.payload.summary must be a non-empty string",
+		],
+		[
+			"needs_input",
+			makeEnvelope({
+				type: "needs_input",
+				payload: {
+					question: "",
+					kind: "decision",
+				},
+			}),
+			"needs_input.payload.question must be a non-empty string",
+		],
+		[
+			"user_intervened",
+			makeEnvelope({
+				type: "user_intervened",
+				payload: {
+					source: "tmux",
+					mode: "broadcast",
+				},
+			}),
+			"user_intervened.payload.mode must be direct-chat",
+		],
+		[
+			"state",
+			makeEnvelope({
+				type: "state",
+				payload: {
+					status: "ready",
+				},
+			}),
+			"state.payload.status must be one of: starting, running, waiting, completed, failed, stopped",
+		],
+		[
+			"error",
+			makeEnvelope({
+				type: "error",
+				payload: {
+					message: "fatal",
+					fatal: "yes",
+				},
+			}),
+			"error.payload.fatal must be a boolean",
+		],
+		[
+			"ping",
+			makeEnvelope({
+				type: "ping",
+				payload: {
+					extra: true,
+				},
+			}),
+			"ping.payload must be an empty object",
+		],
+		[
+			"pong",
+			makeEnvelope({
+				type: "pong",
+				payload: {
+					extra: true,
+				},
+			}),
+			"pong.payload must be an empty object",
+		],
+	])("rejects invalid %s payloads", (_type, envelope, expectedError) => {
+		expect(validateSidecarProtocolEnvelope(envelope)).toEqual({
+			ok: false,
+			error: expectedError,
+		});
+	});
+
+	it.each([
+		["abort", "abort"],
+		["ping", "ping"],
+		["pong", "pong"],
+	])("rejects array payloads for %s empty-object messages", (_scenario, type) => {
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					type,
+					payload: [],
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: `${type}.payload must be an object`,
+		});
+	});
+});
+
+describe("sidecar direction validation", () => {
+	function makeEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: "agt_123",
+			type: "progress",
+			seq: 12,
+			time: "2026-03-10T10:00:00.000Z",
+			payload: {
+				summary: "Mapped auth flow",
+				data: { files: 2 },
+			},
+			...overrides,
+		};
+	}
+
+	it("accepts documented parent control messages on the control path", () => {
+		for (const [type, payload] of [
+			[
+				"hello",
+				{
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			],
+			["steer", { message: "Steer the child" }],
+			["follow_up", { message: "Follow up after current work" }],
+			["abort", {}],
+			["ping", {}],
+		] as const) {
+			const result = validateSidecarControlMessage(
+				makeEnvelope({
+					type,
+					payload,
+				}),
+			);
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.value.type).toBe(type);
+		}
+	});
+
+	it("rejects event messages on the control path", () => {
+		expect(
+			validateSidecarControlMessage(
+				makeEnvelope({
+					type: "progress",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar control message type must be one of: hello, steer, follow_up, abort, ping",
+		});
+	});
+
+	it("accepts documented child event messages on the event path", () => {
+		for (const [type, payload] of [
+			[
+				"ready",
+				{
+					pid: 12345,
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			],
+			["progress", { summary: "Working", data: null }],
+			["final_result", { summary: "Done", data: { findings: 2 } }],
+			["needs_input", { question: "Proceed?", kind: "decision" }],
+			["user_intervened", { source: "tmux", mode: "direct-chat" }],
+			["state", { status: "running" }],
+			["error", { message: "bridge disconnected", fatal: true }],
+			["pong", {}],
+		] as const) {
+			const result = validateSidecarEventMessage(
+				makeEnvelope({
+					type,
+					payload,
+				}),
+			);
+
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.value.type).toBe(type);
+		}
+	});
+
+	it("rejects control messages on the event path", () => {
+		expect(
+			validateSidecarEventMessage(
+				makeEnvelope({
+					type: "steer",
+					payload: {
+						message: "Steer the child",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar event message type must be one of: ready, progress, final_result, needs_input, user_intervened, state, error, pong",
+		});
+	});
+});
+
+describe("sidecar handshake validation", () => {
+	const expectedIdentity = {
+		agentId: "agt_123",
+		sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+	};
+
+	function makeHelloEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: expectedIdentity.agentId,
+			type: "hello",
+			seq: 1,
+			time: "2026-03-10T10:00:00.000Z",
+			payload: {
+				sessionPath: expectedIdentity.sessionPath,
+				tmuxTarget: "main:2.1",
+				mode: "pane",
+			},
+			...overrides,
+		};
+	}
+
+	function makeReadyEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: expectedIdentity.agentId,
+			type: "ready",
+			seq: 2,
+			time: "2026-03-10T10:00:01.000Z",
+			payload: {
+				pid: 12345,
+				sessionPath: expectedIdentity.sessionPath,
+				tmuxTarget: "main:2.1",
+			},
+			...overrides,
+		};
+	}
+
+	it("accepts a hello -> ready handshake with matching identity", () => {
+		const result = validateSidecarHandshake(
+			makeHelloEnvelope({
+				agentId: " agt_123 ",
+			}),
+			makeReadyEnvelope(),
+			{
+				agentId: "  agt_123 ",
+				sessionPath: expectedIdentity.sessionPath,
+			},
+		);
+
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.value.hello.type).toBe("hello");
+		expect(result.value.ready.type).toBe("ready");
+		expect(result.value.hello.agentId).toBe(expectedIdentity.agentId);
+		expect(result.value.ready.agentId).toBe(expectedIdentity.agentId);
+		expect(result.value.hello.payload.sessionPath).toBe(expectedIdentity.sessionPath);
+		expect(result.value.ready.payload.sessionPath).toBe(expectedIdentity.sessionPath);
+	});
+
+	it("rejects handshake identities that are malformed", () => {
+		expect(validateSidecarHandshake(makeHelloEnvelope(), makeReadyEnvelope(), null)).toEqual({
+			ok: false,
+			error: "handshake identity must be an object",
+		});
+	});
+
+	it("rejects handshakes that do not begin with hello", () => {
+		expect(validateSidecarHandshake(makeReadyEnvelope(), makeReadyEnvelope(), expectedIdentity)).toEqual({
+			ok: false,
+			error: "handshake first message must be hello",
+		});
+	});
+
+	it("rejects handshakes whose second message is not ready", () => {
+		expect(validateSidecarHandshake(makeHelloEnvelope(), makeHelloEnvelope(), expectedIdentity)).toEqual({
+			ok: false,
+			error: "handshake second message must be ready",
+		});
+	});
+
+	it.each([
+		[
+			"hello agentId mismatch",
+			makeHelloEnvelope({ agentId: "agt_other" }),
+			makeReadyEnvelope(),
+			"hello agentId must match handshake agentId",
+		],
+		[
+			"ready sessionPath mismatch",
+			makeHelloEnvelope(),
+			makeReadyEnvelope({
+				payload: {
+					pid: 12345,
+					sessionPath: path.join(fakeRuntimeDir, "other-session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			}),
+			"ready sessionPath must match handshake sessionPath",
+		],
+		[
+			"malformed hello payload",
+			makeHelloEnvelope({
+				payload: {
+					sessionPath: "session.jsonl",
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			}),
+			makeReadyEnvelope(),
+			"hello.payload.sessionPath must be an absolute path",
+		],
+		[
+			"malformed ready payload",
+			makeHelloEnvelope(),
+			makeReadyEnvelope({
+				payload: {
+					pid: 0,
+					sessionPath: expectedIdentity.sessionPath,
+					tmuxTarget: "main:2.1",
+				},
+			}),
+			"ready.payload.pid must be a positive safe integer",
+		],
+	])("rejects %s", (_scenario, helloEnvelope, readyEnvelope, expectedError) => {
+		expect(validateSidecarHandshake(helloEnvelope, readyEnvelope, expectedIdentity)).toEqual({
+			ok: false,
+			error: expectedError,
+		});
+	});
+});
+
+describe("delivery ordering seq acceptance", () => {
+	it.each([
+		["negative", -1],
+		["fractional", 3.14],
+		["infinite", Number.POSITIVE_INFINITY],
+		["string", "12"],
+		["null", null],
+	])("rejects malformed %s seq values", (_scenario, seq) => {
+		expect(validateMonotonicSeqAcceptance(seq)).toEqual({
+			ok: false,
+			error: "seq must be a non-negative safe integer",
+		});
+	});
+
+	it("rejects malformed lastAcceptedSeq values", () => {
+		expect(validateMonotonicSeqAcceptance(3, "2")).toEqual({
+			ok: false,
+			error: "lastAcceptedSeq must be a non-negative safe integer",
+		});
+	});
+
+	it("accepts first delivery when no lastAcceptedSeq is recorded", () => {
+		expect(validateMonotonicSeqAcceptance(0)).toEqual({
+			ok: true,
+			value: 0,
+		});
+	});
+
+	it("rejects duplicate seq values", () => {
+		expect(validateMonotonicSeqAcceptance(12, 12)).toEqual({
+			ok: false,
+			error: "seq must be greater than lastAcceptedSeq (duplicate seq)",
+		});
+	});
+
+	it.each([
+		["stale", 11, 12],
+		["out-of-order", 7, 12],
+	])("rejects %s seq values", (_scenario, seq, lastAcceptedSeq) => {
+		expect(validateMonotonicSeqAcceptance(seq, lastAcceptedSeq)).toEqual({
+			ok: false,
+			error: "seq must be greater than lastAcceptedSeq (stale or out-of-order seq)",
+		});
+	});
+
+	it.each([
+		[13, 12],
+		[42, 12],
+	])("accepts increasing seq values (%d after %d)", (seq, lastAcceptedSeq) => {
+		expect(validateMonotonicSeqAcceptance(seq, lastAcceptedSeq)).toEqual({
+			ok: true,
+			value: seq,
 		});
 	});
 });
