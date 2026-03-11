@@ -100,6 +100,15 @@ function cloneValue<T>(value: T): T {
 	return structuredClone(value);
 }
 
+function ensureCloneable<T>(value: T, field: string): ValidationOutcome<T> {
+	try {
+		return ok(structuredClone(value));
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return fail(`${field} must be structured-cloneable: ${reason}`);
+	}
+}
+
 function normalizeProcessExit(exit: ManagedProcessExit): ValidationOutcome<ManagedProcessExit> {
 	if (typeof exit !== "object" || exit === null) {
 		return fail("process exit must be an object");
@@ -153,6 +162,22 @@ export class SubagentManager<TData = unknown> {
 
 	public constructor(private readonly options: SubagentManagerOptions<TData>) {
 		this.now = options.now ?? (() => new Date().toISOString());
+	}
+
+	private cleanupRuntimeRegistration(agentId: string, runtime: ManagedRuntime<TData>): void {
+		this.runtimes.delete(agentId);
+		runtime.connectionOpen = false;
+		runtime.trusted = false;
+		try {
+			runtime.process.terminate("shutdown");
+		} catch {
+			// Best-effort cleanup after registration failure.
+		}
+		try {
+			runtime.sidecar.close();
+		} catch {
+			// Best-effort cleanup after registration failure.
+		}
 	}
 
 	public spawn(request: ManagedSubagentSpawnRequest): ValidationOutcome<SubagentRecord<TData>> {
@@ -243,22 +268,13 @@ export class SubagentManager<TData = unknown> {
 		try {
 			this.options.onSessionOpened?.(launchSpec.agentId, sidecar);
 		} catch (error) {
-			this.runtimes.delete(launchSpec.agentId);
-			try {
-				process.terminate("shutdown");
-			} catch {
-				// Best-effort cleanup after session registration failure.
-			}
-			try {
-				sidecar.close();
-			} catch {
-				// Best-effort cleanup after session registration failure.
-			}
+			this.cleanupRuntimeRegistration(launchSpec.agentId, runtime);
 			return fail(`onSessionOpened failed: ${this.describeError(error)}`);
 		}
 		for (const callback of pendingCallbacks) {
 			const callbackResult = callback();
 			if (!callbackResult.ok) {
+				this.cleanupRuntimeRegistration(launchSpec.agentId, runtime);
 				return callbackResult;
 			}
 		}
@@ -529,6 +545,8 @@ export class SubagentManager<TData = unknown> {
 			Boolean(runtime.record.finalResult),
 		);
 		if (!reportResult.ok) return reportResult;
+		const cloneableDataResult = ensureCloneable(reportResult.value.data ?? null, "progress.data");
+		if (!cloneableDataResult.ok) return cloneableDataResult;
 
 		const nextState: RuntimeState = "running";
 		const nextRecord = {
@@ -537,7 +555,7 @@ export class SubagentManager<TData = unknown> {
 			lastProgressReport: this.makeReport(
 				"progress",
 				reportResult.value.summary,
-				reportResult.value.data ?? null,
+				cloneableDataResult.value,
 				event.time,
 			),
 			pendingInputRequest: undefined,
@@ -596,6 +614,8 @@ export class SubagentManager<TData = unknown> {
 			Boolean(runtime.record.finalResult),
 		);
 		if (!reportResult.ok) return reportResult;
+		const cloneableDataResult = ensureCloneable(reportResult.value.data ?? null, "final_result.data");
+		if (!cloneableDataResult.ok) return cloneableDataResult;
 
 		const nextState: RuntimeState = "completed";
 		const nextRecord = {
@@ -605,7 +625,7 @@ export class SubagentManager<TData = unknown> {
 			finalResult: this.makeReport(
 				"final_result",
 				reportResult.value.summary,
-				reportResult.value.data ?? null,
+				cloneableDataResult.value,
 				event.time,
 			),
 			pendingInputRequest: undefined,

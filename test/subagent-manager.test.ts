@@ -43,9 +43,17 @@ class FakeSidecarSession<TData = unknown> implements SidecarSessionHandle<TData>
 	public readonly sent: SidecarControlMessage<TData>[] = [];
 	public closeCount = 0;
 
-	public constructor(private readonly handlers: SidecarSessionHandlers) {}
+	public constructor(
+		private readonly handlers: SidecarSessionHandlers,
+		private readonly options: {
+			throwOnSend?: boolean;
+		} = {},
+	) {}
 
 	public send(message: SidecarControlMessage<TData>): void {
+		if (this.options.throwOnSend) {
+			throw new Error("send exploded");
+		}
 		this.sent.push(message);
 	}
 
@@ -72,11 +80,14 @@ class FakeSidecarSessions<TData = unknown> implements SidecarSessionAdapter<TDat
 	public constructor(
 		private readonly options: {
 			fireConnectOnOpen?: boolean;
+			throwOnSend?: boolean;
 		} = {},
 	) {}
 
 	public openSession(_socketPath: string, handlers: SidecarSessionHandlers): SidecarSessionHandle<TData> {
-		const session = new FakeSidecarSession<TData>(handlers);
+		const session = new FakeSidecarSession<TData>(handlers, {
+			throwOnSend: this.options.throwOnSend,
+		});
 		if (this.options.fireConnectOnOpen) {
 			session.connect();
 		}
@@ -212,10 +223,12 @@ function createManager(
 		throwOnSessionOpened?: boolean;
 		fireConnectOnOpen?: boolean;
 		fireExitOnLaunch?: ManagedProcessExit;
+		throwOnSend?: boolean;
 	} = {},
 ) {
 	const sidecars = new FakeSidecarSessions({
 		fireConnectOnOpen: options.fireConnectOnOpen,
+		throwOnSend: options.throwOnSend,
 	});
 	const processes = new FakeProcesses({
 		fireExitOnLaunch: options.fireExitOnLaunch,
@@ -514,6 +527,44 @@ describe("SubagentManager", () => {
 		expect(after).toEqual(before);
 	});
 
+	it("rejects uncloneable inbound report data without mutating authoritative state", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:04:35.000Z",
+			"2026-03-11T12:04:36.000Z",
+		]);
+		const request = makeSpawnRequest("agt_uncloneable");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_uncloneable").connect());
+		expectOk(sidecars.get("agt_uncloneable").message(
+			makeEnvelope("agt_uncloneable", "ready", 0, "2026-03-11T12:04:37.000Z", {
+				pid: 8643,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_uncloneable").message(
+			makeEnvelope("agt_uncloneable", "progress", 1, "2026-03-11T12:04:38.000Z", {
+				summary: "trusted progress",
+			}),
+		));
+
+		const before = expectOk(manager.getRecord("agt_uncloneable"));
+		const uncloneable = sidecars.get("agt_uncloneable").message(
+			makeEnvelope("agt_uncloneable", "progress", 2, "2026-03-11T12:04:39.000Z", {
+				summary: "bad payload",
+				data: { fn: () => "nope" },
+			}),
+		);
+
+		expect(uncloneable.ok).toBe(false);
+		if (!uncloneable.ok) {
+			expect(uncloneable.error).toContain("progress.data must be structured-cloneable");
+		}
+
+		const after = expectOk(manager.getRecord("agt_uncloneable"));
+		expect(after).toEqual(before);
+	});
+
 	it("rejects wrong-direction inbound traffic without mutating authoritative state", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:04:40.000Z",
@@ -752,6 +803,23 @@ describe("SubagentManager", () => {
 		expect(exitedSpawn.state).toBe("failed");
 		expect(expectOk(exited.manager.getRecord("agt_reentrant_exit")).state).toBe("failed");
 		expect(expectOk(exited.manager.getRecord("agt_reentrant_exit")).error?.message).toContain("exited");
+	});
+
+	it("cleans up and unregisters the runtime when a deferred spawn callback fails", () => {
+		const { manager, sidecars, processes } = createManager(
+			["2026-03-11T12:06:50.000Z", "2026-03-11T12:06:51.000Z"],
+			{ fireConnectOnOpen: true, throwOnSend: true },
+		);
+		const request = makeSpawnRequest("agt_deferred_failure");
+		const spawnResult = manager.spawn(request);
+
+		expect(spawnResult.ok).toBe(false);
+		if (!spawnResult.ok) {
+			expect(spawnResult.error).toContain("failed to send hello");
+		}
+		expect(processes.get("agt_deferred_failure").terminateReasons).toEqual(["shutdown"]);
+		expect(sidecars.get("agt_deferred_failure").closeCount).toBe(1);
+		expect(manager.getRecord("agt_deferred_failure").ok).toBe(false);
 	});
 
 	it("normalizes intentional shutdown to stopped and treats empty cleanup as a no-op", () => {
