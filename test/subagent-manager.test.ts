@@ -1046,6 +1046,26 @@ describe("SubagentManager", () => {
 		}
 	});
 
+	it("anchors connect-timeout failure timestamps to accepted record chronology", () => {
+		vi.useFakeTimers();
+		try {
+			const { manager } = createManager(
+				["2026-03-11T12:05:50.000Z", "2026-03-11T12:05:40.000Z"],
+				{ connectingTimeoutMs: 5_000 },
+			);
+			expectOk(manager.spawn(makeSpawnRequest("agt_connect_timeout_timestamp")));
+
+			vi.advanceTimersByTime(5_000);
+
+			const record = expectOk(manager.getRecord("agt_connect_timeout_timestamp"));
+			expect(record.state).toBe("failed");
+			expect(record.error?.recordedAt).toBe("2026-03-11T12:05:50.000Z");
+			expect(record.error?.message).toBe("sidecar did not connect before timeout");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("marks pre-ready disconnects and unexpected exits as failures", () => {
 		const first = createManager([
 			"2026-03-11T12:06:00.000Z",
@@ -1066,6 +1086,20 @@ describe("SubagentManager", () => {
 		expectOk(second.processes.get("agt_fail_exit").exit({ code: 1, signal: null }));
 		expect(expectOk(second.manager.getRecord("agt_fail_exit")).state).toBe("failed");
 		expect(expectOk(second.manager.getRecord("agt_fail_exit")).error?.message).toContain("exited");
+	});
+
+	it("anchors pre-ready disconnect failure timestamps to accepted record chronology", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:06:30.000Z",
+			"2026-03-11T12:06:20.000Z",
+		]);
+		expectOk(manager.spawn(makeSpawnRequest("agt_disconnect_timestamp")));
+		expectOk(sidecars.get("agt_disconnect_timestamp").disconnect("backward clock"));
+
+		const record = expectOk(manager.getRecord("agt_disconnect_timestamp"));
+		expect(record.state).toBe("failed");
+		expect(record.error?.recordedAt).toBe("2026-03-11T12:06:30.000Z");
+		expect(record.error?.message).toContain("backward clock");
 	});
 
 	it("anchors process-exit failure timestamps to accepted record chronology", () => {

@@ -404,7 +404,7 @@ export class SubagentManager<TData = unknown> {
 				message: reason
 					? `sidecar disconnected before ready: ${reason}`
 					: "sidecar disconnected before ready",
-				recordedAt: this.now(),
+				recordedAt: this.deriveTerminalTimestamp(runtime.record),
 				fatal: true,
 			},
 		});
@@ -986,7 +986,7 @@ export class SubagentManager<TData = unknown> {
 		const failedResult = this.transitionRecord(runtime.record, "failed", {
 			error: {
 				message: "sidecar did not connect before timeout",
-				recordedAt: this.now(),
+				recordedAt: this.deriveTerminalTimestamp(runtime.record),
 				fatal: true,
 			},
 		});
