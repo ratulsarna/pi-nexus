@@ -157,6 +157,10 @@ function stripUndefinedFields(value: Record<string, unknown>): Record<string, un
 	return next;
 }
 
+function maxIsoTimestamp(first: string, second: string): string {
+	return first >= second ? first : second;
+}
+
 export class SubagentManager<TData = unknown> {
 	private readonly runtimes = new Map<string, ManagedRuntime<TData>>();
 
@@ -430,6 +434,7 @@ export class SubagentManager<TData = unknown> {
 		if (this.isTerminal(runtime.record.state)) {
 			return ok(cloneValue(runtime.record));
 		}
+		const terminalTimestamp = this.deriveTerminalTimestamp(runtime.record);
 
 		if (
 			runtime.lastReportedState === "completed"
@@ -437,7 +442,7 @@ export class SubagentManager<TData = unknown> {
 			&& exitResult.value.signal === null
 		) {
 			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
-				stoppedAt: this.now(),
+				stoppedAt: terminalTimestamp,
 			});
 			if (!stoppedResult.ok) return stoppedResult;
 
@@ -450,7 +455,7 @@ export class SubagentManager<TData = unknown> {
 		const failedResult = this.transitionRecord(runtime.record, "failed", {
 			error: {
 				message: formatExitMessage(exitResult.value),
-				recordedAt: this.now(),
+				recordedAt: terminalTimestamp,
 				fatal: true,
 			},
 		});
@@ -479,18 +484,22 @@ export class SubagentManager<TData = unknown> {
 			return ok([]);
 		}
 
-		const stoppedAt = this.now();
 		const stoppedRecords: SubagentRecord<TData>[] = [];
+		let firstError: ValidationError | undefined;
 
 		for (const runtime of this.runtimes.values()) {
 			this.clearConnectingTimeout(runtime);
 			if (!this.isTerminal(runtime.record.state)) {
-				const stoppedResult = this.transitionRecord(runtime.record, "stopped", { stoppedAt });
-				if (!stoppedResult.ok) return stoppedResult;
-
-				runtime.record = stoppedResult.value;
-				runtime.connectionOpen = false;
-				runtime.trusted = false;
+				const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
+					stoppedAt: this.deriveTerminalTimestamp(runtime.record),
+				});
+				if (stoppedResult.ok) {
+					runtime.record = stoppedResult.value;
+					runtime.connectionOpen = false;
+					runtime.trusted = false;
+				} else if (!firstError) {
+					firstError = stoppedResult;
+				}
 			} else {
 				runtime.connectionOpen = false;
 				runtime.trusted = false;
@@ -509,6 +518,10 @@ export class SubagentManager<TData = unknown> {
 			}
 
 			stoppedRecords.push(cloneValue(runtime.record));
+		}
+
+		if (firstError) {
+			return firstError;
 		}
 
 		return ok(stoppedRecords);
@@ -914,6 +927,29 @@ export class SubagentManager<TData = unknown> {
 
 	private isTerminalReportedState(state?: SidecarStateStatus): boolean {
 		return state === "completed" || state === "failed" || state === "stopped";
+	}
+
+	private deriveTerminalTimestamp(record: SubagentRecord<TData>): string {
+		let latest = maxIsoTimestamp(this.now(), record.createdAt);
+		const candidates = [
+			record.startedAt,
+			record.connectedAt,
+			record.completedAt,
+			record.stoppedAt,
+			record.degradedAt,
+			record.lastProgressReport?.reportedAt,
+			record.pendingInputRequest?.reportedAt,
+			record.finalResult?.reportedAt,
+			record.userIntervened?.recordedAt,
+			record.error?.recordedAt,
+		];
+		for (const candidate of candidates) {
+			if (candidate) {
+				latest = maxIsoTimestamp(latest, candidate);
+			}
+		}
+
+		return latest;
 	}
 
 	private scheduleConnectingTimeout(agentId: string, runtime: ManagedRuntime<TData>): void {

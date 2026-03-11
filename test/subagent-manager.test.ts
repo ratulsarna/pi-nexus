@@ -1040,6 +1040,34 @@ describe("SubagentManager", () => {
 		expect(expectOk(second.manager.getRecord("agt_fail_exit")).error?.message).toContain("exited");
 	});
 
+	it("anchors process-exit failure timestamps to accepted record chronology", () => {
+		const { manager, sidecars, processes } = createManager([
+			"2026-03-11T12:06:20.000Z",
+			"2026-03-11T12:06:25.000Z",
+		]);
+		const request = makeSpawnRequest("agt_exit_timestamp");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_exit_timestamp").connect());
+		expectOk(sidecars.get("agt_exit_timestamp").message(
+			makeEnvelope("agt_exit_timestamp", "ready", 0, "2026-03-11T12:06:30.000Z", {
+				pid: 7771,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_exit_timestamp").message(
+			makeEnvelope("agt_exit_timestamp", "progress", 1, "2026-03-11T12:06:40.000Z", {
+				summary: "ahead of wall clock",
+			}),
+		));
+
+		expectOk(processes.get("agt_exit_timestamp").exit({ code: 1, signal: null }));
+		const record = expectOk(manager.getRecord("agt_exit_timestamp"));
+		expect(record.state).toBe("failed");
+		expect(record.error?.recordedAt).toBe("2026-03-11T12:06:40.000Z");
+		expect(record.error?.message).toContain("code 1");
+	});
+
 	it("returns a validation error and cleans up when onSessionOpened throws", () => {
 		const { manager, processes } = createManager(
 			["2026-03-11T12:06:20.000Z"],
@@ -1214,6 +1242,58 @@ describe("SubagentManager", () => {
 		expect(failed.processes.get("agt_shutdown_failed").terminateReasons).toEqual(["shutdown"]);
 		expect(failed.sidecars.get("agt_shutdown_failed").closeCount).toBe(1);
 		expect(expectOk(failed.manager.getRecord("agt_shutdown_failed")).state).toBe("failed");
+	});
+
+	it("continues shutdown cleanup when a stop transition cannot be normalized", () => {
+		const { manager, sidecars, processes } = createManager([
+			"2026-03-11T12:07:40.000Z",
+			"2026-03-11T12:07:41.000Z",
+		]);
+		const brokenRequest = makeSpawnRequest("agt_shutdown_broken");
+		const healthyRequest = makeSpawnRequest("agt_shutdown_healthy");
+		expectOk(manager.spawn(brokenRequest));
+		expectOk(manager.spawn(healthyRequest));
+		expectOk(sidecars.get("agt_shutdown_broken").connect());
+		expectOk(sidecars.get("agt_shutdown_healthy").connect());
+		expectOk(sidecars.get("agt_shutdown_broken").message(
+			makeEnvelope("agt_shutdown_broken", "ready", 0, "2026-03-11T12:07:42.000Z", {
+				pid: 6661,
+				sessionPath: brokenRequest.launchSpec.sessionPath,
+				tmuxTarget: brokenRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_shutdown_healthy").message(
+			makeEnvelope("agt_shutdown_healthy", "ready", 0, "2026-03-11T12:07:43.000Z", {
+				pid: 6662,
+				sessionPath: healthyRequest.launchSpec.sessionPath,
+				tmuxTarget: healthyRequest.launchSpec.tmuxTarget,
+			}),
+		));
+
+		const runtimes = (manager as unknown as {
+			runtimes: Map<string, { record: Record<string, unknown> }>;
+		}).runtimes;
+		const brokenRuntime = runtimes.get("agt_shutdown_broken");
+		if (!brokenRuntime) {
+			throw new Error("missing broken runtime");
+		}
+		brokenRuntime.record = {
+			...brokenRuntime.record,
+			finalResult: {
+				kind: "final_result",
+				summary: "invalid while ready",
+				data: null,
+				reportedAt: "2026-03-11T12:07:44.000Z",
+			},
+		};
+
+		const shutdownResult = manager.shutdownAll();
+		expect(shutdownResult.ok).toBe(false);
+		expect(processes.get("agt_shutdown_broken").terminateReasons).toEqual(["shutdown"]);
+		expect(sidecars.get("agt_shutdown_broken").closeCount).toBe(1);
+		expect(processes.get("agt_shutdown_healthy").terminateReasons).toEqual(["shutdown"]);
+		expect(sidecars.get("agt_shutdown_healthy").closeCount).toBe(1);
+		expect(expectOk(manager.getRecord("agt_shutdown_healthy")).state).toBe("stopped");
 	});
 
 	it("fails deterministically for unknown agent activity", () => {
