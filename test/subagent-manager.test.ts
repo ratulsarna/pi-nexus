@@ -69,8 +69,17 @@ class FakeSidecarSession<TData = unknown> implements SidecarSessionHandle<TData>
 class FakeSidecarSessions<TData = unknown> implements SidecarSessionAdapter<TData> {
 	public readonly sessions = new Map<string, FakeSidecarSession<TData>>();
 
+	public constructor(
+		private readonly options: {
+			fireConnectOnOpen?: boolean;
+		} = {},
+	) {}
+
 	public openSession(_socketPath: string, handlers: SidecarSessionHandlers): SidecarSessionHandle<TData> {
 		const session = new FakeSidecarSession<TData>(handlers);
+		if (this.options.fireConnectOnOpen) {
+			session.connect();
+		}
 		return session;
 	}
 
@@ -107,12 +116,21 @@ class FakeProcessHandle implements SubagentProcessHandle {
 class FakeProcesses implements SubagentProcessAdapter {
 	public readonly handles = new Map<string, FakeProcessHandle>();
 
+	public constructor(
+		private readonly options: {
+			fireExitOnLaunch?: ManagedProcessExit;
+		} = {},
+	) {}
+
 	public launch(
 		launchSpec: RuntimeLaunchSpec,
 		handlers: { onExit: (exit: ManagedProcessExit) => ValidationOutcome<unknown> },
 	): SubagentProcessHandle {
 		const handle = new FakeProcessHandle(handlers.onExit);
 		this.handles.set(launchSpec.agentId, handle);
+		if (this.options.fireExitOnLaunch) {
+			handle.exit(this.options.fireExitOnLaunch);
+		}
 		return handle;
 	}
 
@@ -192,10 +210,16 @@ function createManager(
 	times: string[],
 	options: {
 		throwOnSessionOpened?: boolean;
+		fireConnectOnOpen?: boolean;
+		fireExitOnLaunch?: ManagedProcessExit;
 	} = {},
 ) {
-	const sidecars = new FakeSidecarSessions();
-	const processes = new FakeProcesses();
+	const sidecars = new FakeSidecarSessions({
+		fireConnectOnOpen: options.fireConnectOnOpen,
+	});
+	const processes = new FakeProcesses({
+		fireExitOnLaunch: options.fireExitOnLaunch,
+	});
 	const clock = createTimeCursor(...times);
 	const manager = new SubagentManager({
 		now: () => clock.next(),
@@ -514,6 +538,77 @@ describe("SubagentManager", () => {
 		expect(after).toEqual(before);
 	});
 
+	it("honors terminal child state updates and avoids later exit misclassification", () => {
+		const stopped = createManager([
+			"2026-03-11T12:04:50.000Z",
+			"2026-03-11T12:04:51.000Z",
+		]);
+		const stoppedRequest = makeSpawnRequest("agt_state_stopped");
+		expectOk(stopped.manager.spawn(stoppedRequest));
+		expectOk(stopped.sidecars.get("agt_state_stopped").connect());
+		expectOk(stopped.sidecars.get("agt_state_stopped").message(
+			makeEnvelope("agt_state_stopped", "ready", 0, "2026-03-11T12:04:52.000Z", {
+				pid: 1112,
+				sessionPath: stoppedRequest.launchSpec.sessionPath,
+				tmuxTarget: stoppedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(stopped.sidecars.get("agt_state_stopped").message(
+			makeEnvelope("agt_state_stopped", "state", 1, "2026-03-11T12:04:53.000Z", {
+				status: "stopped",
+			}),
+		));
+		expect(expectOk(stopped.manager.getRecord("agt_state_stopped")).state).toBe("stopped");
+		expectOk(stopped.processes.get("agt_state_stopped").exit({ code: 0, signal: null }));
+		expect(expectOk(stopped.manager.getRecord("agt_state_stopped")).state).toBe("stopped");
+
+		const failed = createManager([
+			"2026-03-11T12:04:54.000Z",
+			"2026-03-11T12:04:55.000Z",
+		]);
+		const failedRequest = makeSpawnRequest("agt_state_failed");
+		expectOk(failed.manager.spawn(failedRequest));
+		expectOk(failed.sidecars.get("agt_state_failed").connect());
+		expectOk(failed.sidecars.get("agt_state_failed").message(
+			makeEnvelope("agt_state_failed", "ready", 0, "2026-03-11T12:04:56.000Z", {
+				pid: 1113,
+				sessionPath: failedRequest.launchSpec.sessionPath,
+				tmuxTarget: failedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(failed.sidecars.get("agt_state_failed").message(
+			makeEnvelope("agt_state_failed", "state", 1, "2026-03-11T12:04:57.000Z", {
+				status: "failed",
+			}),
+		));
+		expect(expectOk(failed.manager.getRecord("agt_state_failed")).state).toBe("failed");
+
+		const completed = createManager([
+			"2026-03-11T12:04:58.000Z",
+			"2026-03-11T12:04:59.000Z",
+			"2026-03-11T12:05:02.000Z",
+		]);
+		const completedRequest = makeSpawnRequest("agt_state_completed");
+		expectOk(completed.manager.spawn(completedRequest));
+		expectOk(completed.sidecars.get("agt_state_completed").connect());
+		expectOk(completed.sidecars.get("agt_state_completed").message(
+			makeEnvelope("agt_state_completed", "ready", 0, "2026-03-11T12:05:00.000Z", {
+				pid: 1114,
+				sessionPath: completedRequest.launchSpec.sessionPath,
+				tmuxTarget: completedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(completed.sidecars.get("agt_state_completed").message(
+			makeEnvelope("agt_state_completed", "state", 1, "2026-03-11T12:05:01.000Z", {
+				status: "completed",
+			}),
+		));
+		expectOk(completed.processes.get("agt_state_completed").exit({ code: 0, signal: null }));
+		const completedRecord = expectOk(completed.manager.getRecord("agt_state_completed"));
+		expect(completedRecord.state).toBe("stopped");
+		expect(completedRecord.error).toBeUndefined();
+	});
+
 	it("marks a ready agent degraded on disconnect and rejects further trusted controls", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:05:00.000Z",
@@ -623,6 +718,27 @@ describe("SubagentManager", () => {
 		}
 		expect(processes.get("agt_session_hook").terminateReasons).toEqual(["shutdown"]);
 		expect(manager.getRecord("agt_session_hook").ok).toBe(false);
+	});
+
+	it("handles re-entrant openSession and launch callbacks after runtime registration", () => {
+		const connected = createManager(
+			["2026-03-11T12:06:30.000Z", "2026-03-11T12:06:31.000Z"],
+			{ fireConnectOnOpen: true },
+		);
+		const connectedRequest = makeSpawnRequest("agt_reentrant_connect");
+		const connectedSpawn = expectOk(connected.manager.spawn(connectedRequest));
+		expect(connectedSpawn.state).toBe("connecting");
+		expect(connected.sidecars.get("agt_reentrant_connect").sent.map((message) => message.type)).toEqual(["hello"]);
+
+		const exited = createManager(
+			["2026-03-11T12:06:40.000Z", "2026-03-11T12:06:41.000Z"],
+			{ fireExitOnLaunch: { code: 1, signal: null } },
+		);
+		const exitedRequest = makeSpawnRequest("agt_reentrant_exit");
+		const exitedSpawn = expectOk(exited.manager.spawn(exitedRequest));
+		expect(exitedSpawn.state).toBe("failed");
+		expect(expectOk(exited.manager.getRecord("agt_reentrant_exit")).state).toBe("failed");
+		expect(expectOk(exited.manager.getRecord("agt_reentrant_exit")).error?.message).toContain("exited");
 	});
 
 	it("normalizes intentional shutdown to stopped and treats empty cleanup as a no-op", () => {

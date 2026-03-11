@@ -13,9 +13,9 @@ import {
 	type RuntimeLaunchSpec,
 	type RuntimeState,
 	type SidecarControlMessage,
-	type SidecarControlMessage as AnySidecarControlMessage,
 	type SidecarEventMessage,
 	type SidecarProtocolMessage,
+	type SidecarStateStatus,
 	type SubagentRecord,
 	type UserIntervenedMetadata,
 	type ValidationError,
@@ -77,6 +77,7 @@ interface ManagedRuntime<TData = unknown> {
 	lastHello?: SidecarControlMessage<TData> & { type: "hello" };
 	connectionOpen: boolean;
 	trusted: boolean;
+	lastReportedState?: SidecarStateStatus;
 }
 
 function fail(error: string): ValidationError {
@@ -183,11 +184,21 @@ export class SubagentManager<TData = unknown> {
 		if (!startingRecordResult.ok) return startingRecordResult;
 
 		let sidecar: SidecarSessionHandle<TData>;
+		let runtimeRegistered = false;
+		const pendingCallbacks: Array<() => ValidationOutcome<unknown>> = [];
+		const runOrQueue = (callback: () => ValidationOutcome<unknown>): ValidationOutcome<unknown> => {
+			if (!runtimeRegistered) {
+				pendingCallbacks.push(callback);
+				return ok(undefined);
+			}
+
+			return callback();
+		};
 		try {
 			sidecar = this.options.sidecarSessions.openSession(launchSpec.socketPath, {
-				onConnect: () => this.handleSidecarConnect(launchSpec.agentId),
-				onMessage: (message) => this.handleSidecarMessage(launchSpec.agentId, message),
-				onDisconnect: (reason) => this.handleSidecarDisconnect(launchSpec.agentId, reason),
+				onConnect: () => runOrQueue(() => this.handleSidecarConnect(launchSpec.agentId)),
+				onMessage: (message) => runOrQueue(() => this.handleSidecarMessage(launchSpec.agentId, message)),
+				onDisconnect: (reason) => runOrQueue(() => this.handleSidecarDisconnect(launchSpec.agentId, reason)),
 			});
 		} catch (error) {
 			return fail(`failed to open sidecar session: ${this.describeError(error)}`);
@@ -196,7 +207,7 @@ export class SubagentManager<TData = unknown> {
 		let process: SubagentProcessHandle;
 		try {
 			process = this.options.runtimeProcesses.launch(launchSpec, {
-				onExit: (exit) => this.handleProcessExit(launchSpec.agentId, exit),
+				onExit: (exit) => runOrQueue(() => this.handleProcessExit(launchSpec.agentId, exit)),
 			});
 		} catch (error) {
 			try {
@@ -221,6 +232,7 @@ export class SubagentManager<TData = unknown> {
 			trusted: false,
 		};
 		this.runtimes.set(launchSpec.agentId, runtime);
+		runtimeRegistered = true;
 		try {
 			this.options.onSessionOpened?.(launchSpec.agentId, sidecar);
 		} catch (error) {
@@ -236,6 +248,12 @@ export class SubagentManager<TData = unknown> {
 				// Best-effort cleanup after session registration failure.
 			}
 			return fail(`onSessionOpened failed: ${this.describeError(error)}`);
+		}
+		for (const callback of pendingCallbacks) {
+			const callbackResult = callback();
+			if (!callbackResult.ok) {
+				return callbackResult;
+			}
 		}
 
 		return ok(cloneValue(runtime.record));
@@ -349,6 +367,18 @@ export class SubagentManager<TData = unknown> {
 		if (!exitResult.ok) return exitResult;
 
 		if (this.isTerminal(runtime.record.state)) {
+			return ok(cloneValue(runtime.record));
+		}
+
+		if (runtime.lastReportedState === "completed") {
+			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
+				stoppedAt: this.now(),
+			});
+			if (!stoppedResult.ok) return stoppedResult;
+
+			runtime.record = stoppedResult.value;
+			runtime.connectionOpen = false;
+			runtime.trusted = false;
 			return ok(cloneValue(runtime.record));
 		}
 
@@ -612,20 +642,54 @@ export class SubagentManager<TData = unknown> {
 			return fail("cannot accept state before handshake is complete");
 		}
 
-		if (event.payload.status !== "running" && event.payload.status !== "waiting") {
-			return fail(`cannot accept terminal or unsupported state update: ${event.payload.status}`);
+		runtime.lastReportedState = event.payload.status;
+
+		switch (event.payload.status) {
+			case "starting":
+				return ok(cloneValue(runtime.record));
+			case "running":
+			case "waiting": {
+				const nextState = event.payload.status;
+				const nextRecord = {
+					...runtime.record,
+					state: nextState,
+				};
+				const normalizedResult = this.normalizeWithTransition(runtime.record, nextState, nextRecord);
+				if (!normalizedResult.ok) return normalizedResult;
+
+				runtime.record = normalizedResult.value;
+				return ok(cloneValue(runtime.record));
+			}
+			case "failed": {
+				const nextRecord = {
+					...runtime.record,
+					state: "failed" as const,
+					error: {
+						message: "child reported failed state",
+						recordedAt: event.time,
+						fatal: true,
+					},
+				};
+				const normalizedResult = this.normalizeWithTransition(runtime.record, "failed", nextRecord);
+				if (!normalizedResult.ok) return normalizedResult;
+
+				runtime.record = normalizedResult.value;
+				runtime.trusted = false;
+				return ok(cloneValue(runtime.record));
+			}
+			case "stopped": {
+				const normalizedResult = this.transitionRecord(runtime.record, "stopped", {
+					stoppedAt: event.time,
+				});
+				if (!normalizedResult.ok) return normalizedResult;
+
+				runtime.record = normalizedResult.value;
+				runtime.trusted = false;
+				return ok(cloneValue(runtime.record));
+			}
+			case "completed":
+				return ok(cloneValue(runtime.record));
 		}
-
-		const nextState = event.payload.status;
-		const nextRecord = {
-			...runtime.record,
-			state: nextState,
-		};
-		const normalizedResult = this.normalizeWithTransition(runtime.record, nextState, nextRecord);
-		if (!normalizedResult.ok) return normalizedResult;
-
-		runtime.record = normalizedResult.value;
-		return ok(cloneValue(runtime.record));
 	}
 
 	private applyError(
