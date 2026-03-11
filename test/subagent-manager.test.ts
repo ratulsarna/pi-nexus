@@ -898,6 +898,34 @@ describe("SubagentManager", () => {
 		).toBe(false);
 	});
 
+	it("anchors degradedAt to accepted record chronology on trusted disconnect", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:05:05.000Z",
+			"2026-03-11T12:05:06.000Z",
+			"2026-03-11T12:05:07.000Z",
+		]);
+		const request = makeSpawnRequest("agt_degraded_timestamp");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_degraded_timestamp").connect());
+		expectOk(sidecars.get("agt_degraded_timestamp").message(
+			makeEnvelope("agt_degraded_timestamp", "ready", 0, "2026-03-11T12:05:10.000Z", {
+				pid: 1359,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_degraded_timestamp").message(
+			makeEnvelope("agt_degraded_timestamp", "progress", 1, "2026-03-11T12:05:11.000Z", {
+				summary: "ahead of wall clock",
+			}),
+		));
+
+		expectOk(sidecars.get("agt_degraded_timestamp").disconnect("lost socket"));
+		const record = expectOk(manager.getRecord("agt_degraded_timestamp"));
+		expect(record.state).toBe("degraded");
+		expect(record.degradedAt).toBe("2026-03-11T12:05:11.000Z");
+	});
+
 	it("does not persist terminal child state when a terminal state event is rejected", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:05:06.000Z",

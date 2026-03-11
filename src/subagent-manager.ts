@@ -388,7 +388,7 @@ export class SubagentManager<TData = unknown> {
 
 		if (runtime.record.state === "ready" || runtime.record.state === "running" || runtime.record.state === "waiting") {
 			const degradedResult = this.transitionRecord(runtime.record, "degraded", {
-				degradedAt: this.now(),
+				degradedAt: this.deriveTerminalTimestamp(runtime.record),
 			});
 			if (!degradedResult.ok) return degradedResult;
 			runtime.record = degradedResult.value;
