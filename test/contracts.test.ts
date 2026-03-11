@@ -15,6 +15,7 @@ import {
 	validateReportToParentInput,
 	validateRuntimeBootstrapConfig,
 	validateRuntimeLaunchSpec,
+	validateSidecarProtocolEnvelope,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
 	type RuntimeState,
@@ -1259,6 +1260,301 @@ describe("validateReportToParentInput", () => {
 		expect(result).toEqual({
 			ok: false,
 			error: `cannot accept ${kind} report after final_result has been recorded`,
+		});
+	});
+});
+
+describe("sidecar protocol envelope", () => {
+	function makeEnvelope(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			version: 1,
+			agentId: "agt_123",
+			type: "progress",
+			seq: 12,
+			time: "2026-03-10T10:00:00.000Z",
+			payload: {
+				summary: "Mapped auth flow",
+				data: { files: 2 },
+			},
+			...overrides,
+		};
+	}
+
+	it("accepts all supported sidecar message kinds", () => {
+		const validCases: ReadonlyArray<[type: string, payload: Record<string, unknown>]> = [
+			[
+				"hello",
+				{
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			],
+			[
+				"ready",
+				{
+					pid: 12345,
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			],
+			[
+				"progress",
+				{
+					summary: "Working",
+					data: { files: ["/repo/src/auth.ts"] },
+				},
+			],
+			[
+				"final_result",
+				{
+					summary: "Done",
+					data: { findings: 2 },
+				},
+			],
+			[
+				"needs_input",
+				{
+					question: "Proceed with migration?",
+					kind: "decision",
+				},
+			],
+			[
+				"user_intervened",
+				{
+					source: "tmux",
+					mode: "direct-chat",
+				},
+			],
+			[
+				"state",
+				{
+					status: "running",
+				},
+			],
+			[
+				"error",
+				{
+					message: "bridge disconnected",
+					fatal: true,
+				},
+			],
+			["ping", {}],
+			["pong", {}],
+		];
+
+		for (const [type, payload] of validCases) {
+			const result = validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					type,
+					payload,
+				}),
+			);
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(result.value.type).toBe(type);
+		}
+	});
+
+	it("normalizes trim-sensitive text fields", () => {
+		const result = validateSidecarProtocolEnvelope(
+			makeEnvelope({
+				agentId: "  agt_123  ",
+				type: "progress",
+				payload: {
+					summary: "  mapped auth flow  ",
+					data: undefined,
+				},
+			}),
+		);
+
+		expect(result).toEqual({
+			ok: true,
+			value: {
+				version: 1,
+				agentId: "agt_123",
+				type: "progress",
+				seq: 12,
+				time: "2026-03-10T10:00:00.000Z",
+				payload: {
+					summary: "mapped auth flow",
+					data: null,
+				},
+			},
+		});
+	});
+
+	it("rejects malformed envelopes with deterministic errors", () => {
+		expect(validateSidecarProtocolEnvelope(null)).toEqual({
+			ok: false,
+			error: "sidecar envelope must be an object",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					version: 2,
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope version must be 1",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					type: "steer",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope type must be one of: hello, ready, progress, final_result, needs_input, user_intervened, state, error, ping, pong",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					seq: -1,
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope seq must be a non-negative safe integer",
+		});
+
+		expect(
+			validateSidecarProtocolEnvelope(
+				makeEnvelope({
+					time: "not-a-date",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "sidecar envelope time must be an ISO timestamp",
+		});
+
+		const envelopeWithoutPayload = makeEnvelope();
+		delete (envelopeWithoutPayload as { payload?: unknown }).payload;
+
+		expect(validateSidecarProtocolEnvelope(envelopeWithoutPayload)).toEqual({
+			ok: false,
+			error: "sidecar envelope payload is required",
+		});
+	});
+
+	it.each([
+		[
+			"hello",
+			makeEnvelope({
+				type: "hello",
+				payload: {
+					sessionPath: "session.jsonl",
+					tmuxTarget: "main:2.1",
+					mode: "pane",
+				},
+			}),
+			"hello.payload.sessionPath must be an absolute path",
+		],
+		[
+			"ready",
+			makeEnvelope({
+				type: "ready",
+				payload: {
+					pid: 0,
+					sessionPath: path.join(fakeRuntimeDir, "session.jsonl"),
+					tmuxTarget: "main:2.1",
+				},
+			}),
+			"ready.payload.pid must be a positive safe integer",
+		],
+		[
+			"progress",
+			makeEnvelope({
+				type: "progress",
+				payload: {
+					summary: "  ",
+				},
+			}),
+			"progress.payload.summary must be a non-empty string",
+		],
+		[
+			"final_result",
+			makeEnvelope({
+				type: "final_result",
+				payload: {
+					summary: "",
+				},
+			}),
+			"final_result.payload.summary must be a non-empty string",
+		],
+		[
+			"needs_input",
+			makeEnvelope({
+				type: "needs_input",
+				payload: {
+					question: "",
+					kind: "decision",
+				},
+			}),
+			"needs_input.payload.question must be a non-empty string",
+		],
+		[
+			"user_intervened",
+			makeEnvelope({
+				type: "user_intervened",
+				payload: {
+					source: "tmux",
+					mode: "broadcast",
+				},
+			}),
+			"user_intervened.payload.mode must be direct-chat",
+		],
+		[
+			"state",
+			makeEnvelope({
+				type: "state",
+				payload: {
+					status: "ready",
+				},
+			}),
+			"state.payload.status must be one of: starting, running, waiting, completed, failed, stopped",
+		],
+		[
+			"error",
+			makeEnvelope({
+				type: "error",
+				payload: {
+					message: "fatal",
+					fatal: "yes",
+				},
+			}),
+			"error.payload.fatal must be a boolean",
+		],
+		[
+			"ping",
+			makeEnvelope({
+				type: "ping",
+				payload: {
+					extra: true,
+				},
+			}),
+			"ping.payload must be an empty object",
+		],
+		[
+			"pong",
+			makeEnvelope({
+				type: "pong",
+				payload: {
+					extra: true,
+				},
+			}),
+			"pong.payload must be an empty object",
+		],
+	])("rejects invalid %s payloads", (_type, envelope, expectedError) => {
+		expect(validateSidecarProtocolEnvelope(envelope)).toEqual({
+			ok: false,
+			error: expectedError,
 		});
 	});
 });

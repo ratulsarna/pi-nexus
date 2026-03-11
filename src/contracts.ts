@@ -98,6 +98,88 @@ export interface ReportToParentInput<TData = unknown> {
 	data?: TData | null;
 }
 
+export interface SidecarHelloPayload {
+	sessionPath: string;
+	tmuxTarget: string;
+	mode: TmuxMode;
+}
+
+export interface SidecarReadyPayload {
+	pid: number;
+	sessionPath: string;
+	tmuxTarget: string;
+}
+
+export interface SidecarProgressPayload<TData = unknown> {
+	summary: string;
+	data: TData | null;
+}
+
+export interface SidecarFinalResultPayload<TData = unknown> {
+	summary: string;
+	data: TData | null;
+}
+
+export interface SidecarNeedsInputPayload {
+	question: string;
+	kind: string;
+}
+
+export interface SidecarUserIntervenedPayload {
+	source: "tmux";
+	mode: "direct-chat";
+}
+
+export type SidecarStateStatus =
+	| "starting"
+	| "running"
+	| "waiting"
+	| "completed"
+	| "failed"
+	| "stopped";
+
+export interface SidecarStatePayload {
+	status: SidecarStateStatus;
+}
+
+export interface SidecarErrorPayload {
+	message: string;
+	fatal: boolean;
+}
+
+export type SidecarEmptyPayload = Record<string, never>;
+
+export interface SidecarPayloadByType<TData = unknown> {
+	hello: SidecarHelloPayload;
+	ready: SidecarReadyPayload;
+	progress: SidecarProgressPayload<TData>;
+	final_result: SidecarFinalResultPayload<TData>;
+	needs_input: SidecarNeedsInputPayload;
+	user_intervened: SidecarUserIntervenedPayload;
+	state: SidecarStatePayload;
+	error: SidecarErrorPayload;
+	ping: SidecarEmptyPayload;
+	pong: SidecarEmptyPayload;
+}
+
+export type SidecarMessageKind = keyof SidecarPayloadByType;
+
+export interface SidecarEnvelope<TType extends SidecarMessageKind = SidecarMessageKind, TData = unknown> {
+	version: 1;
+	agentId: string;
+	type: TType;
+	seq: number;
+	time: string;
+	payload: SidecarPayloadByType<TData>[TType];
+}
+
+export type SidecarProtocolMessage<TData = unknown> = {
+	[TType in SidecarMessageKind]: SidecarEnvelope<TType, TData>;
+}[SidecarMessageKind];
+
+export type SidecarControlMessage = Extract<SidecarProtocolMessage, { type: "hello" | "ping" }>;
+export type SidecarEventMessage = Exclude<SidecarProtocolMessage, SidecarControlMessage>;
+
 export type ChildInputOrigin =
 	| "interactive-user"
 	| "parent-steer"
@@ -147,6 +229,28 @@ const RUNTIME_STATES = new Set<RuntimeState>([
 	"degraded",
 ]);
 const REPORT_KINDS = new Set<ReportKind>(["progress", "final_result", "needs_input"]);
+const SIDECAR_MESSAGE_KINDS: ReadonlyArray<SidecarMessageKind> = [
+	"hello",
+	"ready",
+	"progress",
+	"final_result",
+	"needs_input",
+	"user_intervened",
+	"state",
+	"error",
+	"ping",
+	"pong",
+];
+const SIDECAR_MESSAGE_KIND_SET = new Set<SidecarMessageKind>(SIDECAR_MESSAGE_KINDS);
+const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
+	"starting",
+	"running",
+	"waiting",
+	"completed",
+	"failed",
+	"stopped",
+]);
+const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["ping", "pong"]);
 const STATES_REQUIRING_CONNECTED_AT = new Set<RuntimeState>([
 	"ready",
 	"running",
@@ -872,6 +976,155 @@ export function validateReportToParentInput<TData = unknown>(
 		summary: summary.trim(),
 		data: normalizeOptionalData<TData>(input),
 	});
+}
+
+function validateSidecarPayload<TData = unknown>(
+	type: SidecarMessageKind,
+	payload: unknown,
+): ValidationOutcome<SidecarPayloadByType<TData>[SidecarMessageKind]> {
+	if (!isRecord(payload)) {
+		return fail(`${type}.payload must be an object`);
+	}
+
+	if (SIDECAR_EMPTY_PAYLOAD_TYPES.has(type)) {
+		if (Object.keys(payload).length > 0) {
+			return fail(`${type}.payload must be an empty object`);
+		}
+		return ok({} as SidecarEmptyPayload);
+	}
+
+	switch (type) {
+		case "hello": {
+			const sessionPathError = validateRequiredPath("hello.payload.sessionPath", payload.sessionPath);
+			if (sessionPathError) return sessionPathError;
+			const tmuxTargetError = validateRequiredText("hello.payload.tmuxTarget", payload.tmuxTarget);
+			if (tmuxTargetError) return tmuxTargetError;
+			if (payload.mode !== "pane" && payload.mode !== "window") {
+				return fail("hello.payload.mode must be either \"pane\" or \"window\"");
+			}
+
+			return ok({
+				sessionPath: payload.sessionPath as string,
+				tmuxTarget: (payload.tmuxTarget as string).trim(),
+				mode: payload.mode,
+			});
+		}
+		case "ready": {
+			if (typeof payload.pid !== "number" || !Number.isSafeInteger(payload.pid) || payload.pid <= 0) {
+				return fail("ready.payload.pid must be a positive safe integer");
+			}
+			const sessionPathError = validateRequiredPath("ready.payload.sessionPath", payload.sessionPath);
+			if (sessionPathError) return sessionPathError;
+			const tmuxTargetError = validateRequiredText("ready.payload.tmuxTarget", payload.tmuxTarget);
+			if (tmuxTargetError) return tmuxTargetError;
+
+			return ok({
+				pid: payload.pid,
+				sessionPath: payload.sessionPath as string,
+				tmuxTarget: (payload.tmuxTarget as string).trim(),
+			});
+		}
+		case "progress":
+		case "final_result": {
+			const summaryError = validateRequiredText(`${type}.payload.summary`, payload.summary);
+			if (summaryError) return summaryError;
+
+			return ok({
+				summary: (payload.summary as string).trim(),
+				data: normalizeOptionalData<TData>(payload),
+			});
+		}
+		case "needs_input": {
+			const questionError = validateRequiredText("needs_input.payload.question", payload.question);
+			if (questionError) return questionError;
+			const kindError = validateRequiredText("needs_input.payload.kind", payload.kind);
+			if (kindError) return kindError;
+
+			return ok({
+				question: (payload.question as string).trim(),
+				kind: (payload.kind as string).trim(),
+			});
+		}
+		case "user_intervened": {
+			if (payload.source !== "tmux") {
+				return fail("user_intervened.payload.source must be tmux");
+			}
+			if (payload.mode !== "direct-chat") {
+				return fail("user_intervened.payload.mode must be direct-chat");
+			}
+
+			return ok({
+				source: payload.source,
+				mode: payload.mode,
+			});
+		}
+		case "state": {
+			const status = payload.status;
+			if (typeof status !== "string" || !SIDECAR_STATE_STATUSES.has(status as SidecarStateStatus)) {
+				return fail("state.payload.status must be one of: starting, running, waiting, completed, failed, stopped");
+			}
+
+			return ok({
+				status: status as SidecarStateStatus,
+			});
+		}
+		case "error": {
+			const messageError = validateRequiredText("error.payload.message", payload.message);
+			if (messageError) return messageError;
+			if (typeof payload.fatal !== "boolean") {
+				return fail("error.payload.fatal must be a boolean");
+			}
+
+			return ok({
+				message: (payload.message as string).trim(),
+				fatal: payload.fatal,
+			});
+		}
+	}
+}
+
+export function validateSidecarProtocolEnvelope<TData = unknown>(
+	input: unknown,
+): ValidationOutcome<SidecarProtocolMessage<TData>> {
+	if (!isRecord(input)) {
+		return fail("sidecar envelope must be an object");
+	}
+
+	if (input.version !== 1) {
+		return fail("sidecar envelope version must be 1");
+	}
+
+	const agentIdError = validateRequiredText("sidecar envelope agentId", input.agentId);
+	if (agentIdError) return agentIdError;
+
+	const type = input.type;
+	if (typeof type !== "string" || !SIDECAR_MESSAGE_KIND_SET.has(type as SidecarMessageKind)) {
+		return fail(`sidecar envelope type must be one of: ${SIDECAR_MESSAGE_KINDS.join(", ")}`);
+	}
+
+	if (typeof input.seq !== "number" || !Number.isSafeInteger(input.seq) || input.seq < 0) {
+		return fail("sidecar envelope seq must be a non-negative safe integer");
+	}
+
+	if (typeof input.time !== "string" || !isIsoTimestamp(input.time)) {
+		return fail("sidecar envelope time must be an ISO timestamp");
+	}
+
+	if (!hasOwnField(input, "payload")) {
+		return fail("sidecar envelope payload is required");
+	}
+
+	const payloadResult = validateSidecarPayload<TData>(type as SidecarMessageKind, input.payload);
+	if (!payloadResult.ok) return payloadResult;
+
+	return ok({
+		version: 1,
+		agentId: (input.agentId as string).trim(),
+		type: type as SidecarMessageKind,
+		seq: input.seq,
+		time: input.time,
+		payload: payloadResult.value,
+	} as SidecarProtocolMessage<TData>);
 }
 
 export function shouldEmitUserIntervened(event: ChildInputEvent): boolean {
