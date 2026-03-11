@@ -311,6 +311,12 @@ export class SubagentManager<TData = unknown> {
 		if (runtime.connectionOpen) {
 			return fail(`sidecar is already connected for agent ${agentId}`);
 		}
+		if (runtime.record.state === "degraded") {
+			return fail(`cannot reconnect sidecar for degraded agent ${agentId}`);
+		}
+		if (this.isTerminalReportedState(runtime.lastReportedState)) {
+			return fail(`cannot reconnect sidecar after terminal child state for agent ${agentId}`);
+		}
 		if (this.isTerminal(runtime.record.state)) {
 			return fail(`cannot connect sidecar for terminal agent ${agentId}`);
 		}
@@ -367,6 +373,10 @@ export class SubagentManager<TData = unknown> {
 		this.clearConnectingTimeout(runtime);
 		runtime.connectionOpen = false;
 		runtime.trusted = false;
+
+		if (this.isTerminalReportedState(runtime.lastReportedState)) {
+			return ok(cloneValue(runtime.record));
+		}
 
 		if (this.isTerminal(runtime.record.state)) {
 			return ok(cloneValue(runtime.record));
@@ -755,6 +765,7 @@ export class SubagentManager<TData = unknown> {
 				return ok(cloneValue(runtime.record));
 			}
 			case "completed":
+				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
 		}
 	}

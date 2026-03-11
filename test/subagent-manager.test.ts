@@ -707,12 +707,22 @@ describe("SubagentManager", () => {
 				status: "completed",
 			}),
 		));
+		expect(completed.manager.sendSteer("agt_state_completed", "too late").ok).toBe(false);
+		expect(
+			completed.sidecars.get("agt_state_completed").message(
+				makeEnvelope("agt_state_completed", "progress", 2, "2026-03-11T12:05:01.250Z", {
+					summary: "should not apply",
+				}),
+			).ok,
+		).toBe(false);
 		const completedBeforeNonTerminal = expectOk(completed.manager.getRecord("agt_state_completed"));
-		expectOk(completed.sidecars.get("agt_state_completed").message(
-			makeEnvelope("agt_state_completed", "state", 2, "2026-03-11T12:05:01.500Z", {
-				status: "running",
-			}),
-		));
+		expect(
+			completed.sidecars.get("agt_state_completed").message(
+				makeEnvelope("agt_state_completed", "state", 3, "2026-03-11T12:05:01.500Z", {
+					status: "running",
+				}),
+			).ok,
+		).toBe(false);
 		expect(expectOk(completed.manager.getRecord("agt_state_completed"))).toEqual(completedBeforeNonTerminal);
 		expectOk(completed.processes.get("agt_state_completed").exit({ code: 0, signal: null }));
 		const completedRecord = expectOk(completed.manager.getRecord("agt_state_completed"));
@@ -764,6 +774,11 @@ describe("SubagentManager", () => {
 		expectOk(sidecars.get("agt_degraded").disconnect("lost socket"));
 		expect(expectOk(manager.getRecord("agt_degraded")).state).toBe("degraded");
 		expect(manager.sendSteer("agt_degraded", "no longer trusted").ok).toBe(false);
+		expect(manager.handleSidecarConnect("agt_degraded")).toEqual({
+			ok: false,
+			error: "cannot reconnect sidecar for degraded agent agt_degraded",
+		});
+		expect(sidecars.get("agt_degraded").sent.map((message) => message.type)).toEqual(["hello"]);
 		expect(
 			sidecars.get("agt_degraded").message(
 				makeEnvelope("agt_degraded", "progress", 1, "2026-03-11T12:05:04.000Z", {
