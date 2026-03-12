@@ -2161,6 +2161,65 @@ describe("validateSubagentRecord", () => {
 		expect(result.ok).toBe(true);
 	});
 
+	it("returns a validation error when finalResult data cannot be deep-compared", () => {
+		const hostileData: Record<string, unknown> = {};
+		Object.defineProperty(hostileData, "boom", {
+			enumerable: true,
+			get() {
+				throw new Error("getter exploded");
+			},
+		});
+
+		expect(() =>
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "latest",
+						data: hostileData,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: { boom: "safe" },
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).not.toThrow();
+
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "latest",
+						data: hostileData,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: { boom: "safe" },
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "finalResult.data must be comparable: getter exploded",
+		});
+	});
+
 	it("accepts userIntervenedHistory as history-only metadata", () => {
 		expect(
 			validateSubagentRecord(

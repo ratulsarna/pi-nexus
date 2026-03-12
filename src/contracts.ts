@@ -974,6 +974,26 @@ function prefixNestedValidationError(field: string, nestedField: string, error: 
 	return `${field} ${error}`;
 }
 
+function describeThrownError(error: unknown): string {
+	if (error instanceof Error) {
+		return error.message;
+	}
+	try {
+		return String(error);
+	} catch {
+		return "unknown error";
+	}
+}
+
+function safeDeepStrictEqual(field: string, left: unknown, right: unknown): ValidationOutcome<boolean> {
+	try {
+		return ok(isDeepStrictEqual(left, right));
+	} catch (error) {
+		const reason = describeThrownError(error);
+		return fail(`${field} must be comparable: ${reason}`);
+	}
+}
+
 function validateRuntimeFailure(error: unknown): ValidationOutcome<RuntimeFailure> {
 	if (!isRecord(error)) {
 		return fail("error must be an object");
@@ -1633,10 +1653,16 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 	}
 	if (normalizedFinalResult && normalizedFinalResultHistory) {
 		const latestHistoryEntry = normalizedFinalResultHistory.at(-1)!;
+		const dataEqualityResult = safeDeepStrictEqual(
+			"finalResult.data",
+			latestHistoryEntry.data ?? null,
+			normalizedFinalResult.data ?? null,
+		);
+		if (!dataEqualityResult.ok) return dataEqualityResult;
 		if (
 			latestHistoryEntry.summary !== normalizedFinalResult.summary
 			|| latestHistoryEntry.reportedAt !== normalizedFinalResult.reportedAt
-			|| !isDeepStrictEqual(latestHistoryEntry.data ?? null, normalizedFinalResult.data ?? null)
+			|| !dataEqualityResult.value
 		) {
 			return fail("finalResult must match the latest finalResultHistory entry");
 		}
