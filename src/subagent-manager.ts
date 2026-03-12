@@ -465,8 +465,13 @@ export class SubagentManager<TData = unknown> {
 		const clearSilentDisconnectDegradedAt = runtime.lastPostReadyDisconnect !== undefined
 			&& runtime.lastPostReadyDisconnect.reason === undefined
 			&& runtime.lastPostReadyDisconnect.degradedAt === runtime.record.degradedAt;
+		const cleanExitCanStop =
+			runtime.record.state === "ready"
+			|| runtime.record.state === "running"
+			|| runtime.record.state === "waiting"
+			|| runtime.record.state === "needs_input";
 
-		if (exitResult.value.code === 0 && exitResult.value.signal === null) {
+		if (exitResult.value.code === 0 && exitResult.value.signal === null && cleanExitCanStop) {
 			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
 				degradedAt: clearSilentDisconnectDegradedAt ? undefined : runtime.record.degradedAt,
 				stoppedAt: terminalTimestamp,
@@ -474,6 +479,20 @@ export class SubagentManager<TData = unknown> {
 			if (!stoppedResult.ok) return stoppedResult;
 
 			runtime.record = stoppedResult.value;
+			runtime.lastPostReadyDisconnect = undefined;
+			runtime.connectionOpen = false;
+			runtime.trusted = false;
+			return ok(cloneValue(runtime.record));
+		}
+
+		if (exitResult.value.code === 0 && exitResult.value.signal === null && runtime.record.state === "failed") {
+			const normalizedFailedResult = normalizeRecord<TData>({
+				...runtime.record,
+				degradedAt: clearSilentDisconnectDegradedAt ? undefined : runtime.record.degradedAt,
+			});
+			if (!normalizedFailedResult.ok) return normalizedFailedResult;
+
+			runtime.record = normalizedFailedResult.value;
 			runtime.lastPostReadyDisconnect = undefined;
 			runtime.connectionOpen = false;
 			runtime.trusted = false;

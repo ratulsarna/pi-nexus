@@ -1304,6 +1304,31 @@ describe("SubagentManager", () => {
 		expect(expectOk(second.manager.getRecord("agt_fail_exit")).error?.message).toContain("exited");
 	});
 
+	it("treats clean pre-ready exits as failures and does not erase existing failed state", () => {
+		const connecting = createManager([
+			"2026-03-11T12:06:12.000Z",
+			"2026-03-11T12:06:13.000Z",
+		]);
+		expectOk(connecting.manager.spawn(makeSpawnRequest("agt_clean_exit_connecting")));
+		expectOk(connecting.processes.get("agt_clean_exit_connecting").exit({ code: 0, signal: null }));
+		const connectingRecord = expectOk(connecting.manager.getRecord("agt_clean_exit_connecting"));
+		expect(connectingRecord.state).toBe("failed");
+		expect(connectingRecord.error?.message).toContain("code 0");
+
+		const failed = createManager([
+			"2026-03-11T12:06:14.000Z",
+			"2026-03-11T12:06:15.000Z",
+		]);
+		expectOk(failed.manager.spawn(makeSpawnRequest("agt_clean_exit_failed")));
+		expectOk(failed.sidecars.get("agt_clean_exit_failed").disconnect("no handshake"));
+		const failedBeforeExit = expectOk(failed.manager.getRecord("agt_clean_exit_failed"));
+		expect(failedBeforeExit.state).toBe("failed");
+		expectOk(failed.processes.get("agt_clean_exit_failed").exit({ code: 0, signal: null }));
+		const failedAfterExit = expectOk(failed.manager.getRecord("agt_clean_exit_failed"));
+		expect(failedAfterExit.state).toBe("failed");
+		expect(failedAfterExit.error).toEqual(failedBeforeExit.error);
+	});
+
 	it("anchors pre-ready disconnect failure timestamps to accepted record chronology", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:06:30.000Z",
