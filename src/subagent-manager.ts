@@ -479,7 +479,8 @@ export class SubagentManager<TData = unknown> {
 			runtime.record.state === "ready"
 			|| runtime.record.state === "running"
 			|| runtime.record.state === "waiting"
-			|| runtime.record.state === "needs_input";
+			|| runtime.record.state === "needs_input"
+			|| (runtime.record.state === "failed" && runtime.record.connectedAt !== undefined);
 
 		if (exitResult.value.code === 0 && exitResult.value.signal === null && cleanExitCanStop) {
 			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
@@ -495,7 +496,12 @@ export class SubagentManager<TData = unknown> {
 			return ok(cloneValue(runtime.record));
 		}
 
-		if (exitResult.value.code === 0 && exitResult.value.signal === null && runtime.record.state === "failed") {
+		if (
+			exitResult.value.code === 0
+			&& exitResult.value.signal === null
+			&& runtime.record.state === "failed"
+			&& runtime.record.connectedAt === undefined
+		) {
 			const normalizedFailedResult = normalizeRecord<TData>({
 				...runtime.record,
 				degradedAt: clearSilentDisconnectDegradedAt ? undefined : runtime.record.degradedAt,

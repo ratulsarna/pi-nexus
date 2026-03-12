@@ -1408,6 +1408,31 @@ describe("SubagentManager", () => {
 		const failedAfterExit = expectOk(failed.manager.getRecord("agt_clean_exit_failed"));
 		expect(failedAfterExit.state).toBe("failed");
 		expect(failedAfterExit.error).toEqual(failedBeforeExit.error);
+
+		const postReadyFailed = createManager([
+			"2026-03-11T12:06:13.000Z",
+			"2026-03-11T12:06:16.000Z",
+		]);
+		const postReadyFailedRequest = makeSpawnRequest("agt_clean_exit_failed_post_ready");
+		expectOk(postReadyFailed.manager.spawn(postReadyFailedRequest));
+		expectOk(postReadyFailed.sidecars.get("agt_clean_exit_failed_post_ready").connect());
+		expectOk(postReadyFailed.sidecars.get("agt_clean_exit_failed_post_ready").message(
+			makeEnvelope("agt_clean_exit_failed_post_ready", "ready", 0, "2026-03-11T12:06:14.000Z", {
+				pid: 1361,
+				sessionPath: postReadyFailedRequest.launchSpec.sessionPath,
+				tmuxTarget: postReadyFailedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(postReadyFailed.sidecars.get("agt_clean_exit_failed_post_ready").message(
+			makeEnvelope("agt_clean_exit_failed_post_ready", "state", 1, "2026-03-11T12:06:15.000Z", {
+				status: "failed",
+			}),
+		));
+		expectOk(postReadyFailed.processes.get("agt_clean_exit_failed_post_ready").exit({ code: 0, signal: null }));
+		const postReadyFailedAfterExit = expectOk(postReadyFailed.manager.getRecord("agt_clean_exit_failed_post_ready"));
+		expect(postReadyFailedAfterExit.state).toBe("stopped");
+		expect(postReadyFailedAfterExit.error).toBeUndefined();
+		expect(postReadyFailedAfterExit.stoppedAt).toBe("2026-03-11T12:06:16.000Z");
 	});
 
 	it("does not try to degrade failed records that never finished handshake", () => {
