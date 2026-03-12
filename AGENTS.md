@@ -24,10 +24,22 @@
 
 ## Cursor Cloud specific instructions
 
-This is a pure TypeScript library (no running services, no Docker, no database). All commands run from the repo root.
+This is a TypeScript library (no running services, no Docker, no database). All commands run from the repo root (`/workspace`).
+
+### pi-nexus commands
 
 - **Build:** `npm run build` — compiles `src/` → `dist/` via `tsc -p tsconfig.build.json`.
 - **Test:** `npm test` — runs `vitest --run` (272 tests across 4 files; all unit tests, no external deps).
 - **Type-check (lint equivalent):** `npx tsc -p tsconfig.build.json --noEmit` — no ESLint/Prettier is configured; the TypeScript strict-mode build is the effective lint. Use `tsconfig.build.json`, not the bare `tsconfig.json`, to avoid pre-existing mock-type mismatches in test files.
-- **Acceptance test:** `npm run accept:rat-134` requires `tmux` and the `pi` CLI on PATH; it is not needed for normal development and the `pi` CLI is not available in the cloud VM.
+- **Acceptance test:** `npm run accept:rat-134` — requires `tmux` (pre-installed) and the `pi` CLI on PATH (see below). Exercises real `hello → ready → ping → pong` lifecycle over Unix domain sockets in tmux.
 - The test config (`tsconfig.test.json`) includes test files and will show type errors from mock objects — this is expected and does not indicate a problem.
+
+### pi-mono (dependency)
+
+pi-nexus is an extension/plugin for the [pi-mono](https://github.com/badlogic/pi-mono) coding agent. The `pi` CLI is needed for the acceptance test (`accept:rat-134`).
+
+- **Location:** `/home/ubuntu/pi-mono` (cloned from GitHub).
+- **Build:** `cd /home/ubuntu/pi-mono && npm install && npm run build` — builds all workspace packages (tui → ai → agent → coding-agent → mom → web-ui → pods).
+- **pi CLI symlink:** `/home/ubuntu/.local/bin/pi` → `/home/ubuntu/pi-mono/packages/coding-agent/dist/cli.js`. The update script ensures `~/.local/bin` is on PATH.
+- To update pi-mono: `cd /home/ubuntu/pi-mono && git pull && npm install && npm run build`.
+- pi-mono's `npm run build` fetches model metadata from remote APIs (models.dev, OpenRouter, Vercel) during the `pi-ai` package build step. This requires network access and adds ~1-2s to the build.
