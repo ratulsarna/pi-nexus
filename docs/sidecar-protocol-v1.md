@@ -160,7 +160,8 @@ Payload:
 Rules:
 
 - authoritative protocol vocabulary uses `interrupt`
-- on successful handling, the parent clears any pending input request and moves posture to `waiting`
+- sending `interrupt` does not let the parent guess posture from transport success alone
+- once the child has successfully honored the interrupt, the resulting accepted lifecycle update clears any pending input request and moves posture to `waiting`
 
 ### `ping`
 

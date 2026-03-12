@@ -253,8 +253,9 @@ The live tmux child is the source of truth for:
 ### Parent `interrupt`
 
 - `interrupt` is the authoritative control vocabulary at the contract boundary
-- a successful interrupt clears any pending input request
-- a successful interrupt moves posture to `waiting`
+- sending `interrupt` alone does not authorize the parent to rewrite posture
+- once the child has successfully honored the interrupt, the resulting accepted lifecycle update clears any pending input request
+- once the child has successfully honored the interrupt, the resulting accepted lifecycle update moves posture to `waiting`
 
 ## Relationship to the protocol
 

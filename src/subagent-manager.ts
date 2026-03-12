@@ -403,6 +403,9 @@ export class SubagentManager<TData = unknown> {
 			|| runtime.record.state === "failed"
 		) {
 			this.clearConnectingTimeout(runtime);
+			if (reason === undefined) {
+				return ok(cloneValue(runtime.record));
+			}
 			const degradedResult = normalizeRecord<TData>({
 				...runtime.record,
 				degradedAt: this.deriveTerminalTimestamp(runtime.record),
@@ -491,22 +494,7 @@ export class SubagentManager<TData = unknown> {
 	}
 
 	public sendInterrupt(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {
-		const controlResult = this.sendControl(agentId, "interrupt", {});
-		if (!controlResult.ok) return controlResult;
-
-		const runtimeResult = this.getRuntime(agentId);
-		if (!runtimeResult.ok) return runtimeResult;
-		const runtime = runtimeResult.value;
-		const normalizedResult = normalizeRecord<TData>({
-			...runtime.record,
-			state: "waiting",
-			pendingInputRequest: undefined,
-			error: undefined,
-		});
-		if (!normalizedResult.ok) return normalizedResult;
-
-		runtime.record = normalizedResult.value;
-		return ok(cloneValue(controlResult.value));
+		return this.sendControl(agentId, "interrupt", {});
 	}
 
 	public sendPing(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {

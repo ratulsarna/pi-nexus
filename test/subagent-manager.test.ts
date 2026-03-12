@@ -442,6 +442,35 @@ describe("SubagentManager", () => {
 		expect(processes.get("agt_controls").terminateReasons).toEqual([]);
 	});
 
+	it("does not rewrite child-authored posture immediately when interrupt is only sent", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:02:10.000Z",
+			"2026-03-11T12:02:11.000Z",
+		]);
+		const request = makeSpawnRequest("agt_interrupt_pending");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_interrupt_pending").connect());
+		expectOk(sidecars.get("agt_interrupt_pending").message(
+			makeEnvelope("agt_interrupt_pending", "ready", 0, "2026-03-11T12:02:12.000Z", {
+				pid: 5679,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_interrupt_pending").message(
+			makeEnvelope("agt_interrupt_pending", "needs_input", 1, "2026-03-11T12:02:13.000Z", {
+				question: "Need approval",
+				kind: "decision",
+			}),
+		));
+
+		expectOk(manager.sendInterrupt("agt_interrupt_pending"));
+
+		const record = expectOk(manager.getRecord("agt_interrupt_pending"));
+		expect(record.state).toBe("needs_input");
+		expect(record.pendingInputRequest?.summary).toBe("Need approval");
+	});
+
 	it("updates authoritative state from accepted child events", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:03:00.000Z",
@@ -968,6 +997,49 @@ describe("SubagentManager", () => {
 		const record = expectOk(manager.getRecord("agt_degraded_timestamp"));
 		expect(record.state).toBe("running");
 		expect(record.degradedAt).toBe("2026-03-11T12:05:11.000Z");
+	});
+
+	it("does not stamp degradedAt for silent post-ready disconnects that are immediately resolved by process exit", () => {
+		const clean = createManager([
+			"2026-03-11T12:05:12.000Z",
+			"2026-03-11T12:05:13.000Z",
+		]);
+		const cleanRequest = makeSpawnRequest("agt_exit_disconnect_clean");
+		expectOk(clean.manager.spawn(cleanRequest));
+		expectOk(clean.sidecars.get("agt_exit_disconnect_clean").connect());
+		expectOk(clean.sidecars.get("agt_exit_disconnect_clean").message(
+			makeEnvelope("agt_exit_disconnect_clean", "ready", 0, "2026-03-11T12:05:14.000Z", {
+				pid: 1361,
+				sessionPath: cleanRequest.launchSpec.sessionPath,
+				tmuxTarget: cleanRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(clean.sidecars.get("agt_exit_disconnect_clean").disconnect());
+		expectOk(clean.processes.get("agt_exit_disconnect_clean").exit({ code: 0, signal: null }));
+		const cleanRecord = expectOk(clean.manager.getRecord("agt_exit_disconnect_clean"));
+		expect(cleanRecord.state).toBe("stopped");
+		expect(cleanRecord.degradedAt).toBeUndefined();
+
+		const failed = createManager([
+			"2026-03-11T12:05:15.000Z",
+			"2026-03-11T12:05:16.000Z",
+		]);
+		const failedRequest = makeSpawnRequest("agt_exit_disconnect_failed");
+		expectOk(failed.manager.spawn(failedRequest));
+		expectOk(failed.sidecars.get("agt_exit_disconnect_failed").connect());
+		expectOk(failed.sidecars.get("agt_exit_disconnect_failed").message(
+			makeEnvelope("agt_exit_disconnect_failed", "ready", 0, "2026-03-11T12:05:17.000Z", {
+				pid: 1362,
+				sessionPath: failedRequest.launchSpec.sessionPath,
+				tmuxTarget: failedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(failed.sidecars.get("agt_exit_disconnect_failed").disconnect());
+		expectOk(failed.processes.get("agt_exit_disconnect_failed").exit({ code: 1, signal: null }));
+		const failedRecord = expectOk(failed.manager.getRecord("agt_exit_disconnect_failed"));
+		expect(failedRecord.state).toBe("failed");
+		expect(failedRecord.degradedAt).toBeUndefined();
+		expect(failedRecord.error?.message).toContain("code 1");
 	});
 
 	it("does not persist terminal child state when a terminal state event is rejected", () => {

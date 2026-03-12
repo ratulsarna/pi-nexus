@@ -2137,6 +2137,30 @@ describe("validateSubagentRecord", () => {
 		});
 	});
 
+	it("accepts semantically equal finalResult data without depending on JSON serialization", () => {
+		const result = validateSubagentRecord(
+			makeRecord({
+				state: "running",
+				connectedAt: "2026-03-10T10:01:00.000Z",
+				finalResult: {
+					kind: "final_result",
+					summary: "latest",
+					data: { count: 1n, nested: { alpha: "a", beta: "b" } },
+					reportedAt: "2026-03-10T10:03:00.000Z",
+				},
+				finalResultHistory: [
+					{
+						kind: "final_result",
+						summary: "latest",
+						data: { nested: { beta: "b", alpha: "a" }, count: 1n },
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+				],
+			}),
+		);
+		expect(result.ok).toBe(true);
+	});
+
 	it("accepts userIntervenedHistory as history-only metadata", () => {
 		expect(
 			validateSubagentRecord(
@@ -2180,7 +2204,7 @@ describe("validateSubagentRecord", () => {
 			),
 		).toEqual({
 			ok: false,
-			error: "userIntervenedHistory[0] userIntervened.recordedAt must be an ISO timestamp",
+			error: "userIntervenedHistory[0].recordedAt must be an ISO timestamp",
 		});
 	});
 

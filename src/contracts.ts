@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export type TmuxMode = "pane" | "window";
 
@@ -963,6 +964,16 @@ function validateUserIntervenedMetadata(
 	});
 }
 
+function prefixNestedValidationError(field: string, nestedField: string, error: string): string {
+	if (error === `${nestedField} must be an object`) {
+		return `${field} must be an object`;
+	}
+	if (error.startsWith(`${nestedField}.`)) {
+		return `${field}.${error.slice(nestedField.length + 1)}`;
+	}
+	return `${field} ${error}`;
+}
+
 function validateRuntimeFailure(error: unknown): ValidationOutcome<RuntimeFailure> {
 	if (!isRecord(error)) {
 		return fail("error must be an object");
@@ -1356,7 +1367,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		for (let index = 0; index < userIntervenedHistory.length; index += 1) {
 			const entryResult = validateUserIntervenedMetadata(userIntervenedHistory[index]);
 			if (!entryResult.ok) {
-				return fail(`userIntervenedHistory[${index}] ${entryResult.error.replace(/^userIntervened /, "")}`);
+				return fail(prefixNestedValidationError(`userIntervenedHistory[${index}]`, "userIntervened", entryResult.error));
 			}
 			if (entries.length > 0 && !isTimestampOnOrBefore(entries.at(-1)!.recordedAt, entryResult.value.recordedAt)) {
 				return fail("userIntervenedHistory must be sorted by recordedAt");
@@ -1622,7 +1633,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		if (
 			latestHistoryEntry.summary !== normalizedFinalResult.summary
 			|| latestHistoryEntry.reportedAt !== normalizedFinalResult.reportedAt
-			|| JSON.stringify(latestHistoryEntry.data ?? null) !== JSON.stringify(normalizedFinalResult.data ?? null)
+			|| !isDeepStrictEqual(latestHistoryEntry.data ?? null, normalizedFinalResult.data ?? null)
 		) {
 			return fail("finalResult must match the latest finalResultHistory entry");
 		}
