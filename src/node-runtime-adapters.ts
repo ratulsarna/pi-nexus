@@ -62,6 +62,7 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 				return;
 			}
 
+			this.buffer = "";
 			this.disconnected = false;
 			this.lastDisconnectReason = undefined;
 			this.socket = socket;
@@ -70,6 +71,7 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 				this.lastDisconnectReason = normalizeError(error).message;
 			});
 			socket.on("close", () => {
+				this.buffer = "";
 				this.socket = undefined;
 				this.emitDisconnect(this.lastDisconnectReason);
 			});
@@ -101,6 +103,8 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 		}
 
 		this.closed = true;
+		this.buffer = "";
+		this.lastDisconnectReason = undefined;
 		this.socket?.destroy();
 		this.socket = undefined;
 		this.server.close();

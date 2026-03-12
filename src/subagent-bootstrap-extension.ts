@@ -275,6 +275,11 @@ class SubagentBootstrapSession {
 			throw new Error("hello mode must match bootstrap tmuxMode");
 		}
 
+		if (!this.pi.sendUserMessage) {
+			throw new Error("pi.sendUserMessage must be available for bootstrap prompt injection");
+		}
+		this.pi.sendUserMessage(this.config.initialPrompt);
+
 		this.sendEvent("ready", {
 			pid: this.options.pid(),
 			sessionPath: this.config.sessionPath,
@@ -282,11 +287,6 @@ class SubagentBootstrapSession {
 		});
 		this.ready = true;
 		this.clearTimeout();
-
-		if (!this.pi.sendUserMessage) {
-			throw new Error("pi.sendUserMessage must be available for bootstrap prompt injection");
-		}
-		this.pi.sendUserMessage(this.config.initialPrompt);
 		this.startupResolve();
 	}
 

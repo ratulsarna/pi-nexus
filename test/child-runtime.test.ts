@@ -374,6 +374,77 @@ describe("installSubagentBootstrapExtension", () => {
 		sessionHandle.close();
 	});
 
+	it("clears any partial child frame before accepting a reconnect on the same socket path", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pnx-sock-reconnect-buffer-"));
+		const socketPath = path.join(runtimeDir, "sidecar.sock");
+		const observedMessages: Array<Record<string, unknown>> = [];
+		const disconnectEvents: Array<string | undefined> = [];
+		const adapter = new NodeSidecarSessionAdapter();
+		const sessionHandle = adapter.openSession(socketPath, {
+			onConnect() {
+				return { ok: true, value: undefined };
+			},
+			onMessage(message) {
+				observedMessages.push(message);
+				return { ok: true, value: undefined };
+			},
+			onDisconnect(reason) {
+				disconnectEvents.push(reason);
+				return { ok: true, value: undefined };
+			},
+		});
+
+		const firstSocket = net.createConnection(socketPath);
+		await waitForSocketConnect(firstSocket);
+		firstSocket.write('{"type":"partial"');
+		firstSocket.end();
+		await waitFor(() => disconnectEvents.length === 1);
+
+		const secondSocket = net.createConnection(socketPath);
+		await waitForSocketConnect(secondSocket);
+		secondSocket.write(`${JSON.stringify({ type: "complete", seq: 1 })}\n`);
+		await waitFor(() => observedMessages.length === 1);
+		secondSocket.end();
+		await waitFor(() => disconnectEvents.length === 2);
+
+		expect(observedMessages).toEqual([{ type: "complete", seq: 1 }]);
+		expect(disconnectEvents).toEqual([undefined, undefined]);
+		sessionHandle.close();
+	});
+
+	it("resets disconnect reason state before accepting a reconnect on the same socket path", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pnx-sock-reconnect-reason-"));
+		const socketPath = path.join(runtimeDir, "sidecar.sock");
+		const disconnectEvents: Array<string | undefined> = [];
+		const adapter = new NodeSidecarSessionAdapter();
+		const sessionHandle = adapter.openSession(socketPath, {
+			onConnect() {
+				return { ok: true, value: undefined };
+			},
+			onMessage() {
+				return { ok: true, value: undefined };
+			},
+			onDisconnect(reason) {
+				disconnectEvents.push(reason);
+				return { ok: true, value: undefined };
+			},
+		});
+
+		const firstSocket = net.createConnection(socketPath);
+		await waitForSocketConnect(firstSocket);
+		firstSocket.write("{not-json}\n");
+		await waitFor(() => disconnectEvents.length === 1);
+		expect(disconnectEvents[0]).toContain("invalid child message JSON");
+
+		const secondSocket = net.createConnection(socketPath);
+		await waitForSocketConnect(secondSocket);
+		secondSocket.end();
+		await waitFor(() => disconnectEvents.length === 2);
+
+		expect(disconnectEvents[1]).toBeUndefined();
+		sessionHandle.close();
+	});
+
 	it("rejects handshake identity mismatch and shuts the child down", async () => {
 		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
 		const bootstrap = makeBootstrap("agt_child_mismatch", runtimeDir, fakeExtensionPath);
@@ -405,6 +476,80 @@ describe("installSubagentBootstrapExtension", () => {
 		});
 
 		await expect(sessionStart).rejects.toThrow("hello tmuxTarget must match bootstrap tmuxTarget");
+		expect(ctx.shutdownCalls).toBe(1);
+		expect(parseSentEnvelopes(socket)).toEqual([]);
+	});
+
+	it("does not advertise ready if bootstrap prompt injection fails", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrap = makeBootstrap("agt_child_prompt_failure", runtimeDir, fakeExtensionPath);
+		const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+		fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		const socket = new FakeSocket();
+		const pi = new FakePiApi();
+		(pi as unknown as { sendUserMessage: (content: string) => void }).sendUserMessage = () => {
+			throw new Error("prompt injection failed");
+		};
+		const ctx = new FakeExtensionContext();
+		installSubagentBootstrapExtension(pi, {
+			env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+			connectSocket: () => socket,
+			now: () => "2026-03-12T10:02:10.000Z",
+		});
+
+		const sessionStart = pi.emit("session_start", {}, ctx);
+		socket.connect();
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "hello",
+			seq: 0,
+			time: "2026-03-12T10:02:11.000Z",
+			payload: {
+				sessionPath: bootstrap.sessionPath,
+				tmuxTarget: bootstrap.tmuxTarget,
+				mode: bootstrap.tmuxMode,
+			},
+		});
+
+		await expect(sessionStart).rejects.toThrow("prompt injection failed");
+		expect(ctx.shutdownCalls).toBe(1);
+		expect(parseSentEnvelopes(socket)).toEqual([]);
+	});
+
+	it("does not advertise ready if bootstrap prompt injection is unavailable", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrap = makeBootstrap("agt_child_prompt_missing", runtimeDir, fakeExtensionPath);
+		const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+		fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		const socket = new FakeSocket();
+		const pi = new FakePiApi();
+		(pi as unknown as { sendUserMessage?: undefined }).sendUserMessage = undefined;
+		const ctx = new FakeExtensionContext();
+		installSubagentBootstrapExtension(pi, {
+			env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+			connectSocket: () => socket,
+			now: () => "2026-03-12T10:02:20.000Z",
+		});
+
+		const sessionStart = pi.emit("session_start", {}, ctx);
+		socket.connect();
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "hello",
+			seq: 0,
+			time: "2026-03-12T10:02:21.000Z",
+			payload: {
+				sessionPath: bootstrap.sessionPath,
+				tmuxTarget: bootstrap.tmuxTarget,
+				mode: bootstrap.tmuxMode,
+			},
+		});
+
+		await expect(sessionStart).rejects.toThrow("pi.sendUserMessage must be available for bootstrap prompt injection");
 		expect(ctx.shutdownCalls).toBe(1);
 		expect(parseSentEnvelopes(socket)).toEqual([]);
 	});
