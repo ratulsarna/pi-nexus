@@ -144,6 +144,14 @@ class SubagentBootstrapSession {
 
 	private buffer = "";
 
+	private buildStartupFailure(error: Error, cleanupErrors: Error[]): Error {
+		if (cleanupErrors.length === 0) {
+			return error;
+		}
+
+		return new AggregateError(cleanupErrors, error.message);
+	}
+
 	public constructor(
 		private readonly config: RuntimeBootstrapConfig,
 		private readonly socket: SocketLike,
@@ -201,8 +209,12 @@ class SubagentBootstrapSession {
 		}
 
 		this.closed = true;
-		this.clearTimeout();
-		this.socket.end();
+		this.clearTimeoutSafely();
+		try {
+			this.socket.end();
+		} catch {
+			// Best-effort shutdown during bootstrap lifecycle churn.
+		}
 	}
 
 	private handleChunk(chunk: Buffer | string): void {
@@ -286,7 +298,7 @@ class SubagentBootstrapSession {
 			tmuxTarget: this.config.tmuxTarget,
 		});
 		this.ready = true;
-		this.clearTimeout();
+		this.clearTimeoutSafely();
 		this.startupResolve();
 	}
 
@@ -316,19 +328,37 @@ class SubagentBootstrapSession {
 		}
 
 		this.closed = true;
-		this.clearTimeout();
-		this.socket.destroy(error);
-		this.ctx.shutdown();
-		this.startupReject(error);
+		const cleanupErrors: Error[] = [];
+		const timeoutError = this.clearTimeoutSafely();
+		if (timeoutError) {
+			cleanupErrors.push(timeoutError);
+		}
+		try {
+			this.socket.destroy(error);
+		} catch (destroyError) {
+			cleanupErrors.push(normalizeError(destroyError));
+		}
+		try {
+			this.ctx.shutdown();
+		} catch (shutdownError) {
+			cleanupErrors.push(normalizeError(shutdownError));
+		}
+		this.startupReject(this.buildStartupFailure(error, cleanupErrors));
 	}
 
-	private clearTimeout(): void {
+	private clearTimeoutSafely(): Error | undefined {
 		if (this.timeoutHandle === undefined) {
-			return;
+			return undefined;
 		}
 
-		this.options.clearTimeoutFn(this.timeoutHandle);
+		const handle = this.timeoutHandle;
 		this.timeoutHandle = undefined;
+		try {
+			this.options.clearTimeoutFn(handle);
+			return undefined;
+		} catch (error) {
+			return normalizeError(error);
+		}
 	}
 }
 

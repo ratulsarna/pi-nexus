@@ -18,6 +18,15 @@ class FakeSocket extends EventEmitter {
 	public destroyed = false;
 	public destroyedWith: Error | undefined;
 
+	public constructor(
+		private readonly options: {
+			throwOnDestroy?: Error;
+			throwOnEnd?: Error;
+		} = {},
+	) {
+		super();
+	}
+
 	public override on(event: string, listener: (...args: unknown[]) => void): this {
 		return super.on(event, listener);
 	}
@@ -29,6 +38,9 @@ class FakeSocket extends EventEmitter {
 
 	public end(): this {
 		this.ended = true;
+		if (this.options.throwOnEnd) {
+			throw this.options.throwOnEnd;
+		}
 		this.emit("close");
 		return this;
 	}
@@ -36,6 +48,9 @@ class FakeSocket extends EventEmitter {
 	public destroy(error?: Error): this {
 		this.destroyed = true;
 		this.destroyedWith = error;
+		if (this.options.throwOnDestroy) {
+			throw this.options.throwOnDestroy;
+		}
 		this.emit("close");
 		return this;
 	}
@@ -56,8 +71,17 @@ class FakeSocket extends EventEmitter {
 class FakeExtensionContext {
 	public shutdownCalls = 0;
 
+	public constructor(
+		private readonly options: {
+			throwOnShutdown?: Error;
+		} = {},
+	) {}
+
 	public shutdown(): void {
 		this.shutdownCalls += 1;
+		if (this.options.throwOnShutdown) {
+			throw this.options.throwOnShutdown;
+		}
 	}
 }
 
@@ -164,6 +188,46 @@ describe("installSubagentBootstrapExtension", () => {
 			sessionPath: bootstrap.sessionPath,
 			tmuxTarget: bootstrap.tmuxTarget,
 		});
+		expect(ctx.shutdownCalls).toBe(0);
+	});
+
+	it("still settles startup successfully if ready-path timer cleanup throws", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrap = makeBootstrap("agt_child_ready_cleanup", runtimeDir, fakeExtensionPath);
+		const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+		fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		const socket = new FakeSocket();
+		const pi = new FakePiApi();
+		const ctx = new FakeExtensionContext();
+		installSubagentBootstrapExtension(pi, {
+			env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+			connectSocket: () => socket,
+			now: () => "2026-03-12T10:00:30.000Z",
+			pid: () => 4343,
+			clearTimeoutFn: () => {
+				throw new Error("clear timeout exploded");
+			},
+		});
+
+		const sessionStart = pi.emit("session_start", {}, ctx);
+		socket.connect();
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "hello",
+			seq: 0,
+			time: "2026-03-12T10:00:31.000Z",
+			payload: {
+				sessionPath: bootstrap.sessionPath,
+				tmuxTarget: bootstrap.tmuxTarget,
+				mode: bootstrap.tmuxMode,
+			},
+		});
+		await sessionStart;
+
+		expect(pi.sentUserMessages).toEqual([bootstrap.initialPrompt]);
+		expect(parseSentEnvelopes(socket).map((message) => message.type)).toEqual(["ready"]);
 		expect(ctx.shutdownCalls).toBe(0);
 	});
 
@@ -550,6 +614,57 @@ describe("installSubagentBootstrapExtension", () => {
 		});
 
 		await expect(sessionStart).rejects.toThrow("pi.sendUserMessage must be available for bootstrap prompt injection");
+		expect(ctx.shutdownCalls).toBe(1);
+		expect(parseSentEnvelopes(socket)).toEqual([]);
+	});
+
+	it("still settles startup rejection if teardown cleanup throws during a pre-ready failure", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrap = makeBootstrap("agt_child_cleanup_failure", runtimeDir, fakeExtensionPath);
+		const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+		fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		const socket = new FakeSocket({
+			throwOnDestroy: new Error("destroy exploded"),
+		});
+		const pi = new FakePiApi();
+		const ctx = new FakeExtensionContext({
+			throwOnShutdown: new Error("shutdown exploded"),
+		});
+		installSubagentBootstrapExtension(pi, {
+			env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+			connectSocket: () => socket,
+			now: () => "2026-03-12T10:02:25.000Z",
+			clearTimeoutFn: () => {
+				throw new Error("clear timeout exploded");
+			},
+		});
+
+		const sessionStart = pi.emit("session_start", {}, ctx);
+		socket.connect();
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "hello",
+			seq: 0,
+			time: "2026-03-12T10:02:26.000Z",
+			payload: {
+				sessionPath: bootstrap.sessionPath,
+				tmuxTarget: "other:child",
+				mode: bootstrap.tmuxMode,
+			},
+		});
+
+		const error = await sessionStart.catch((rejection: unknown) => rejection);
+		expect(error).toBeInstanceOf(AggregateError);
+		expect((error as Error).message).toContain("hello tmuxTarget must match bootstrap tmuxTarget");
+		const cleanupMessages = (error as AggregateError).errors.map((entry) => normalizeError(entry).message);
+		expect(cleanupMessages).toEqual([
+			"clear timeout exploded",
+			"destroy exploded",
+			"shutdown exploded",
+		]);
+		expect(socket.destroyed).toBe(true);
 		expect(ctx.shutdownCalls).toBe(1);
 		expect(parseSentEnvelopes(socket)).toEqual([]);
 	});

@@ -19,7 +19,27 @@ beforeAll(() => {
 	fs.mkdirSync(fakeBinDir, { recursive: true });
 
 	const fakeTmuxPath = path.join(fakeBinDir, "tmux");
-	fs.writeFileSync(fakeTmuxPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+	fs.writeFileSync(
+		fakeTmuxPath,
+		`#!/bin/sh
+counter_file="\${TMUX_FAKE_COUNTER_FILE:-}"
+if [ -n "$counter_file" ]; then
+	count=0
+	if [ -f "$counter_file" ]; then
+		count=$(cat "$counter_file")
+	fi
+	count=$((count + 1))
+	printf '%s' "$count" > "$counter_file"
+else
+	count=1
+fi
+if [ "\${TMUX_FAKE_FAIL_ON_CALL:-}" = "$count" ]; then
+	exit 1
+fi
+exit 0
+`,
+		{ mode: 0o755 },
+	);
 
 	fakePiPath = path.join(fakeBinDir, "pi");
 	fs.writeFileSync(fakePiPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -143,5 +163,48 @@ describe("TmuxSubagentProcessAdapter", () => {
 				{ onExit() {} },
 			),
 		).toThrow("launch env key must not contain =: BAD=KEY");
+		expect(fs.readdirSync(exitMarkerDir)).toEqual([]);
+	});
+
+	it("cleans launch artifacts if the first tmux send-keys call throws", () => {
+		const exitMarkerDir = fs.mkdtempSync(path.join(fakeRootDir, "tmux-first-fail-"));
+		const counterPath = path.join(exitMarkerDir, "tmux-counter.txt");
+		process.env.TMUX_FAKE_COUNTER_FILE = counterPath;
+		process.env.TMUX_FAKE_FAIL_ON_CALL = "1";
+		try {
+			const adapter = new TmuxSubagentProcessAdapter({
+				exitMarkerDir,
+				pollIntervalMs: 60_000,
+			});
+
+			expect(() => adapter.launch(makeLaunchSpec(), { onExit() {} })).toThrow(
+				"tmux command failed: tmux send-keys -t session:1.1 -l",
+			);
+			expect(fs.readdirSync(exitMarkerDir).sort()).toEqual(["tmux-counter.txt"]);
+		} finally {
+			delete process.env.TMUX_FAKE_COUNTER_FILE;
+			delete process.env.TMUX_FAKE_FAIL_ON_CALL;
+		}
+	});
+
+	it("cleans launch artifacts if the second tmux send-keys call throws", () => {
+		const exitMarkerDir = fs.mkdtempSync(path.join(fakeRootDir, "tmux-second-fail-"));
+		const counterPath = path.join(exitMarkerDir, "tmux-counter.txt");
+		process.env.TMUX_FAKE_COUNTER_FILE = counterPath;
+		process.env.TMUX_FAKE_FAIL_ON_CALL = "2";
+		try {
+			const adapter = new TmuxSubagentProcessAdapter({
+				exitMarkerDir,
+				pollIntervalMs: 60_000,
+			});
+
+			expect(() => adapter.launch(makeLaunchSpec(), { onExit() {} })).toThrow(
+				"tmux command failed: tmux send-keys -t session:1.1 Enter",
+			);
+			expect(fs.readdirSync(exitMarkerDir).sort()).toEqual(["tmux-counter.txt"]);
+		} finally {
+			delete process.env.TMUX_FAKE_COUNTER_FILE;
+			delete process.env.TMUX_FAKE_FAIL_ON_CALL;
+		}
 	});
 });

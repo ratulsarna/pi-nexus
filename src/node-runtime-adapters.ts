@@ -279,12 +279,22 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 		const exitMarkerDir = this.options.exitMarkerDir ?? path.dirname(launchSpec.sessionPath);
 		fs.mkdirSync(exitMarkerDir, { recursive: true });
 		const { launchDir, launcherPath, exitMarkerPath } = createTmuxLaunchArtifacts(exitMarkerDir);
-		writeTmuxLaunchScript(launchSpec, launcherPath, exitMarkerPath);
-
-		runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "-l", `sh ${shQuote(launcherPath)}`]);
-		runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "Enter"]);
+		try {
+			writeTmuxLaunchScript(launchSpec, launcherPath, exitMarkerPath);
+			runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "-l", `sh ${shQuote(launcherPath)}`]);
+			runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "Enter"]);
+		} catch (error) {
+			cleanupTmuxLaunchArtifacts(launchDir);
+			throw error;
+		}
 
 		let exited = false;
+		const finalizeExit = (exit: ManagedProcessExit): void => {
+			exited = true;
+			clearInterval(interval);
+			cleanupTmuxLaunchArtifacts(launchDir);
+			handlers.onExit(exit);
+		};
 		const interval = setInterval(() => {
 			if (exited || !fs.existsSync(exitMarkerPath)) {
 				return;
@@ -292,13 +302,10 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 
 			const rawExitCode = fs.readFileSync(exitMarkerPath, "utf8").trim();
 			const parsedExitCode = Number(rawExitCode);
-			exited = true;
-			clearInterval(interval);
-			handlers.onExit({
+			finalizeExit({
 				code: Number.isSafeInteger(parsedExitCode) ? parsedExitCode : null,
 				signal: null,
 			});
-			cleanupTmuxLaunchArtifacts(launchDir);
 		}, this.options.pollIntervalMs ?? 100);
 		interval.unref?.();
 
@@ -315,11 +322,10 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 					"-t",
 					launchSpec.tmuxTarget,
 				]);
-				handlers.onExit({
+				finalizeExit({
 					code: null,
 					signal: reason === "abort" ? "SIGINT" : "SIGTERM",
 				});
-				cleanupTmuxLaunchArtifacts(launchDir);
 			},
 		};
 	}
