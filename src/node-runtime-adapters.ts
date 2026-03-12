@@ -191,20 +191,64 @@ function shQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function joinShellWords(words: ReadonlyArray<string>): string {
+	return words.map((word) => shQuote(word)).join(" ");
+}
+
+function validateTmuxLaunchEnvEntry(key: string, value: string): void {
+	if (key.length === 0) {
+		throw new Error("launch env keys must be non-empty");
+	}
+	if (key.includes("=")) {
+		throw new Error(`launch env key must not contain =: ${key}`);
+	}
+	if (key.includes("\0")) {
+		throw new Error(`launch env key must not contain NUL: ${key}`);
+	}
+	if (value.includes("\0")) {
+		throw new Error(`launch env value must not contain NUL: ${key}`);
+	}
+}
+
+function buildTmuxEnvCommand(env: Readonly<Record<string, string>>): string {
+	const envAssignments = Object.entries(env).map(([key, value]) => {
+		validateTmuxLaunchEnvEntry(key, value);
+		return shQuote(`${key}=${value}`);
+	});
+	return envAssignments.length > 0 ? `env -i ${envAssignments.join(" ")}` : "env -i";
+}
+
+function createTmuxLaunchArtifacts(exitMarkerDir: string): {
+	launchDir: string;
+	launcherPath: string;
+	exitMarkerPath: string;
+} {
+	const launchDir = fs.mkdtempSync(path.join(exitMarkerDir, "tmux-launch-"));
+	return {
+		launchDir,
+		launcherPath: path.join(launchDir, "launch.sh"),
+		exitMarkerPath: path.join(launchDir, "exit.code"),
+	};
+}
+
+function cleanupTmuxLaunchArtifacts(launchDir: string): void {
+	try {
+		fs.rmSync(launchDir, { recursive: true, force: true });
+	} catch {
+		// Best-effort cleanup for tmux launch artifacts.
+	}
+}
+
 function writeTmuxLaunchScript(
 	launchSpec: RuntimeLaunchSpec,
-	exitMarkerDir: string,
+	launcherPath: string,
 	exitMarkerPath: string,
 ): string {
-	const command = [launchSpec.command, ...launchSpec.args].map((entry) => shQuote(entry)).join(" ");
-	const launcherPath = path.join(exitMarkerDir, `${launchSpec.agentId}.tmux-launch.sh`);
-	const envExports = Object.entries(launchSpec.env)
-		.map(([key, value]) => `export ${key}=${shQuote(value)}`)
-		.join("\n");
+	const command = joinShellWords([launchSpec.command, ...launchSpec.args]);
+	const envCommand = buildTmuxEnvCommand(launchSpec.env);
 	const script = `#!/bin/sh
 cd ${shQuote(launchSpec.cwd)} || exit 1
-${envExports}
-${command}
+${envCommand} ${command}
 status=$?
 printf '%s\n' "$status" > ${shQuote(exitMarkerPath)}
 exit "$status"
@@ -234,9 +278,8 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 	): SubagentProcessHandle {
 		const exitMarkerDir = this.options.exitMarkerDir ?? path.dirname(launchSpec.sessionPath);
 		fs.mkdirSync(exitMarkerDir, { recursive: true });
-		const exitMarkerPath = path.join(exitMarkerDir, `${launchSpec.agentId}.tmux-exit`);
-		const launcherPath = writeTmuxLaunchScript(launchSpec, exitMarkerDir, exitMarkerPath);
-		fs.rmSync(exitMarkerPath, { force: true });
+		const { launchDir, launcherPath, exitMarkerPath } = createTmuxLaunchArtifacts(exitMarkerDir);
+		writeTmuxLaunchScript(launchSpec, launcherPath, exitMarkerPath);
 
 		runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "-l", `sh ${shQuote(launcherPath)}`]);
 		runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "Enter"]);
@@ -255,6 +298,7 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 				code: Number.isSafeInteger(parsedExitCode) ? parsedExitCode : null,
 				signal: null,
 			});
+			cleanupTmuxLaunchArtifacts(launchDir);
 		}, this.options.pollIntervalMs ?? 100);
 		interval.unref?.();
 
@@ -275,6 +319,7 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 					code: null,
 					signal: reason === "abort" ? "SIGINT" : "SIGTERM",
 				});
+				cleanupTmuxLaunchArtifacts(launchDir);
 			},
 		};
 	}
