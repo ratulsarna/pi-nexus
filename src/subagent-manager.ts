@@ -80,6 +80,10 @@ interface ManagedRuntime<TData = unknown> {
 	connectingTimeoutHandle?: ReturnType<typeof setTimeout>;
 	trusted: boolean;
 	lastReportedState?: SidecarStateStatus;
+	lastPostReadyDisconnect?: {
+		reason?: string;
+		degradedAt: string;
+	};
 }
 
 function fail(error: string): ValidationError {
@@ -403,15 +407,17 @@ export class SubagentManager<TData = unknown> {
 			|| runtime.record.state === "failed"
 		) {
 			this.clearConnectingTimeout(runtime);
-			if (reason === undefined) {
-				return ok(cloneValue(runtime.record));
-			}
+			const degradedAt = this.deriveTerminalTimestamp(runtime.record);
 			const degradedResult = normalizeRecord<TData>({
 				...runtime.record,
-				degradedAt: this.deriveTerminalTimestamp(runtime.record),
+				degradedAt,
 			});
 			if (!degradedResult.ok) return degradedResult;
 			runtime.record = degradedResult.value;
+			runtime.lastPostReadyDisconnect = {
+				reason,
+				degradedAt,
+			};
 			return ok(cloneValue(runtime.record));
 		}
 
@@ -456,20 +462,26 @@ export class SubagentManager<TData = unknown> {
 			return ok(cloneValue(runtime.record));
 		}
 		const terminalTimestamp = this.deriveTerminalTimestamp(runtime.record);
+		const clearSilentDisconnectDegradedAt = runtime.lastPostReadyDisconnect !== undefined
+			&& runtime.lastPostReadyDisconnect.reason === undefined
+			&& runtime.lastPostReadyDisconnect.degradedAt === runtime.record.degradedAt;
 
 		if (exitResult.value.code === 0 && exitResult.value.signal === null) {
 			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
+				degradedAt: clearSilentDisconnectDegradedAt ? undefined : runtime.record.degradedAt,
 				stoppedAt: terminalTimestamp,
 			});
 			if (!stoppedResult.ok) return stoppedResult;
 
 			runtime.record = stoppedResult.value;
+			runtime.lastPostReadyDisconnect = undefined;
 			runtime.connectionOpen = false;
 			runtime.trusted = false;
 			return ok(cloneValue(runtime.record));
 		}
 
 		const failedResult = this.transitionRecord(runtime.record, "failed", {
+			degradedAt: clearSilentDisconnectDegradedAt ? undefined : runtime.record.degradedAt,
 			error: {
 				message: formatExitMessage(exitResult.value),
 				recordedAt: terminalTimestamp,
@@ -480,6 +492,7 @@ export class SubagentManager<TData = unknown> {
 		if (!failedResult.ok) return failedResult;
 
 		runtime.record = failedResult.value;
+		runtime.lastPostReadyDisconnect = undefined;
 		runtime.connectionOpen = false;
 		runtime.trusted = false;
 		return ok(cloneValue(runtime.record));
@@ -599,6 +612,7 @@ export class SubagentManager<TData = unknown> {
 		if (!readyRecordResult.ok) return readyRecordResult;
 
 		runtime.record = readyRecordResult.value;
+		runtime.lastPostReadyDisconnect = undefined;
 		this.clearConnectingTimeout(runtime);
 		runtime.trusted = true;
 		return ok(cloneValue(runtime.record));

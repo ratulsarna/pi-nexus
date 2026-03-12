@@ -999,7 +999,7 @@ describe("SubagentManager", () => {
 		expect(record.degradedAt).toBe("2026-03-11T12:05:11.000Z");
 	});
 
-	it("does not stamp degradedAt for silent post-ready disconnects that are immediately resolved by process exit", () => {
+	it("stamps degradedAt on silent post-ready disconnects and clears exit-precursor degradation once process exit lands", () => {
 		const clean = createManager([
 			"2026-03-11T12:05:12.000Z",
 			"2026-03-11T12:05:13.000Z",
@@ -1015,6 +1015,9 @@ describe("SubagentManager", () => {
 			}),
 		));
 		expectOk(clean.sidecars.get("agt_exit_disconnect_clean").disconnect());
+		const degradedBeforeExit = expectOk(clean.manager.getRecord("agt_exit_disconnect_clean"));
+		expect(degradedBeforeExit.state).toBe("ready");
+		expect(degradedBeforeExit.degradedAt).toBe("2026-03-11T12:05:14.000Z");
 		expectOk(clean.processes.get("agt_exit_disconnect_clean").exit({ code: 0, signal: null }));
 		const cleanRecord = expectOk(clean.manager.getRecord("agt_exit_disconnect_clean"));
 		expect(cleanRecord.state).toBe("stopped");
@@ -1035,6 +1038,9 @@ describe("SubagentManager", () => {
 			}),
 		));
 		expectOk(failed.sidecars.get("agt_exit_disconnect_failed").disconnect());
+		const degradedFailedBeforeExit = expectOk(failed.manager.getRecord("agt_exit_disconnect_failed"));
+		expect(degradedFailedBeforeExit.state).toBe("ready");
+		expect(degradedFailedBeforeExit.degradedAt).toBe("2026-03-11T12:05:17.000Z");
 		expectOk(failed.processes.get("agt_exit_disconnect_failed").exit({ code: 1, signal: null }));
 		const failedRecord = expectOk(failed.manager.getRecord("agt_exit_disconnect_failed"));
 		expect(failedRecord.state).toBe("failed");
