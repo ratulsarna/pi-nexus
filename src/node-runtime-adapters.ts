@@ -45,6 +45,8 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 
 	private closed = false;
 
+	private ownsSocketPath = false;
+
 	private disconnected = false;
 
 	private buffer = "";
@@ -55,7 +57,7 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 		private readonly socketPath: string,
 		private readonly handlers: SidecarSessionHandlers<TData>,
 		private readonly options: NodeSidecarSessionAdapterOptions<TData>,
-	) {
+		) {
 		this.server = net.createServer((socket) => {
 			if (this.socket) {
 				socket.destroy();
@@ -81,6 +83,12 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 				socket.destroy(new Error(connectResult.error));
 			}
 		});
+		this.server.on("listening", () => {
+			this.ownsSocketPath = true;
+		});
+		this.server.on("close", () => {
+			this.ownsSocketPath = false;
+		});
 		this.server.on("error", (error) => {
 			this.lastDisconnectReason = normalizeError(error).message;
 			this.emitDisconnect(this.lastDisconnectReason);
@@ -105,10 +113,22 @@ class NodeSidecarSessionHandle<TData = unknown> implements SidecarSessionHandle<
 		this.closed = true;
 		this.buffer = "";
 		this.lastDisconnectReason = undefined;
-		this.socket?.destroy();
+		const ownedSocketPath = this.ownsSocketPath;
+		try {
+			this.socket?.destroy();
+		} catch {
+			// Best-effort sidecar socket teardown.
+		}
 		this.socket = undefined;
-		this.server.close();
-		cleanupSocketPath(this.socketPath);
+		try {
+			this.server.close();
+		} catch {
+			// Best-effort server close.
+		}
+		if (ownedSocketPath) {
+			cleanupSocketPath(this.socketPath);
+		}
+		this.ownsSocketPath = false;
 	}
 
 	private handleChunk(chunk: Buffer): void {
@@ -315,17 +335,24 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 					return;
 				}
 
-				exited = true;
-				clearInterval(interval);
-				runTmuxCommand([
-					launchSpec.tmuxMode === "pane" ? "kill-pane" : "kill-window",
-					"-t",
-					launchSpec.tmuxTarget,
-				]);
-				finalizeExit({
-					code: null,
-					signal: reason === "abort" ? "SIGINT" : "SIGTERM",
-				});
+				let terminateError: Error | undefined;
+				try {
+					runTmuxCommand([
+						launchSpec.tmuxMode === "pane" ? "kill-pane" : "kill-window",
+						"-t",
+						launchSpec.tmuxTarget,
+					]);
+				} catch (error) {
+					terminateError = normalizeError(error);
+				} finally {
+					finalizeExit({
+						code: null,
+						signal: reason === "abort" ? "SIGINT" : "SIGTERM",
+					});
+				}
+				if (terminateError) {
+					throw terminateError;
+				}
 			},
 		};
 	}

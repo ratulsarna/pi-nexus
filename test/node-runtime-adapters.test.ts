@@ -1,11 +1,12 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { RuntimeLaunchSpec } from "../src/contracts.js";
-import { TmuxSubagentProcessAdapter } from "../src/node-runtime-adapters.js";
+import { NodeSidecarSessionAdapter, TmuxSubagentProcessAdapter } from "../src/node-runtime-adapters.js";
 
 let originalPath: string | undefined;
 let fakeRootDir = os.tmpdir();
@@ -207,4 +208,92 @@ describe("TmuxSubagentProcessAdapter", () => {
 			delete process.env.TMUX_FAKE_FAIL_ON_CALL;
 		}
 	});
+
+	it("still finalizes terminate cleanup and exit reporting if tmux kill throws", () => {
+		const exitMarkerDir = fs.mkdtempSync(path.join(fakeRootDir, "tmux-terminate-fail-"));
+		const counterPath = path.join(exitMarkerDir, "tmux-counter.txt");
+		process.env.TMUX_FAKE_COUNTER_FILE = counterPath;
+		process.env.TMUX_FAKE_FAIL_ON_CALL = "3";
+		try {
+			const exits: Array<{ code: number | null; signal: string | null }> = [];
+			const adapter = new TmuxSubagentProcessAdapter({
+				exitMarkerDir,
+				pollIntervalMs: 60_000,
+			});
+			const handle = adapter.launch(makeLaunchSpec(), {
+				onExit(exit) {
+					exits.push(exit);
+				},
+			});
+
+			expect(() => handle.terminate("shutdown")).toThrow("tmux command failed: tmux kill-pane -t session:1.1");
+			expect(exits).toEqual([{ code: null, signal: "SIGTERM" }]);
+			expect(fs.readdirSync(exitMarkerDir).sort()).toEqual(["tmux-counter.txt"]);
+		} finally {
+			delete process.env.TMUX_FAKE_COUNTER_FILE;
+			delete process.env.TMUX_FAKE_FAIL_ON_CALL;
+		}
+	});
 });
+
+describe("NodeSidecarSessionAdapter", () => {
+	it("does not unlink a socket path it failed to bind and therefore does not own", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pnx-own-"));
+		const socketPath = path.join(runtimeDir, "bridge.sock");
+		const owner = net.createServer();
+		try {
+			await new Promise<void>((resolve, reject) => {
+				owner.once("listening", () => resolve());
+				owner.once("error", reject);
+				owner.listen(socketPath);
+			});
+
+			const disconnectReasons: Array<string | undefined> = [];
+			const adapter = new NodeSidecarSessionAdapter();
+			const handle = adapter.openSession(socketPath, {
+				onConnect() {
+					return { ok: true, value: undefined };
+				},
+				onMessage() {
+					return { ok: true, value: undefined };
+				},
+				onDisconnect(reason) {
+					disconnectReasons.push(reason);
+					return { ok: true, value: undefined };
+				},
+			});
+
+			await waitFor(() => disconnectReasons.length === 1);
+			handle.close();
+
+			expect(disconnectReasons[0]).toContain("EADDRINUSE");
+			expect(fs.existsSync(socketPath)).toBe(true);
+
+			const probe = net.createConnection(socketPath);
+			await waitForSocketConnect(probe);
+			probe.end();
+		} finally {
+			await new Promise<void>((resolve, reject) => owner.close((error) => (error ? reject(error) : resolve())));
+			fs.rmSync(runtimeDir, { recursive: true, force: true });
+		}
+	});
+});
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) {
+			return;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+
+	throw new Error("timed out waiting for condition");
+}
+
+async function waitForSocketConnect(socket: net.Socket): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		socket.once("connect", () => resolve());
+		socket.once("error", reject);
+	});
+}
