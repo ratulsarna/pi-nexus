@@ -535,6 +535,42 @@ describe("SubagentManager", () => {
 		expect(finalResultRecord.finalResultHistory).toHaveLength(1);
 	});
 
+	it("does not disconnect when state needs_input arrives before request details", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:03:08.000Z",
+			"2026-03-11T12:03:09.000Z",
+		]);
+		const request = makeSpawnRequest("agt_state_needs_input_first");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_state_needs_input_first").connect());
+		expectOk(sidecars.get("agt_state_needs_input_first").message(
+			makeEnvelope("agt_state_needs_input_first", "ready", 0, "2026-03-11T12:03:10.000Z", {
+				pid: 9106,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+
+		expectOk(sidecars.get("agt_state_needs_input_first").message(
+			makeEnvelope("agt_state_needs_input_first", "state", 1, "2026-03-11T12:03:11.000Z", {
+				status: "needs_input",
+			}),
+		));
+		const beforeDetails = expectOk(manager.getRecord("agt_state_needs_input_first"));
+		expect(beforeDetails.state).toBe("ready");
+		expect(beforeDetails.pendingInputRequest).toBeUndefined();
+
+		expectOk(sidecars.get("agt_state_needs_input_first").message(
+			makeEnvelope("agt_state_needs_input_first", "needs_input", 2, "2026-03-11T12:03:12.000Z", {
+				question: "Need approval",
+				kind: "decision",
+			}),
+		));
+		const afterDetails = expectOk(manager.getRecord("agt_state_needs_input_first"));
+		expect(afterDetails.state).toBe("needs_input");
+		expect(afterDetails.pendingInputRequest?.summary).toBe("Need approval");
+	});
+
 	it("accepts repeated final_result reports and preserves append-only current-best history", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:03:10.000Z",

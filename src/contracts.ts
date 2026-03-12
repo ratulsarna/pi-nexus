@@ -1520,6 +1520,9 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			return fail(`degradedAt must be on or after ${degradedBaselineLabel}`);
 		}
 	}
+	if (stoppedAt && degradedAt && !isTimestampOnOrBefore(degradedAt, stoppedAt)) {
+		return fail("degradedAt must be on or before stoppedAt");
+	}
 
 	if (state === "stopped" && stoppedAt) {
 		if (

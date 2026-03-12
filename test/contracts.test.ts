@@ -2288,6 +2288,22 @@ describe("validateSubagentRecord", () => {
 		).toBe(true);
 	});
 
+	it("rejects stopped records whose degradedAt is later than stoppedAt", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "stopped",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					stoppedAt: "2026-03-10T10:03:00.000Z",
+					degradedAt: "2026-03-10T10:04:00.000Z",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "degradedAt must be on or before stoppedAt",
+		});
+	});
+
 	it("rejects trusted sidecar history after degradedAt", () => {
 		expect(
 			validateSubagentRecord(

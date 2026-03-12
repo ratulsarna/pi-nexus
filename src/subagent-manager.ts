@@ -800,6 +800,10 @@ export class SubagentManager<TData = unknown> {
 			case "waiting":
 			case "needs_input": {
 				const nextState = event.payload.status;
+				if (nextState === "needs_input" && runtime.record.pendingInputRequest === undefined) {
+					runtime.lastReportedState = event.payload.status;
+					return ok(cloneValue(runtime.record));
+				}
 				const nextRecord = {
 					...runtime.record,
 					state: nextState,
