@@ -147,15 +147,21 @@ Payload:
 }
 ```
 
-### `abort`
+### `interrupt`
 
-Request termination of current work.
+Request interruption of the current work stretch while keeping the session open.
 
 Payload:
 
 ```json
 {}
 ```
+
+Rules:
+
+- authoritative protocol vocabulary uses `interrupt`
+- sending `interrupt` does not let the parent guess posture from transport success alone
+- once the child has successfully honored the interrupt, the resulting accepted lifecycle update clears any pending input request and moves posture to `waiting`
 
 ### `ping`
 
@@ -209,7 +215,7 @@ Rules:
 
 ### `final_result`
 
-Explicit completion result.
+Explicit current-best result.
 
 Payload:
 
@@ -224,8 +230,10 @@ Payload:
 
 Rules:
 
-- at most one terminal `final_result`
-- parent treats this as the authoritative result
+- non-terminal
+- may be sent multiple times
+- every accepted entry is preserved in append-only history
+- the latest accepted entry is the current best answer for parent-facing reads
 
 ### `needs_input`
 
@@ -256,6 +264,7 @@ Payload:
 Rules:
 
 - no transcript included by default
+- emitted only on positive evidence of submitted direct user input in the child session
 - parent marks previous assumptions as potentially stale
 - parent waits for the next explicit `progress` or `final_result`
 
@@ -276,9 +285,15 @@ Allowed statuses:
 - `starting`
 - `running`
 - `waiting`
-- `completed`
+- `needs_input`
 - `failed`
 - `stopped`
+
+Rules:
+
+- these statuses are child-authored lifecycle posture, not parent inference
+- `final_result` is history data, not a `state.status`
+- `failed` is non-terminal at the session level
 
 ### `error`
 
@@ -292,6 +307,12 @@ Payload:
   "fatal": true
 }
 ```
+
+Rules:
+
+- moves parent posture to `failed`
+- clears any pending input request
+- does not by itself terminate the session
 
 ### `pong`
 
@@ -350,9 +371,9 @@ Chronology rule:
 The sidecar is authoritative for:
 
 - parent-visible progress
-- final result
-- lifecycle state
-- user intervention metadata
+- current-best final result plus preserved `final_result` history
+- explicit child-authored lifecycle posture
+- user intervention metadata history
 
 The tmux terminal is authoritative for:
 
@@ -369,7 +390,7 @@ The tmux terminal is authoritative for:
 
 ### Socket disconnects after `ready`
 
-- parent marks sub-agent degraded or failed
+- parent records degraded trust separately from conversational posture
 - parent stops trusting future orchestration
 - user may still inspect the live tmux target
 

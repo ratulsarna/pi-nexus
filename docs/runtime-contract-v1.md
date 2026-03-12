@@ -117,9 +117,11 @@ Rules:
 - `summary` must be non-empty after trim
 - `data` is optional and may be `null`
 - reports are not accepted while the child is still `starting` or `connecting`
-- reports are not accepted once the runtime is `degraded`
-- `final_result` is terminal and may be sent once only
-- after terminal completion, later reports are ignored or treated as violations by the parent
+- reports are not accepted once the runtime is `stopped`
+- `failed` is non-terminal, so later accepted reports may move the session back into active conversational posture
+- `final_result` is non-terminal and may be sent multiple times
+- every accepted `final_result` appends to `finalResultHistory`
+- the latest accepted `final_result` is mirrored in `finalResult` as the cheap current-best view
 
 ## User intervention contract
 
@@ -157,18 +159,22 @@ Allowed states:
 - `ready`
 - `running`
 - `waiting`
-- `completed`
+- `needs_input`
 - `failed`
 - `stopped`
-- `degraded`
 
 Terminal states:
 
-- `completed`
-- `failed`
 - `stopped`
 
-`degraded` means the live tmux child still exists but the parent can no longer trust sidecar orchestration.
+`degraded` is not a runtime state. It is a separate trust marker recorded as `degradedAt` when the live tmux child may still exist but the parent can no longer trust sidecar orchestration.
+
+Posture rules:
+
+- `running` means the child says it is actively working and no `final_result` has yet been produced for the current stretch of work
+- `waiting` means no result is currently expected and the session is still open for more work
+- `needs_input` means the child is waiting for explicit user input, with details stored separately in `pendingInputRequest`
+- `failed` means the child reported an error condition, but the session is still non-terminal until it later recovers or stops
 
 ## State transition rules
 
@@ -177,18 +183,24 @@ Examples of allowed transitions:
 - `starting -> connecting`
 - `connecting -> ready`
 - `ready -> running`
+- `ready -> waiting`
+- `ready -> needs_input`
 - `running -> waiting`
+- `running -> needs_input`
 - `waiting -> running`
-- `running -> completed`
-- `ready -> degraded`
-- `degraded -> failed`
+- `waiting -> needs_input`
+- `needs_input -> running`
+- `failed -> running`
+- `failed -> waiting`
+- `failed -> needs_input`
 
 Examples of forbidden transitions:
 
 - `starting -> ready`
 - `connecting -> running`
-- `completed -> running`
+- `stopped -> running`
 - `failed -> ready`
+- `needs_input -> ready`
 
 ## Source of truth
 
@@ -197,8 +209,10 @@ The parent-side record is the source of truth for:
 - lifecycle state
 - latest explicit progress report
 - latest explicit needs-input request
-- final result
-- user intervention metadata
+- cheap current-best final result
+- append-only `finalResultHistory`
+- append-only `userIntervenedHistory`
+- degraded trust marker
 
 The live tmux child is the source of truth for:
 
@@ -219,13 +233,29 @@ The live tmux child is the source of truth for:
 
 ### Sidecar dies after ready
 
-- state becomes `degraded`
+- conversational posture stays at the last accepted child-authored state
+- `degradedAt` is recorded separately
 - parent no longer trusts orchestration correctness
 - human can still inspect the tmux target manually
 
+### Child reports `error` or `failed`
+
+- state becomes `failed`
+- pending input clears
+- the session is still non-terminal
+- later accepted child reports or state updates may move the session back to `running`, `waiting`, or `needs_input`
+
 ### Child exits
 
-- state becomes `completed`, `failed`, or `stopped` depending on the recorded terminal cause
+- clean exit becomes `stopped`
+- abnormal exit becomes `failed`
+
+### Parent `interrupt`
+
+- `interrupt` is the authoritative control vocabulary at the contract boundary
+- sending `interrupt` alone does not authorize the parent to rewrite posture
+- once the child has successfully honored the interrupt, the resulting accepted lifecycle update clears any pending input request
+- once the child has successfully honored the interrupt, the resulting accepted lifecycle update moves posture to `waiting`
 
 ## Relationship to the protocol
 

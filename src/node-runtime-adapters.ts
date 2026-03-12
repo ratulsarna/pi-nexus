@@ -201,7 +201,7 @@ export class ChildProcessSubagentProcessAdapter implements SubagentProcessAdapte
 
 		return {
 			terminate(reason) {
-				child.kill(reason === "abort" ? "SIGINT" : "SIGTERM");
+				child.kill(reason === "interrupt" ? "SIGINT" : "SIGTERM");
 			},
 		};
 	}
@@ -335,6 +335,11 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 					return;
 				}
 
+				if (reason === "interrupt") {
+					runTmuxCommand(["send-keys", "-t", launchSpec.tmuxTarget, "C-c"]);
+					return;
+				}
+
 				let terminateError: Error | undefined;
 				try {
 					runTmuxCommand([
@@ -347,7 +352,7 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 				} finally {
 					finalizeExit({
 						code: null,
-						signal: reason === "abort" ? "SIGINT" : "SIGTERM",
+						signal: "SIGTERM",
 					});
 				}
 				if (terminateError) {

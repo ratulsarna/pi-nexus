@@ -19,11 +19,15 @@ beforeAll(() => {
 	fakeBinDir = path.join(fakeRootDir, "bin");
 	fs.mkdirSync(fakeBinDir, { recursive: true });
 
-	const fakeTmuxPath = path.join(fakeBinDir, "tmux");
+const fakeTmuxPath = path.join(fakeBinDir, "tmux");
 	fs.writeFileSync(
 		fakeTmuxPath,
 		`#!/bin/sh
 counter_file="\${TMUX_FAKE_COUNTER_FILE:-}"
+log_file="\${TMUX_FAKE_LOG_FILE:-}"
+if [ -n "$log_file" ]; then
+	printf '%s\\n' "$*" >> "$log_file"
+fi
 if [ -n "$counter_file" ]; then
 	count=0
 	if [ -f "$counter_file" ]; then
@@ -232,6 +236,35 @@ describe("TmuxSubagentProcessAdapter", () => {
 		} finally {
 			delete process.env.TMUX_FAKE_COUNTER_FILE;
 			delete process.env.TMUX_FAKE_FAIL_ON_CALL;
+		}
+	});
+
+	it("sends Ctrl-C without finalizing exit when terminate is interrupt", () => {
+		const exitMarkerDir = fs.mkdtempSync(path.join(fakeRootDir, "tmux-interrupt-"));
+		const logPath = path.join(exitMarkerDir, "tmux.log");
+		process.env.TMUX_FAKE_LOG_FILE = logPath;
+		try {
+			const exits: Array<{ code: number | null; signal: string | null }> = [];
+			const adapter = new TmuxSubagentProcessAdapter({
+				exitMarkerDir,
+				pollIntervalMs: 60_000,
+			});
+			const handle = adapter.launch(makeLaunchSpec(), {
+				onExit(exit) {
+					exits.push(exit);
+				},
+			});
+
+			handle.terminate("interrupt");
+
+			expect(exits).toEqual([]);
+			expect(fs.readFileSync(logPath, "utf8")).toContain("send-keys -t session:1.1 C-c");
+			expect(fs.readdirSync(exitMarkerDir).sort()).toContain("tmux.log");
+
+			handle.terminate("shutdown");
+			expect(exits).toEqual([{ code: null, signal: "SIGTERM" }]);
+		} finally {
+			delete process.env.TMUX_FAKE_LOG_FILE;
 		}
 	});
 });

@@ -115,7 +115,7 @@ function registerReportTool(pi: ExtensionApiLike): void {
 			additionalProperties: false,
 		},
 		async execute(_toolCallId, params) {
-			const reportResult = validateReportToParentInput(params, "ready", false);
+			const reportResult = validateReportToParentInput(params, "ready");
 			if (!reportResult.ok) {
 				throw new Error(reportResult.error);
 			}

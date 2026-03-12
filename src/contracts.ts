@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export type TmuxMode = "pane" | "window";
 
@@ -10,14 +11,13 @@ export type RuntimeState =
 	| "ready"
 	| "running"
 	| "waiting"
-	| "completed"
+	| "needs_input"
 	| "failed"
-	| "stopped"
-	| "degraded";
+	| "stopped";
 
 export type RuntimeChildMode = "interactive-cli";
 
-export type ParentControlKind = "hello" | "steer" | "follow_up" | "abort" | "ping";
+export type ParentControlKind = "hello" | "steer" | "follow_up" | "interrupt" | "ping";
 export type ReportKind = "progress" | "final_result" | "needs_input";
 export const BOOTSTRAP_CONFIG_ENV_VAR = "PI_SUBAGENT_BOOTSTRAP_CONFIG";
 
@@ -63,7 +63,7 @@ export interface UserIntervenedMetadata {
 	recordedAt: string;
 }
 
-export interface RuntimeTerminalError {
+export interface RuntimeFailure {
 	message: string;
 	recordedAt: string;
 	fatal: boolean;
@@ -81,15 +81,15 @@ export interface SubagentRecord<TData = unknown> {
 	childMode: RuntimeChildMode;
 	createdAt: string;
 	startedAt?: string;
-	completedAt?: string;
 	stoppedAt?: string;
 	connectedAt?: string;
 	degradedAt?: string;
-	userIntervened?: UserIntervenedMetadata;
+	userIntervenedHistory?: UserIntervenedMetadata[];
 	lastProgressReport?: ExplicitReport<TData>;
 	pendingInputRequest?: ExplicitReport<TData> & { kind: "needs_input" };
 	finalResult?: ExplicitReport<TData> & { kind: "final_result" };
-	error?: RuntimeTerminalError;
+	finalResultHistory?: Array<ExplicitReport<TData> & { kind: "final_result" }>;
+	error?: RuntimeFailure;
 }
 
 export interface ReportToParentInput<TData = unknown> {
@@ -142,7 +142,7 @@ export type SidecarStateStatus =
 	| "starting"
 	| "running"
 	| "waiting"
-	| "completed"
+	| "needs_input"
 	| "failed"
 	| "stopped";
 
@@ -161,7 +161,7 @@ export interface SidecarPayloadByType<TData = unknown> {
 	hello: SidecarHelloPayload;
 	steer: SidecarSteerPayload;
 	follow_up: SidecarFollowUpPayload;
-	abort: SidecarEmptyPayload;
+	interrupt: SidecarEmptyPayload;
 	ready: SidecarReadyPayload;
 	progress: SidecarProgressPayload<TData>;
 	final_result: SidecarFinalResultPayload<TData>;
@@ -229,33 +229,31 @@ export type ValidationOutcome<T> = ValidationResult<T> | ValidationError;
 const RUNTIME_STATE_TRANSITIONS: Record<RuntimeState, readonly RuntimeState[]> = {
 	starting: ["connecting", "failed", "stopped"],
 	connecting: ["ready", "failed", "stopped"],
-	ready: ["running", "waiting", "failed", "stopped", "degraded"],
-	running: ["waiting", "completed", "failed", "stopped", "degraded"],
-	waiting: ["running", "completed", "failed", "stopped", "degraded"],
-	completed: [],
-	failed: [],
+	ready: ["running", "waiting", "needs_input", "failed", "stopped"],
+	running: ["waiting", "needs_input", "failed", "stopped"],
+	waiting: ["running", "needs_input", "failed", "stopped"],
+	needs_input: ["running", "waiting", "failed", "stopped"],
+	failed: ["running", "waiting", "needs_input", "stopped"],
 	stopped: [],
-	degraded: ["failed", "stopped"],
 };
 
-const TERMINAL_STATES = new Set<RuntimeState>(["completed", "failed", "stopped"]);
+const TERMINAL_STATES = new Set<RuntimeState>(["stopped"]);
 const RUNTIME_STATES = new Set<RuntimeState>([
 	"starting",
 	"connecting",
 	"ready",
 	"running",
 	"waiting",
-	"completed",
+	"needs_input",
 	"failed",
 	"stopped",
-	"degraded",
 ]);
 const REPORT_KINDS = new Set<ReportKind>(["progress", "final_result", "needs_input"]);
 const SIDECAR_CONTROL_MESSAGE_KINDS: ReadonlyArray<ParentControlKind> = [
 	"hello",
 	"steer",
 	"follow_up",
-	"abort",
+	"interrupt",
 	"ping",
 ];
 const SIDECAR_EVENT_MESSAGE_KINDS: ReadonlyArray<SidecarEventKind> = [
@@ -279,20 +277,19 @@ const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
 	"starting",
 	"running",
 	"waiting",
-	"completed",
+	"needs_input",
 	"failed",
 	"stopped",
 ]);
-const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["abort", "ping", "pong"]);
+const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["interrupt", "ping", "pong"]);
 const STATES_REQUIRING_CONNECTED_AT = new Set<RuntimeState>([
 	"ready",
 	"running",
 	"waiting",
-	"completed",
-	"degraded",
+	"needs_input",
 ]);
 const PRE_HANDSHAKE_STATES = new Set<RuntimeState>(["starting", "connecting"]);
-const REPORT_REJECTED_STATES = new Set<RuntimeState>(["starting", "connecting", "completed", "failed", "stopped", "degraded"]);
+const REPORT_REJECTED_STATES = new Set<RuntimeState>(["starting", "connecting", "stopped"]);
 
 function isNonEmptyTrimmedString(value: unknown): value is string {
 	if (typeof value !== "string") return false;
@@ -967,7 +964,37 @@ function validateUserIntervenedMetadata(
 	});
 }
 
-function validateRuntimeTerminalError(error: unknown): ValidationOutcome<RuntimeTerminalError> {
+function prefixNestedValidationError(field: string, nestedField: string, error: string): string {
+	if (error === `${nestedField} must be an object`) {
+		return `${field} must be an object`;
+	}
+	if (error.startsWith(`${nestedField}.`)) {
+		return `${field}.${error.slice(nestedField.length + 1)}`;
+	}
+	return `${field} ${error}`;
+}
+
+function describeThrownError(error: unknown): string {
+	if (error instanceof Error) {
+		return error.message;
+	}
+	try {
+		return String(error);
+	} catch {
+		return "unknown error";
+	}
+}
+
+function safeDeepStrictEqual(field: string, left: unknown, right: unknown): ValidationOutcome<boolean> {
+	try {
+		return ok(isDeepStrictEqual(left, right));
+	} catch (error) {
+		const reason = describeThrownError(error);
+		return fail(`${field} must be comparable: ${reason}`);
+	}
+}
+
+function validateRuntimeFailure(error: unknown): ValidationOutcome<RuntimeFailure> {
 	if (!isRecord(error)) {
 		return fail("error must be an object");
 	}
@@ -993,7 +1020,6 @@ function validateRuntimeTerminalError(error: unknown): ValidationOutcome<Runtime
 export function validateReportToParentInput<TData = unknown>(
 	input: unknown,
 	currentState?: RuntimeState,
-	hasFinalResult = false,
 ): ValidationOutcome<ReportToParentInput<TData>> {
 	if (!isRecord(input)) {
 		return fail("report must be an object");
@@ -1009,10 +1035,6 @@ export function validateReportToParentInput<TData = unknown>(
 
 	if (currentState && REPORT_REJECTED_STATES.has(currentState)) {
 		return fail(`cannot accept ${kind} report while state is ${currentState}`);
-	}
-
-	if (hasFinalResult) {
-		return fail(`cannot accept ${kind} report after final_result has been recorded`);
 	}
 
 	return ok({
@@ -1114,7 +1136,7 @@ function validateSidecarPayload<TData = unknown>(
 		case "state": {
 			const status = payload.status;
 			if (typeof status !== "string" || !SIDECAR_STATE_STATUSES.has(status as SidecarStateStatus)) {
-				return fail("state.payload.status must be one of: starting, running, waiting, completed, failed, stopped");
+				return fail("state.payload.status must be one of: starting, running, waiting, needs_input, failed, stopped");
 			}
 
 			return ok({
@@ -1330,7 +1352,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 
 	const state = record.state;
 	if (typeof state !== "string" || !isRuntimeState(state)) {
-		return fail("state must be one of: starting, connecting, ready, running, waiting, completed, failed, stopped, degraded");
+		return fail("state must be one of: starting, connecting, ready, running, waiting, needs_input, failed, stopped");
 	}
 	if (!isNonEmptyTrimmedString(record.tmuxTarget)) return fail("tmuxTarget must be a non-empty string");
 	if (record.tmuxMode !== "pane" && record.tmuxMode !== "window") {
@@ -1348,26 +1370,36 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 	if (hasOwnField(record, "stoppedAt") && (typeof record.stoppedAt !== "string" || !isIsoTimestamp(record.stoppedAt))) {
 		return fail("stoppedAt must be an ISO timestamp");
 	}
-	if (hasOwnField(record, "completedAt") && (typeof record.completedAt !== "string" || !isIsoTimestamp(record.completedAt))) {
-		return fail("completedAt must be an ISO timestamp");
-	}
 	if (hasOwnField(record, "connectedAt") && (typeof record.connectedAt !== "string" || !isIsoTimestamp(record.connectedAt))) {
 		return fail("connectedAt must be an ISO timestamp");
 	}
 	if (hasOwnField(record, "degradedAt") && (typeof record.degradedAt !== "string" || !isIsoTimestamp(record.degradedAt))) {
 		return fail("degradedAt must be an ISO timestamp");
 	}
-	const userIntervened = hasOwnField(record, "userIntervened") ? record.userIntervened : undefined;
-	let normalizedUserIntervened: UserIntervenedMetadata | undefined;
-	if (hasOwnField(record, "userIntervened")) {
-		const userIntervenedValidation = validateUserIntervenedMetadata(userIntervened);
-		if (!userIntervenedValidation.ok) return userIntervenedValidation;
-		normalizedUserIntervened = userIntervenedValidation.value;
+
+	const userIntervenedHistory = hasOwnField(record, "userIntervenedHistory") ? record.userIntervenedHistory : undefined;
+	let normalizedUserIntervenedHistory: UserIntervenedMetadata[] | undefined;
+	if (hasOwnField(record, "userIntervenedHistory")) {
+		if (!Array.isArray(userIntervenedHistory) || userIntervenedHistory.length === 0) {
+			return fail("userIntervenedHistory must be a non-empty array");
+		}
+		const entries: UserIntervenedMetadata[] = [];
+		for (let index = 0; index < userIntervenedHistory.length; index += 1) {
+			const entryResult = validateUserIntervenedMetadata(userIntervenedHistory[index]);
+			if (!entryResult.ok) {
+				return fail(prefixNestedValidationError(`userIntervenedHistory[${index}]`, "userIntervened", entryResult.error));
+			}
+			if (entries.length > 0 && !isTimestampOnOrBefore(entries.at(-1)!.recordedAt, entryResult.value.recordedAt)) {
+				return fail("userIntervenedHistory must be sorted by recordedAt");
+			}
+			entries.push(entryResult.value);
+		}
+		normalizedUserIntervenedHistory = entries;
 	}
 	const runtimeError = hasOwnField(record, "error") ? record.error : undefined;
-	let normalizedRuntimeError: RuntimeTerminalError | undefined;
+	let normalizedRuntimeError: RuntimeFailure | undefined;
 	if (hasOwnField(record, "error")) {
-		const errorValidation = validateRuntimeTerminalError(runtimeError);
+		const errorValidation = validateRuntimeFailure(runtimeError);
 		if (!errorValidation.ok) return errorValidation;
 		normalizedRuntimeError = errorValidation.value;
 	}
@@ -1400,23 +1432,35 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		if (!finalResultValidation.ok) return finalResultValidation;
 		normalizedFinalResult = finalResultValidation.value as ExplicitReport<TData> & { kind: "final_result" };
 	}
-	if (finalResult && state !== "completed") {
-		return fail("finalResult may only be present when state is completed");
-	}
-	if (hasOwnField(record, "completedAt") && state !== "completed") {
-		return fail("completedAt may only be present when state is completed");
+	const finalResultHistory = hasOwnField(record, "finalResultHistory") ? record.finalResultHistory : undefined;
+	let normalizedFinalResultHistory: Array<ExplicitReport<TData> & { kind: "final_result" }> | undefined;
+	if (hasOwnField(record, "finalResultHistory")) {
+		if (!Array.isArray(finalResultHistory) || finalResultHistory.length === 0) {
+			return fail("finalResultHistory must be a non-empty array");
+		}
+		const entries: Array<ExplicitReport<TData> & { kind: "final_result" }> = [];
+		for (let index = 0; index < finalResultHistory.length; index += 1) {
+			const entryResult = validateExplicitReport<TData>(
+				`finalResultHistory[${index}]`,
+				finalResultHistory[index],
+				"final_result",
+			);
+			if (!entryResult.ok) return entryResult as ValidationOutcome<SubagentRecord<TData>>;
+			if (entries.length > 0 && !isTimestampOnOrBefore(entries.at(-1)!.reportedAt, entryResult.value.reportedAt)) {
+				return fail("finalResultHistory must be sorted by reportedAt");
+			}
+			entries.push(entryResult.value as ExplicitReport<TData> & { kind: "final_result" });
+		}
+		normalizedFinalResultHistory = entries;
 	}
 	if (hasOwnField(record, "stoppedAt") && state !== "stopped") {
 		return fail("stoppedAt may only be present when state is stopped");
 	}
-	if (hasOwnField(record, "degradedAt") && state !== "degraded") {
-		return fail("degradedAt may only be present when state is degraded");
-	}
 	if (STATES_REQUIRING_CONNECTED_AT.has(state) && !hasOwnField(record, "connectedAt")) {
 		return fail(`${state} records must include connectedAt`);
 	}
-	if (state === "completed" && !finalResult) {
-		return fail("completed records must include finalResult");
+	if (state === "needs_input" && !normalizedPendingInputRequest) {
+		return fail("needs_input records must include pendingInputRequest");
 	}
 	if (state === "failed" && !normalizedRuntimeError) {
 		return fail("failed records must include error");
@@ -1427,23 +1471,48 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 	if (normalizedRuntimeError && state !== "failed") {
 		return fail("error may only be present when state is failed");
 	}
-	if (state === "degraded" && !record.degradedAt) {
-		return fail("degraded records must include degradedAt");
+	if (normalizedPendingInputRequest && state !== "needs_input") {
+		return fail("pendingInputRequest may only be present when state is needs_input");
+	}
+	if (normalizedFinalResult && !normalizedFinalResultHistory) {
+		return fail("finalResult requires finalResultHistory");
+	}
+	if (normalizedFinalResultHistory && !normalizedFinalResult) {
+		return fail("finalResultHistory requires finalResult");
 	}
 
 	const startedAt = record.startedAt as string | undefined;
 	const stoppedAt = record.stoppedAt as string | undefined;
-	const completedAt = record.completedAt as string | undefined;
 	const connectedAt = record.connectedAt as string | undefined;
 	const degradedAt = record.degradedAt as string | undefined;
 
-	if ((normalizedLastProgressReport || normalizedPendingInputRequest || normalizedUserIntervened || normalizedFinalResult) && !connectedAt) {
+	if (
+		(
+			normalizedLastProgressReport
+			|| normalizedPendingInputRequest
+			|| normalizedUserIntervenedHistory
+			|| normalizedFinalResult
+			|| normalizedFinalResultHistory
+			|| degradedAt
+		)
+		&& !connectedAt
+	) {
 		return fail("sidecar-derived fields require connectedAt");
 	}
 	if (PRE_HANDSHAKE_STATES.has(state) && connectedAt) {
 		return fail(`${state} records may not include connectedAt`);
 	}
-	if (PRE_HANDSHAKE_STATES.has(state) && (normalizedLastProgressReport || normalizedPendingInputRequest || normalizedUserIntervened)) {
+	if (
+		PRE_HANDSHAKE_STATES.has(state)
+		&& (
+			normalizedLastProgressReport
+			|| normalizedPendingInputRequest
+			|| normalizedUserIntervenedHistory
+			|| normalizedFinalResult
+			|| normalizedFinalResultHistory
+			|| degradedAt
+		)
+	) {
 		return fail(`${state} records may not include post-handshake sidecar fields`);
 	}
 
@@ -1455,13 +1524,6 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		const connectionBaselineLabel = startedAt ? "startedAt" : "createdAt";
 		if (!isTimestampOnOrBefore(connectionBaseline, connectedAt)) {
 			return fail(`connectedAt must be on or after ${connectionBaselineLabel}`);
-		}
-	}
-	if (completedAt) {
-		const completionBaseline = connectedAt ?? startedAt ?? (record.createdAt as string);
-		const completionBaselineLabel = connectedAt ? "connectedAt" : startedAt ? "startedAt" : "createdAt";
-		if (!isTimestampOnOrBefore(completionBaseline, completedAt)) {
-			return fail(`completedAt must be on or after ${completionBaselineLabel}`);
 		}
 	}
 	if (stoppedAt) {
@@ -1478,69 +1540,10 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			return fail(`degradedAt must be on or after ${degradedBaselineLabel}`);
 		}
 	}
+	if (stoppedAt && degradedAt && !isTimestampOnOrBefore(degradedAt, stoppedAt)) {
+		return fail("degradedAt must be on or before stoppedAt");
+	}
 
-	if (
-		state === "completed" &&
-		completedAt &&
-		normalizedFinalResult &&
-		!isTimestampOnOrBefore(normalizedFinalResult.reportedAt, completedAt)
-	) {
-		return fail("finalResult.reportedAt must be on or before completedAt");
-	}
-	if (state === "completed" && normalizedFinalResult) {
-		if (!isTimestampOnOrBefore(record.createdAt as string, normalizedFinalResult.reportedAt)) {
-			return fail("finalResult.reportedAt must be on or after createdAt");
-		}
-		if (connectedAt && !isTimestampOnOrBefore(connectedAt, normalizedFinalResult.reportedAt)) {
-			return fail("finalResult.reportedAt must be on or after connectedAt");
-		}
-		const terminalBoundary = normalizedFinalResult.reportedAt;
-		if (
-			normalizedLastProgressReport &&
-			!isTimestampOnOrBefore(normalizedLastProgressReport.reportedAt, terminalBoundary)
-		) {
-			return fail("lastProgressReport.reportedAt must be on or before terminal completion");
-		}
-		if (
-			normalizedPendingInputRequest &&
-			!isTimestampOnOrBefore(normalizedPendingInputRequest.reportedAt, terminalBoundary)
-		) {
-			return fail("pendingInputRequest.reportedAt must be on or before terminal completion");
-		}
-		if (
-			normalizedUserIntervened &&
-			!isTimestampOnOrBefore(normalizedUserIntervened.recordedAt, terminalBoundary)
-		) {
-			return fail("userIntervened.recordedAt must be on or before terminal completion");
-		}
-		if (
-			normalizedRuntimeError &&
-			!isTimestampOnOrBefore(normalizedRuntimeError.recordedAt, terminalBoundary)
-		) {
-			return fail("error.recordedAt must be on or before terminal completion");
-		}
-	}
-	if (state === "failed" && normalizedRuntimeError) {
-		const terminalBoundary = normalizedRuntimeError.recordedAt;
-		if (
-			normalizedLastProgressReport &&
-			!isTimestampOnOrBefore(normalizedLastProgressReport.reportedAt, terminalBoundary)
-		) {
-			return fail("lastProgressReport.reportedAt must be on or before terminal failure");
-		}
-		if (
-			normalizedPendingInputRequest &&
-			!isTimestampOnOrBefore(normalizedPendingInputRequest.reportedAt, terminalBoundary)
-		) {
-			return fail("pendingInputRequest.reportedAt must be on or before terminal failure");
-		}
-		if (
-			normalizedUserIntervened &&
-			!isTimestampOnOrBefore(normalizedUserIntervened.recordedAt, terminalBoundary)
-		) {
-			return fail("userIntervened.recordedAt must be on or before terminal failure");
-		}
-	}
 	if (state === "stopped" && stoppedAt) {
 		if (
 			normalizedLastProgressReport &&
@@ -1555,13 +1558,19 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			return fail("pendingInputRequest.reportedAt must be on or before terminal stop");
 		}
 		if (
-			normalizedUserIntervened &&
-			!isTimestampOnOrBefore(normalizedUserIntervened.recordedAt, stoppedAt)
+			normalizedUserIntervenedHistory
+			&& normalizedUserIntervenedHistory.some((entry) => !isTimestampOnOrBefore(entry.recordedAt, stoppedAt))
 		) {
-			return fail("userIntervened.recordedAt must be on or before terminal stop");
+			return fail("userIntervenedHistory entries must be on or before terminal stop");
+		}
+		if (
+			normalizedFinalResultHistory
+			&& normalizedFinalResultHistory.some((entry) => !isTimestampOnOrBefore(entry.reportedAt, stoppedAt))
+		) {
+			return fail("finalResultHistory entries must be on or before terminal stop");
 		}
 	}
-	if (state === "degraded" && degradedAt) {
+	if (degradedAt) {
 		if (
 			normalizedLastProgressReport &&
 			!isTimestampOnOrBefore(normalizedLastProgressReport.reportedAt, degradedAt)
@@ -1575,10 +1584,16 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			return fail("pendingInputRequest.reportedAt must be on or before degradedAt");
 		}
 		if (
-			normalizedUserIntervened &&
-			!isTimestampOnOrBefore(normalizedUserIntervened.recordedAt, degradedAt)
+			normalizedUserIntervenedHistory
+			&& normalizedUserIntervenedHistory.some((entry) => !isTimestampOnOrBefore(entry.recordedAt, degradedAt))
 		) {
-			return fail("userIntervened.recordedAt must be on or before degradedAt");
+			return fail("userIntervenedHistory entries must be on or before degradedAt");
+		}
+		if (
+			normalizedFinalResultHistory
+			&& normalizedFinalResultHistory.some((entry) => !isTimestampOnOrBefore(entry.reportedAt, degradedAt))
+		) {
+			return fail("finalResultHistory entries must be on or before degradedAt");
 		}
 	}
 	if (normalizedLastProgressReport) {
@@ -1597,12 +1612,32 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			return fail("pendingInputRequest.reportedAt must be on or after connectedAt");
 		}
 	}
-	if (normalizedUserIntervened) {
-		if (!isTimestampOnOrBefore(record.createdAt as string, normalizedUserIntervened.recordedAt)) {
-			return fail("userIntervened.recordedAt must be on or after createdAt");
+	if (normalizedFinalResult) {
+		if (!isTimestampOnOrBefore(record.createdAt as string, normalizedFinalResult.reportedAt)) {
+			return fail("finalResult.reportedAt must be on or after createdAt");
 		}
-		if (connectedAt && !isTimestampOnOrBefore(connectedAt, normalizedUserIntervened.recordedAt)) {
-			return fail("userIntervened.recordedAt must be on or after connectedAt");
+		if (connectedAt && !isTimestampOnOrBefore(connectedAt, normalizedFinalResult.reportedAt)) {
+			return fail("finalResult.reportedAt must be on or after connectedAt");
+		}
+	}
+	if (normalizedFinalResultHistory) {
+		for (const entry of normalizedFinalResultHistory) {
+			if (!isTimestampOnOrBefore(record.createdAt as string, entry.reportedAt)) {
+				return fail("finalResultHistory entries must be on or after createdAt");
+			}
+			if (connectedAt && !isTimestampOnOrBefore(connectedAt, entry.reportedAt)) {
+				return fail("finalResultHistory entries must be on or after connectedAt");
+			}
+		}
+	}
+	if (normalizedUserIntervenedHistory) {
+		for (const entry of normalizedUserIntervenedHistory) {
+			if (!isTimestampOnOrBefore(record.createdAt as string, entry.recordedAt)) {
+				return fail("userIntervenedHistory entries must be on or after createdAt");
+			}
+			if (connectedAt && !isTimestampOnOrBefore(connectedAt, entry.recordedAt)) {
+				return fail("userIntervenedHistory entries must be on or after connectedAt");
+			}
 		}
 	}
 	if (normalizedRuntimeError) {
@@ -1614,6 +1649,22 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		}
 		if (connectedAt && !isTimestampOnOrBefore(connectedAt, normalizedRuntimeError.recordedAt)) {
 			return fail("error.recordedAt must be on or after connectedAt");
+		}
+	}
+	if (normalizedFinalResult && normalizedFinalResultHistory) {
+		const latestHistoryEntry = normalizedFinalResultHistory.at(-1)!;
+		const dataEqualityResult = safeDeepStrictEqual(
+			"finalResult.data",
+			latestHistoryEntry.data ?? null,
+			normalizedFinalResult.data ?? null,
+		);
+		if (!dataEqualityResult.ok) return dataEqualityResult;
+		if (
+			latestHistoryEntry.summary !== normalizedFinalResult.summary
+			|| latestHistoryEntry.reportedAt !== normalizedFinalResult.reportedAt
+			|| !dataEqualityResult.value
+		) {
+			return fail("finalResult must match the latest finalResultHistory entry");
 		}
 	}
 
@@ -1629,14 +1680,14 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		childMode: record.childMode,
 		createdAt: record.createdAt as string,
 		startedAt,
-		completedAt,
 		stoppedAt,
 		connectedAt,
 		degradedAt,
-		userIntervened: normalizedUserIntervened,
+		userIntervenedHistory: normalizedUserIntervenedHistory,
 		lastProgressReport: normalizedLastProgressReport,
 		pendingInputRequest: normalizedPendingInputRequest,
 		finalResult: normalizedFinalResult,
+		finalResultHistory: normalizedFinalResultHistory,
 		error: normalizedRuntimeError,
 	};
 

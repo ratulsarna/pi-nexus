@@ -1133,11 +1133,13 @@ describe("runtime state transitions", () => {
 		["starting", "connecting"],
 		["connecting", "ready"],
 		["ready", "running"],
+		["ready", "needs_input"],
 		["running", "waiting"],
+		["running", "needs_input"],
 		["waiting", "running"],
-		["running", "completed"],
-		["ready", "degraded"],
-		["degraded", "failed"],
+		["waiting", "needs_input"],
+		["needs_input", "running"],
+		["failed", "running"],
 		["running", "stopped"],
 	])("allows %s -> %s", (from, to) => {
 		expect(canTransitionRuntimeState(from as RuntimeState, to as RuntimeState)).toBe(true);
@@ -1150,12 +1152,10 @@ describe("runtime state transitions", () => {
 	it.each([
 		["starting", "ready"],
 		["connecting", "running"],
-		["completed", "running"],
 		["failed", "ready"],
-		["stopped", "completed"],
-		["degraded", "running"],
-		["degraded", "waiting"],
-		["degraded", "completed"],
+		["stopped", "running"],
+		["ready", "starting"],
+		["needs_input", "ready"],
 	])("rejects %s -> %s", (from, to) => {
 		expect(canTransitionRuntimeState(from as RuntimeState, to as RuntimeState)).toBe(false);
 		expect(assertRuntimeStateTransition(from as RuntimeState, to as RuntimeState)).toEqual({
@@ -1164,11 +1164,10 @@ describe("runtime state transitions", () => {
 		});
 	});
 
-	it("marks only completed, failed, and stopped as terminal", () => {
-		expect(isTerminalRuntimeState("completed")).toBe(true);
-		expect(isTerminalRuntimeState("failed")).toBe(true);
+	it("marks only stopped as terminal", () => {
+		expect(isTerminalRuntimeState("failed")).toBe(false);
 		expect(isTerminalRuntimeState("stopped")).toBe(true);
-		expect(isTerminalRuntimeState("degraded")).toBe(false);
+		expect(isTerminalRuntimeState("needs_input")).toBe(false);
 		expect(isTerminalRuntimeState("running")).toBe(false);
 	});
 });
@@ -1224,15 +1223,26 @@ describe("validateReportToParentInput", () => {
 		});
 	});
 
-	it.each(["completed", "failed", "stopped"] as const)("rejects reports after terminal state %s", (state) => {
-		const result = validateReportToParentInput({ kind: "progress", summary: "update" }, state);
-		expect(result).toEqual({
-			ok: false,
-			error: `cannot accept progress report while state is ${state}`,
+	it("accepts reports while state is failed because failure is non-terminal", () => {
+		expect(validateReportToParentInput({ kind: "progress", summary: "update" }, "failed")).toEqual({
+			ok: true,
+			value: {
+				kind: "progress",
+				summary: "update",
+				data: null,
+			},
 		});
 	});
 
-	it.each(["starting", "connecting", "degraded"] as const)(
+	it("rejects reports after terminal state stopped", () => {
+		const result = validateReportToParentInput({ kind: "progress", summary: "update" }, "stopped");
+		expect(result).toEqual({
+			ok: false,
+			error: "cannot accept progress report while state is stopped",
+		});
+	});
+
+	it.each(["starting", "connecting"] as const)(
 		"rejects reports while state is %s",
 		(state) => {
 			const result = validateReportToParentInput({ kind: "progress", summary: "update" }, state);
@@ -1243,27 +1253,22 @@ describe("validateReportToParentInput", () => {
 		},
 	);
 
-	it("rejects a duplicate final_result", () => {
-		const result = validateReportToParentInput(
-			{ kind: "final_result", summary: "done" },
-			"running",
-			true,
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "cannot accept final_result report after final_result has been recorded",
+	it("accepts repeated final_result reports", () => {
+		expect(validateReportToParentInput({ kind: "final_result", summary: "first" }, "running")).toEqual({
+			ok: true,
+			value: {
+				kind: "final_result",
+				summary: "first",
+				data: null,
+			},
 		});
-	});
-
-	it.each(["progress", "needs_input"] as const)("rejects %s after final_result has been recorded", (kind) => {
-		const result = validateReportToParentInput(
-			{ kind, summary: "late message" },
-			"running",
-			true,
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: `cannot accept ${kind} report after final_result has been recorded`,
+		expect(validateReportToParentInput({ kind: "final_result", summary: "second" }, "running")).toEqual({
+			ok: true,
+			value: {
+				kind: "final_result",
+				summary: "second",
+				data: null,
+			},
 		});
 	});
 });
@@ -1306,7 +1311,7 @@ describe("sidecar protocol envelope", () => {
 					message: "After that, check tests too.",
 				},
 			],
-			["abort", {}],
+			["interrupt", {}],
 			[
 				"ready",
 				{
@@ -1431,7 +1436,7 @@ describe("sidecar protocol envelope", () => {
 			),
 		).toEqual({
 			ok: false,
-			error: "sidecar envelope type must be one of: hello, steer, follow_up, abort, ping, ready, progress, final_result, needs_input, user_intervened, state, error, pong",
+			error: "sidecar envelope type must be one of: hello, steer, follow_up, interrupt, ping, ready, progress, final_result, needs_input, user_intervened, state, error, pong",
 		});
 
 		expect(
@@ -1487,14 +1492,14 @@ describe("sidecar protocol envelope", () => {
 			"follow_up.payload.message must be a non-empty string",
 		],
 		[
-			"abort",
+			"interrupt",
 			makeEnvelope({
-				type: "abort",
+				type: "interrupt",
 				payload: {
 					extra: true,
 				},
 			}),
-			"abort.payload must be an empty object",
+			"interrupt.payload must be an empty object",
 		],
 		[
 			"hello",
@@ -1570,7 +1575,7 @@ describe("sidecar protocol envelope", () => {
 					status: "ready",
 				},
 			}),
-			"state.payload.status must be one of: starting, running, waiting, completed, failed, stopped",
+			"state.payload.status must be one of: starting, running, waiting, needs_input, failed, stopped",
 		],
 		[
 			"error",
@@ -1611,7 +1616,7 @@ describe("sidecar protocol envelope", () => {
 	});
 
 	it.each([
-		["abort", "abort"],
+		["interrupt", "interrupt"],
 		["ping", "ping"],
 		["pong", "pong"],
 	])("rejects array payloads for %s empty-object messages", (_scenario, type) => {
@@ -1657,7 +1662,7 @@ describe("sidecar direction validation", () => {
 			],
 			["steer", { message: "Steer the child" }],
 			["follow_up", { message: "Follow up after current work" }],
-			["abort", {}],
+			["interrupt", {}],
 			["ping", {}],
 		] as const) {
 			const result = validateSidecarControlMessage(
@@ -1682,7 +1687,7 @@ describe("sidecar direction validation", () => {
 			),
 		).toEqual({
 			ok: false,
-			error: "sidecar control message type must be one of: hello, steer, follow_up, abort, ping",
+			error: "sidecar control message type must be one of: hello, steer, follow_up, interrupt, ping",
 		});
 	});
 
@@ -1971,385 +1976,524 @@ describe("validateSubagentRecord", () => {
 			ok: false,
 			error: "subagent record must be an object",
 		});
+		expect(validateSubagentRecord([])).toEqual({
+			ok: false,
+			error: "id must be a non-empty string",
+		});
 	});
 
 	it("accepts a minimal valid record", () => {
-		const result = validateSubagentRecord(makeRecord());
-		expect(result.ok).toBe(true);
+		expect(validateSubagentRecord(makeRecord()).ok).toBe(true);
 	});
 
-	it("rejects falsy optional timestamp fields when they are present", () => {
-		expect(validateSubagentRecord(makeRecord({ startedAt: "" }))).toEqual({
-			ok: false,
-			error: "startedAt must be an ISO timestamp",
-		});
-		expect(validateSubagentRecord(makeRecord({ stoppedAt: "" }))).toEqual({
-			ok: false,
-			error: "stoppedAt must be an ISO timestamp",
-		});
-		expect(validateSubagentRecord(makeRecord({ connectedAt: null as unknown as string }))).toEqual({
-			ok: false,
-			error: "connectedAt must be an ISO timestamp",
-		});
-	});
-
-	it("rejects falsy optional object fields when they are present", () => {
-		expect(validateSubagentRecord(makeRecord({ userIntervened: null as unknown as SubagentRecord["userIntervened"] }))).toEqual({
-			ok: false,
-			error: "userIntervened must be an object",
-		});
-		expect(validateSubagentRecord(makeRecord({ lastProgressReport: null as unknown as SubagentRecord["lastProgressReport"] }))).toEqual({
-			ok: false,
-			error: "lastProgressReport must be an object",
-		});
-	});
-
-	it("accepts a completed record only when finalResult exists", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result.ok).toBe(true);
-	});
-
-	it("accepts a waiting record with a persisted needs_input request", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "waiting",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				pendingInputRequest: {
-					kind: "needs_input",
-					summary: "Need approval to proceed",
-					data: { question: "Continue?" },
-					reportedAt: "2026-03-10T10:02:00.000Z",
-				},
-			}),
-		);
-		expect(result.ok).toBe(true);
-		if (!result.ok) return;
-		expect(result.value.pendingInputRequest).toEqual({
-			kind: "needs_input",
-			summary: "Need approval to proceed",
-			data: { question: "Continue?" },
-			reportedAt: "2026-03-10T10:02:00.000Z",
-		});
-	});
-
-	it("rejects finalResult when the record is not completed", () => {
+	it("accepts current-best finalResult plus append-only finalResultHistory", () => {
 		const result = validateSubagentRecord(
 			makeRecord({
 				state: "running",
+				connectedAt: "2026-03-10T10:01:00.000Z",
 				finalResult: {
 					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
+					summary: "latest",
+					data: { step: 2 },
+					reportedAt: "2026-03-10T10:03:00.000Z",
 				},
+				finalResultHistory: [
+					{
+						kind: "final_result",
+						summary: "first",
+						data: { step: 1 },
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+					{
+						kind: "final_result",
+						summary: "latest",
+						data: { step: 2 },
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+				],
 			}),
 		);
-		expect(result).toEqual({
-			ok: false,
-			error: "finalResult may only be present when state is completed",
-		});
+		expect(result.ok).toBe(true);
 	});
 
-	it("rejects a completed record without finalResult", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "completed records must include finalResult",
-		});
-	});
-
-	it("rejects completedAt on non-completed records", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "running",
-				completedAt: "2026-03-10T10:05:00.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "completedAt may only be present when state is completed",
-		});
-	});
-
-	it.each(["ready", "running", "waiting", "completed", "degraded"] as const)(
-		"rejects %s records without connectedAt",
-		(state) => {
-			const base =
-				state === "completed"
-					? {
-							finalResult: {
-								kind: "final_result" as const,
-								summary: "done",
-								data: null,
-								reportedAt: "2026-03-10T10:05:00.000Z",
-							},
-							completedAt: "2026-03-10T10:05:00.000Z",
-						}
-					: state === "degraded"
-						? {
-								degradedAt: "2026-03-10T10:05:00.000Z",
-							}
-						: {};
-
-			const result = validateSubagentRecord(
+	it("accepts needs_input posture with a matching pending input request", () => {
+		expect(
+			validateSubagentRecord(
 				makeRecord({
-					state,
-					...base,
+					state: "needs_input",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					pendingInputRequest: {
+						kind: "needs_input",
+						summary: "Need approval to proceed",
+						data: { question: "Continue?" },
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
 				}),
-			);
-			expect(result).toEqual({
-				ok: false,
-				error: `${state} records must include connectedAt`,
-			});
-		},
-	);
+			).ok,
+		).toBe(true);
+	});
 
-	it("rejects startedAt before createdAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				startedAt: "2026-03-10T09:59:59.000Z",
-			}),
-		);
-		expect(result).toEqual({
+	it("rejects needs_input posture without pendingInputRequest", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "needs_input",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "startedAt must be on or after createdAt",
+			error: "needs_input records must include pendingInputRequest",
 		});
 	});
 
-	it("rejects connectedAt before startedAt", () => {
+	it("rejects pendingInputRequest outside needs_input posture", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					pendingInputRequest: {
+						kind: "needs_input",
+						summary: "Need approval",
+						data: null,
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "pendingInputRequest may only be present when state is needs_input",
+		});
+	});
+
+	it("rejects finalResult without finalResultHistory", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "latest",
+						data: null,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "finalResult requires finalResultHistory",
+		});
+	});
+
+	it("rejects finalResultHistory without finalResult", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: null,
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "finalResultHistory requires finalResult",
+		});
+	});
+
+	it("rejects current-best finalResult that does not match the latest history entry", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "mismatch",
+						data: null,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: null,
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "finalResult must match the latest finalResultHistory entry",
+		});
+	});
+
+	it("accepts semantically equal finalResult data without depending on JSON serialization", () => {
 		const result = validateSubagentRecord(
 			makeRecord({
 				state: "running",
-				startedAt: "2026-03-10T10:01:00.000Z",
-				connectedAt: "2026-03-10T10:00:30.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "connectedAt must be on or after startedAt",
-		});
-	});
-
-	it("rejects completedAt before connectedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				startedAt: "2026-03-10T10:01:00.000Z",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				completedAt: "2026-03-10T10:01:30.000Z",
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:01:30.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "completedAt must be on or after connectedAt",
-		});
-	});
-
-	it("rejects a degraded record without degradedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "degraded",
 				connectedAt: "2026-03-10T10:01:00.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "degraded records must include degradedAt",
-		});
-	});
-
-	it("rejects unknown runtime states from untyped sources", () => {
-		const result = validateSubagentRecord(makeRecord({ state: "paused" as RuntimeState }));
-		expect(result).toEqual({
-			ok: false,
-			error: "state must be one of: starting, connecting, ready, running, waiting, completed, failed, stopped, degraded",
-		});
-	});
-
-	it("rejects finalResult with the wrong kind", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				finalResult: {
-					kind: "progress",
-					summary: "wrong",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				} as SubagentRecord["finalResult"],
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "finalResult.kind must be final_result",
-		});
-	});
-
-	it("rejects finalResult with a blank summary", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
 				finalResult: {
 					kind: "final_result",
-					summary: "   ",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
+					summary: "latest",
+					data: { count: 1n, nested: { alpha: "a", beta: "b" } },
+					reportedAt: "2026-03-10T10:03:00.000Z",
 				},
+				finalResultHistory: [
+					{
+						kind: "final_result",
+						summary: "latest",
+						data: { nested: { beta: "b", alpha: "a" }, count: 1n },
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+				],
 			}),
 		);
-		expect(result).toEqual({
+		expect(result.ok).toBe(true);
+	});
+
+	it("returns a validation error when finalResult data cannot be deep-compared", () => {
+		const hostileData: Record<string, unknown> = {};
+		Object.defineProperty(hostileData, "boom", {
+			enumerable: true,
+			get() {
+				throw new Error("getter exploded");
+			},
+		});
+
+		expect(() =>
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "latest",
+						data: hostileData,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: { boom: "safe" },
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).not.toThrow();
+
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "latest",
+						data: hostileData,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: { boom: "safe" },
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "finalResult.summary must be a non-empty string",
+			error: "finalResult.data must be comparable: getter exploded",
 		});
 	});
 
-	it("rejects finalResult with a bad reportedAt timestamp", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "not-a-date",
-				},
-			}),
-		);
-		expect(result).toEqual({
+	it("accepts userIntervenedHistory as history-only metadata", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:02:00.000Z",
+						},
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("rejects malformed userIntervenedHistory entries", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "March 10, 2026",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "finalResult.reportedAt must be an ISO timestamp",
+			error: "userIntervenedHistory[0].recordedAt must be an ISO timestamp",
 		});
 	});
 
-	it("rejects invalid lastProgressReport payloads", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				lastProgressReport: {
-					kind: "progress",
-					summary: "",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
+	it("rejects unsorted finalResultHistory entries", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "first",
+						data: null,
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "later",
+							data: null,
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+						{
+							kind: "final_result",
+							summary: "first",
+							data: null,
+							reportedAt: "2026-03-10T10:02:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "lastProgressReport.summary must be a non-empty string",
+			error: "finalResultHistory must be sorted by reportedAt",
 		});
 	});
 
-	it("rejects pendingInputRequest with the wrong kind", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "waiting",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				pendingInputRequest: {
-					kind: "progress",
-					summary: "wrong",
-					data: null,
-					reportedAt: "2026-03-10T10:02:00.000Z",
-				} as SubagentRecord["pendingInputRequest"],
-			}),
-		);
-		expect(result).toEqual({
+	it("rejects finalResultHistory entries before connectedAt", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "latest",
+						data: null,
+						reportedAt: "2026-03-10T10:03:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "too early",
+							data: null,
+							reportedAt: "2026-03-10T10:01:00.000Z",
+						},
+						{
+							kind: "final_result",
+							summary: "latest",
+							data: null,
+							reportedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "pendingInputRequest.kind must be needs_input",
+			error: "finalResultHistory entries must be on or after connectedAt",
 		});
 	});
 
-	it("rejects lastProgressReport with a non-progress kind", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				lastProgressReport: {
-					kind: "needs_input",
-					summary: "waiting on decision",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
+	it("accepts degradedAt as a separate trust-loss marker", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					degradedAt: "2026-03-10T10:03:00.000Z",
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("rejects stopped records whose degradedAt is later than stoppedAt", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "stopped",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					stoppedAt: "2026-03-10T10:03:00.000Z",
+					degradedAt: "2026-03-10T10:04:00.000Z",
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "lastProgressReport.kind must be progress",
+			error: "degradedAt must be on or before stoppedAt",
 		});
 	});
 
-	it("rejects malformed userIntervened metadata", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				userIntervened: {
-					source: "tmux",
-					mode: "direct-chat",
-					inputSource: "interactive-user",
-					recordedAt: "March 10, 2026",
-				},
-			}),
-		);
-		expect(result).toEqual({
+	it("rejects trusted sidecar history after degradedAt", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					degradedAt: "2026-03-10T10:03:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "late",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "late",
+							data: null,
+							reportedAt: "2026-03-10T10:04:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "userIntervened.recordedAt must be an ISO timestamp",
+			error: "finalResultHistory entries must be on or before degradedAt",
 		});
 	});
 
-	it("rejects lastProgressReport before createdAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "running",
-				connectedAt: "2026-03-10T10:00:30.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "too early",
-					data: null,
-					reportedAt: "2026-03-10T09:59:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
+	it("rejects sidecar history after stoppedAt", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "stopped",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					stoppedAt: "2026-03-10T10:03:00.000Z",
+					finalResult: {
+						kind: "final_result",
+						summary: "late",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "late",
+							data: null,
+							reportedAt: "2026-03-10T10:04:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "lastProgressReport.reportedAt must be on or after createdAt",
+			error: "finalResultHistory entries must be on or before terminal stop",
 		});
 	});
 
-	it("rejects lastProgressReport before connectedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "running",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "too early",
-					data: null,
-					reportedAt: "2026-03-10T10:01:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
+	it("rejects userIntervenedHistory entries before connectedAt", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:01:00.000Z",
+						},
+					],
+				}),
+			),
+		).toEqual({
 			ok: false,
-			error: "lastProgressReport.reportedAt must be on or after connectedAt",
+			error: "userIntervenedHistory entries must be on or after connectedAt",
 		});
 	});
 
-	it("rejects sidecar-derived fields before connectedAt even in non-handshake states", () => {
+	it("rejects malformed error payloads", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					error: {
+						message: "child exited",
+						recordedAt: "2026-03-10T10:05:00.000Z",
+						fatal: "nope" as unknown as boolean,
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "error.fatal must be a boolean",
+		});
+	});
+
+	it("rejects failed records without error", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "failed",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "failed records must include error",
+		});
+	});
+
+	it("rejects non-failed records with error payloads", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:02:00.000Z",
+					error: {
+						message: "should not be here",
+						recordedAt: "2026-03-10T10:03:00.000Z",
+						fatal: true,
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "error may only be present when state is failed",
+		});
+	});
+
+	it("rejects sidecar-derived fields before connectedAt", () => {
 		expect(
 			validateSubagentRecord(
 				makeRecord({
@@ -2365,45 +2509,6 @@ describe("validateSubagentRecord", () => {
 		).toEqual({
 			ok: false,
 			error: "sidecar-derived fields require connectedAt",
-		});
-
-		expect(
-			validateSubagentRecord(
-				makeRecord({
-					state: "failed",
-					error: {
-						message: "child exited",
-						recordedAt: "2026-03-10T10:01:30.000Z",
-						fatal: true,
-					},
-					userIntervened: {
-						source: "tmux",
-						mode: "direct-chat",
-						inputSource: "interactive-user",
-						recordedAt: "2026-03-10T10:01:00.000Z",
-					},
-				}),
-			),
-		).toEqual({
-			ok: false,
-			error: "sidecar-derived fields require connectedAt",
-		});
-
-		expect(
-			validateSubagentRecord(
-				makeRecord({
-					state: "waiting",
-					pendingInputRequest: {
-						kind: "needs_input",
-						summary: "Need approval",
-						data: null,
-						reportedAt: "2026-03-10T10:01:00.000Z",
-					},
-				}),
-			),
-		).toEqual({
-			ok: false,
-			error: "waiting records must include connectedAt",
 		});
 	});
 
@@ -2418,26 +2523,6 @@ describe("validateSubagentRecord", () => {
 		).toEqual({
 			ok: false,
 			error: "starting records may not include connectedAt",
-		});
-	});
-
-	it("rejects connectedAt on connecting records even when sidecar fields are present", () => {
-		expect(
-			validateSubagentRecord(
-				makeRecord({
-					state: "connecting",
-					connectedAt: "2026-03-10T10:01:00.000Z",
-					lastProgressReport: {
-						kind: "progress",
-						summary: "unexpected progress",
-						data: null,
-						reportedAt: "2026-03-10T10:02:00.000Z",
-					},
-				}),
-			),
-		).toEqual({
-			ok: false,
-			error: "connecting records may not include connectedAt",
 		});
 	});
 
@@ -2459,496 +2544,30 @@ describe("validateSubagentRecord", () => {
 		expect(result.value.lastProgressReport?.data).toBeNull();
 	});
 
-	it("rejects userIntervened before connectedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "running",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				userIntervened: {
-					source: "tmux",
-					mode: "direct-chat",
-					inputSource: "interactive-user",
-					recordedAt: "2026-03-10T10:01:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "userIntervened.recordedAt must be on or after connectedAt",
-		});
-	});
-
-	it("rejects error before createdAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "failed",
-				error: {
-					message: "too early",
-					recordedAt: "2026-03-10T09:59:00.000Z",
-					fatal: true,
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "error.recordedAt must be on or after createdAt",
-		});
-	});
-
-	it("rejects error before connectedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "failed",
-				connectedAt: "2026-03-10T10:05:00.000Z",
-				error: {
-					message: "too early",
-					recordedAt: "2026-03-10T10:01:00.000Z",
-					fatal: true,
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "error.recordedAt must be on or after connectedAt",
-		});
-	});
-
-	it("rejects pendingInputRequest before connectedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "waiting",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				pendingInputRequest: {
-					kind: "needs_input",
-					summary: "too early",
-					data: null,
-					reportedAt: "2026-03-10T10:01:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "pendingInputRequest.reportedAt must be on or after connectedAt",
-		});
-	});
-
-	it("rejects malformed error payloads", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				error: {
-					message: "child exited",
-					recordedAt: "2026-03-10T10:05:00.000Z",
-					fatal: "nope" as unknown as boolean,
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "error.fatal must be a boolean",
-		});
-	});
-
-	it("rejects failed records without error", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "failed",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "failed records must include error",
-		});
-	});
-
-	it("rejects non-failed records with terminal error payloads", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "running",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				error: {
-					message: "should not be here",
-					recordedAt: "2026-03-10T10:03:00.000Z",
-					fatal: true,
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "error may only be present when state is failed",
-		});
-	});
-
-	it("rejects failed records whose error predates startedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "failed",
-				startedAt: "2026-03-10T10:02:00.000Z",
-				error: {
-					message: "too early",
-					recordedAt: "2026-03-10T10:01:00.000Z",
-					fatal: true,
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "error.recordedAt must be on or after startedAt",
-		});
-	});
-
-	it("rejects failed records with sidecar activity after terminal failure", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "failed",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				error: {
-					message: "child exited",
-					recordedAt: "2026-03-10T10:05:00.000Z",
-					fatal: true,
-				},
-				lastProgressReport: {
-					kind: "progress",
-					summary: "late progress",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "lastProgressReport.reportedAt must be on or before terminal failure",
-		});
-	});
-
-	it("rejects failed records with needs_input after terminal failure", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "failed",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				error: {
-					message: "child exited",
-					recordedAt: "2026-03-10T10:05:00.000Z",
-					fatal: true,
-				},
-				pendingInputRequest: {
-					kind: "needs_input",
-					summary: "late blocker",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "pendingInputRequest.reportedAt must be on or before terminal failure",
-		});
-	});
-
-	it("accepts stopped records with historical sidecar-derived fields bounded by stoppedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "stopped",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				stoppedAt: "2026-03-10T10:05:00.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "done enough",
-					data: null,
-					reportedAt: "2026-03-10T10:04:00.000Z",
-				},
-				userIntervened: {
-					source: "tmux",
-					mode: "direct-chat",
-					inputSource: "interactive-user",
-					recordedAt: "2026-03-10T10:03:30.000Z",
-				},
-			}),
-		);
-		expect(result.ok).toBe(true);
-	});
-
-	it("rejects stopped records without stoppedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "stopped",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "stopped records must include stoppedAt",
-		});
-	});
-
-	it("rejects stopped records with sidecar-derived fields after stoppedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "stopped",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				stoppedAt: "2026-03-10T10:03:00.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "late progress",
-					data: null,
-					reportedAt: "2026-03-10T10:04:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "lastProgressReport.reportedAt must be on or before terminal stop",
-		});
-	});
-
-	it("rejects degradedAt on non-degraded records", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "running",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				degradedAt: "2026-03-10T10:03:00.000Z",
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "degradedAt may only be present when state is degraded",
-		});
-	});
-
-	it("rejects degraded records with progress after degradedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "degraded",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				degradedAt: "2026-03-10T10:05:00.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "late progress",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "lastProgressReport.reportedAt must be on or before degradedAt",
-		});
-	});
-
-	it("rejects degraded records with needs_input after degradedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "degraded",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				degradedAt: "2026-03-10T10:05:00.000Z",
-				pendingInputRequest: {
-					kind: "needs_input",
-					summary: "late blocker",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "pendingInputRequest.reportedAt must be on or before degradedAt",
-		});
-	});
-
-	it("rejects degraded records with user intervention after degradedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "degraded",
-				connectedAt: "2026-03-10T10:02:00.000Z",
-				degradedAt: "2026-03-10T10:05:00.000Z",
-				userIntervened: {
-					source: "tmux",
-					mode: "direct-chat",
-					inputSource: "interactive-user",
-					recordedAt: "2026-03-10T10:06:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "userIntervened.recordedAt must be on or before degradedAt",
-		});
-	});
-
 	it("rejects non-ISO timestamps even when Date.parse would accept them", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				createdAt: "March 10, 2026" as unknown as string,
-			}),
-		);
-		expect(result).toEqual({
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					createdAt: "March 10, 2026" as unknown as string,
+				}),
+			),
+		).toEqual({
 			ok: false,
 			error: "createdAt must be an ISO timestamp",
 		});
 	});
 
-	it("rejects completed records with progress after final completion", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "late progress",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "lastProgressReport.reportedAt must be on or before terminal completion",
-		});
-	});
-
-	it("rejects completed records whose finalResult is after completedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:04:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "finalResult.reportedAt must be on or before completedAt",
-		});
-	});
-
-	it("rejects completed records with sidecar activity after final_result even when completedAt is later", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:06:00.000Z",
-				lastProgressReport: {
-					kind: "progress",
-					summary: "late progress",
-					data: null,
-					reportedAt: "2026-03-10T10:05:30.000Z",
-				},
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "lastProgressReport.reportedAt must be on or before terminal completion",
-		});
-	});
-
-	it("rejects completed records whose finalResult is before createdAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T09:59:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "finalResult.reportedAt must be on or after createdAt",
-		});
-	});
-
-	it("rejects completed records whose finalResult is before connectedAt", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:03:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:02:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "finalResult.reportedAt must be on or after connectedAt",
-		});
-	});
-
-	it("rejects completed records with user intervention after terminal completion", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				userIntervened: {
-					source: "tmux",
-					mode: "direct-chat",
-					inputSource: "interactive-user",
-					recordedAt: "2026-03-10T10:06:00.000Z",
-				},
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "userIntervened.recordedAt must be on or before terminal completion",
-		});
-	});
-
-	it("rejects completed records with needs_input after terminal completion", () => {
-		const result = validateSubagentRecord(
-			makeRecord({
-				state: "completed",
-				connectedAt: "2026-03-10T10:01:00.000Z",
-				completedAt: "2026-03-10T10:05:00.000Z",
-				pendingInputRequest: {
-					kind: "needs_input",
-					summary: "late blocker",
-					data: null,
-					reportedAt: "2026-03-10T10:06:00.000Z",
-				},
-				finalResult: {
-					kind: "final_result",
-					summary: "done",
-					data: null,
-					reportedAt: "2026-03-10T10:05:00.000Z",
-				},
-			}),
-		);
-		expect(result).toEqual({
-			ok: false,
-			error: "pendingInputRequest.reportedAt must be on or before terminal completion",
-		});
+	it("rejects invalid record shape", () => {
+		for (const record of [
+			makeRecord({ id: " " }),
+			makeRecord({ sessionPath: "session.jsonl" }),
+			makeRecord({ socketPath: "" }),
+			makeRecord({ tmuxTarget: "" }),
+			makeRecord({ childMode: "embedded" as SubagentRecord["childMode"] }),
+			makeRecord({ createdAt: "bad-date" }),
+		]) {
+			expect(validateSubagentRecord(record).ok).toBe(false);
+		}
 	});
 
 	it.each([
