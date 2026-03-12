@@ -21,3 +21,13 @@
 - For bind/create endpoints, validate availability, not just syntax. A path can be absolute and well-formed but still be unusable because the target is already occupied.
 - Lifecycle contracts need chronology checks, not just timestamp format checks. Well-formed timestamps can still describe impossible runtime histories.
 - Treat contract-boundary tickets as hardening work, not ordinary feature work. Start with an edge-case matrix covering shape, presence, filesystem reality, lifecycle state, and chronology, and expect a longer review tail than a normal feature ticket.
+
+## Cursor Cloud specific instructions
+
+This is a pure TypeScript library (no running services, no Docker, no database). All commands run from the repo root.
+
+- **Build:** `npm run build` — compiles `src/` → `dist/` via `tsc -p tsconfig.build.json`.
+- **Test:** `npm test` — runs `vitest --run` (272 tests across 4 files; all unit tests, no external deps).
+- **Type-check (lint equivalent):** `npx tsc -p tsconfig.build.json --noEmit` — no ESLint/Prettier is configured; the TypeScript strict-mode build is the effective lint. Use `tsconfig.build.json`, not the bare `tsconfig.json`, to avoid pre-existing mock-type mismatches in test files.
+- **Acceptance test:** `npm run accept:rat-134` requires `tmux` and the `pi` CLI on PATH; it is not needed for normal development and the `pi` CLI is not available in the cloud VM.
+- The test config (`tsconfig.test.json`) includes test files and will show type errors from mock objects — this is expected and does not indicate a problem.
