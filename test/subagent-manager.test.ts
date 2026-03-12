@@ -971,6 +971,49 @@ describe("SubagentManager", () => {
 		expect(failedRecoveryRecord.error).toBeUndefined();
 	});
 
+	it("rejects stale progress after failed without poisoning later recovery", () => {
+		const { manager, sidecars } = createManager([]);
+		const request = makeSpawnRequest("agt_stale_progress_after_failed");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_stale_progress_after_failed").connect());
+		expectOk(sidecars.get("agt_stale_progress_after_failed").message(
+			makeEnvelope("agt_stale_progress_after_failed", "ready", 0, "2026-03-11T12:05:12.000Z", {
+				pid: 1116,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_stale_progress_after_failed").message(
+			makeEnvelope("agt_stale_progress_after_failed", "state", 1, "2026-03-11T12:05:14.000Z", {
+				status: "failed",
+			}),
+		));
+
+		const failedBeforeRecovery = expectOk(manager.getRecord("agt_stale_progress_after_failed"));
+		const rejected = sidecars.get("agt_stale_progress_after_failed").message(
+			makeEnvelope("agt_stale_progress_after_failed", "progress", 2, "2026-03-11T12:05:13.000Z", {
+				summary: "stale recovery",
+			}),
+		);
+		expect(rejected.ok).toBe(false);
+		if (!rejected.ok) {
+			expect(rejected.error).toBe(
+				"progress.time must be on or after accepted record chronology (error.recordedAt)",
+			);
+		}
+		expect(expectOk(manager.getRecord("agt_stale_progress_after_failed"))).toEqual(failedBeforeRecovery);
+
+		expectOk(sidecars.get("agt_stale_progress_after_failed").message(
+			makeEnvelope("agt_stale_progress_after_failed", "progress", 2, "2026-03-11T12:05:15.000Z", {
+				summary: "fresh recovery",
+			}),
+		));
+		const recoveredRecord = expectOk(manager.getRecord("agt_stale_progress_after_failed"));
+		expect(recoveredRecord.state).toBe("running");
+		expect(recoveredRecord.error).toBeUndefined();
+		expect(recoveredRecord.lastProgressReport?.reportedAt).toBe("2026-03-11T12:05:15.000Z");
+	});
+
 	it("marks a ready agent degraded on disconnect and keeps posture separate from trust", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:05:00.000Z",
@@ -1142,7 +1185,9 @@ describe("SubagentManager", () => {
 		);
 		expect(rejected.ok).toBe(false);
 		if (!rejected.ok) {
-			expect(rejected.error).toContain("lastProgressReport.reportedAt must be on or before terminal stop");
+			expect(rejected.error).toBe(
+				"state.time must be on or after accepted record chronology (lastProgressReport.reportedAt)",
+			);
 		}
 
 		expectOk(sidecars.get("agt_rejected_stopped_state").disconnect("lost socket"));

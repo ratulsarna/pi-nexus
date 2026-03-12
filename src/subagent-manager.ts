@@ -165,6 +165,11 @@ function maxIsoTimestamp(first: string, second: string): string {
 	return first >= second ? first : second;
 }
 
+interface ChronologyEntry {
+	label: string;
+	time: string;
+}
+
 function isTransientPreReadyDisconnectReason(reason: string | undefined): boolean {
 	if (!reason?.trim()) {
 		return true;
@@ -649,6 +654,8 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted) {
 			return fail("cannot accept progress before handshake is complete");
 		}
+		const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+		if (!chronologyResult.ok) return chronologyResult;
 
 		const reportResult = validateReportToParentInput<TData>(
 			{
@@ -688,6 +695,8 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted) {
 			return fail("cannot accept needs_input before handshake is complete");
 		}
+		const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+		if (!chronologyResult.ok) return chronologyResult;
 
 		const reportResult = validateReportToParentInput<TData>(
 			{
@@ -718,6 +727,8 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted) {
 			return fail("cannot accept final_result before handshake is complete");
 		}
+		const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+		if (!chronologyResult.ok) return chronologyResult;
 
 		const reportResult = validateReportToParentInput<TData>(
 			{
@@ -762,6 +773,8 @@ export class SubagentManager<TData = unknown> {
 		if (this.isDegraded(runtime.record)) {
 			return fail("cannot accept user_intervened while agent is degraded");
 		}
+		const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+		if (!chronologyResult.ok) return chronologyResult;
 
 		const metadataResult = createUserIntervenedMetadata(event.time);
 		if (!metadataResult.ok) return metadataResult;
@@ -799,6 +812,8 @@ export class SubagentManager<TData = unknown> {
 			case "running":
 			case "waiting":
 			case "needs_input": {
+				const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+				if (!chronologyResult.ok) return chronologyResult;
 				const nextState = event.payload.status;
 				if (nextState === "needs_input" && runtime.record.pendingInputRequest === undefined) {
 					runtime.lastReportedState = event.payload.status;
@@ -818,6 +833,8 @@ export class SubagentManager<TData = unknown> {
 				return ok(cloneValue(runtime.record));
 			}
 			case "failed": {
+				const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+				if (!chronologyResult.ok) return chronologyResult;
 				const nextRecord = {
 					...runtime.record,
 					state: "failed" as const,
@@ -836,6 +853,8 @@ export class SubagentManager<TData = unknown> {
 				return ok(cloneValue(runtime.record));
 			}
 			case "stopped": {
+				const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+				if (!chronologyResult.ok) return chronologyResult;
 				const normalizedResult = this.transitionRecord(runtime.record, "stopped", {
 					stoppedAt: event.time,
 				});
@@ -856,6 +875,8 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted) {
 			return fail("cannot accept error before handshake is complete");
 		}
+		const chronologyResult = this.ensureEventTimeOnOrAfterAcceptedChronology(runtime.record, event.type, event.time);
+		if (!chronologyResult.ok) return chronologyResult;
 
 		const nextRecord = {
 			...runtime.record,
@@ -965,6 +986,63 @@ export class SubagentManager<TData = unknown> {
 			data,
 			reportedAt,
 		};
+	}
+
+	private ensureEventTimeOnOrAfterAcceptedChronology(
+		record: SubagentRecord<TData>,
+		eventType: SidecarEventMessage<TData>["type"],
+		eventTime: string,
+	): ValidationOutcome<undefined> {
+		const latestChronologyEntry = this.getLatestAcceptedChronologyEntry(record);
+		if (!latestChronologyEntry || latestChronologyEntry.time <= eventTime) {
+			return ok(undefined);
+		}
+
+		return fail(`${eventType}.time must be on or after accepted record chronology (${latestChronologyEntry.label})`);
+	}
+
+	private getLatestAcceptedChronologyEntry(record: SubagentRecord<TData>): ChronologyEntry | undefined {
+		const entries: ChronologyEntry[] = [];
+
+		if (record.lastProgressReport) {
+			entries.push({
+				label: "lastProgressReport.reportedAt",
+				time: record.lastProgressReport.reportedAt,
+			});
+		}
+		if (record.pendingInputRequest) {
+			entries.push({
+				label: "pendingInputRequest.reportedAt",
+				time: record.pendingInputRequest.reportedAt,
+			});
+		}
+		const latestFinalResultTime = record.finalResultHistory?.at(-1)?.reportedAt ?? record.finalResult?.reportedAt;
+		if (latestFinalResultTime) {
+			entries.push({
+				label: "finalResult.reportedAt",
+				time: latestFinalResultTime,
+			});
+		}
+		const latestUserIntervenedAt = record.userIntervenedHistory?.at(-1)?.recordedAt;
+		if (latestUserIntervenedAt) {
+			entries.push({
+				label: "userIntervenedHistory.recordedAt",
+				time: latestUserIntervenedAt,
+			});
+		}
+		if (record.error) {
+			entries.push({
+				label: "error.recordedAt",
+				time: record.error.recordedAt,
+			});
+		}
+
+		return entries.reduce<ChronologyEntry | undefined>((latest, entry) => {
+			if (!latest || maxIsoTimestamp(latest.time, entry.time) === entry.time) {
+				return entry;
+			}
+			return latest;
+		}, undefined);
 	}
 
 	private getRuntime(agentId: string): ValidationOutcome<ManagedRuntime<TData>> {
