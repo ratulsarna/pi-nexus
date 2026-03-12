@@ -1329,6 +1329,26 @@ describe("SubagentManager", () => {
 		expect(failedAfterExit.error).toEqual(failedBeforeExit.error);
 	});
 
+	it("does not try to degrade failed records that never finished handshake", () => {
+		const { manager, sidecars, processes } = createManager([
+			"2026-03-11T12:06:16.000Z",
+			"2026-03-11T12:06:17.000Z",
+		]);
+		expectOk(manager.spawn(makeSpawnRequest("agt_failed_pre_ready_disconnect")));
+		expectOk(processes.get("agt_failed_pre_ready_disconnect").exit({ code: 1, signal: null }));
+
+		const failedBeforeDisconnect = expectOk(manager.getRecord("agt_failed_pre_ready_disconnect"));
+		expect(failedBeforeDisconnect.state).toBe("failed");
+		expect(failedBeforeDisconnect.connectedAt).toBeUndefined();
+
+		expectOk(sidecars.get("agt_failed_pre_ready_disconnect").disconnect("cleanup close"));
+
+		const failedAfterDisconnect = expectOk(manager.getRecord("agt_failed_pre_ready_disconnect"));
+		expect(failedAfterDisconnect.state).toBe("failed");
+		expect(failedAfterDisconnect.degradedAt).toBeUndefined();
+		expect(failedAfterDisconnect.error).toEqual(failedBeforeDisconnect.error);
+	});
+
 	it("anchors pre-ready disconnect failure timestamps to accepted record chronology", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:06:30.000Z",

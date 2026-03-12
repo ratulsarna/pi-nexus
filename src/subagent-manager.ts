@@ -399,6 +399,11 @@ export class SubagentManager<TData = unknown> {
 			return ok(cloneValue(runtime.record));
 		}
 
+		if (runtime.record.state === "failed" && runtime.record.connectedAt === undefined) {
+			this.clearConnectingTimeout(runtime);
+			return ok(cloneValue(runtime.record));
+		}
+
 		if (
 			runtime.record.state === "ready"
 			|| runtime.record.state === "running"
