@@ -414,6 +414,7 @@ describe("SubagentManager", () => {
 			"2026-03-11T12:02:01.000Z",
 			"2026-03-11T12:02:02.000Z",
 			"2026-03-11T12:02:03.000Z",
+			"2026-03-11T12:02:03.500Z",
 		]);
 		const request = makeSpawnRequest("agt_controls");
 		expectOk(manager.spawn(request));
@@ -429,13 +430,15 @@ describe("SubagentManager", () => {
 		expectOk(manager.sendSteer("agt_controls", "Steer now"));
 		expectOk(manager.sendFollowUp("agt_controls", "Follow up later"));
 		expectOk(manager.sendAbort("agt_controls"));
+		expectOk(manager.sendPing("agt_controls"));
 		expect(sidecars.get("agt_controls").sent.map((message) => message.type)).toEqual([
 			"hello",
 			"steer",
 			"follow_up",
 			"abort",
+			"ping",
 		]);
-		expect(sidecars.get("agt_controls").sent.map((message) => message.seq)).toEqual([0, 1, 2, 3]);
+		expect(sidecars.get("agt_controls").sent.map((message) => message.seq)).toEqual([0, 1, 2, 3, 4]);
 		expect(processes.get("agt_controls").terminateReasons).toEqual([]);
 	});
 
@@ -1122,6 +1125,62 @@ describe("SubagentManager", () => {
 		}
 	});
 
+	it("keeps connecting across a silent pre-ready disconnect and accepts a later ready", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:05:46.000Z",
+			"2026-03-11T12:05:47.000Z",
+		]);
+		const request = makeSpawnRequest("agt_transient_disconnect");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_transient_disconnect").connect());
+		expectOk(sidecars.get("agt_transient_disconnect").disconnect());
+
+		const connectingRecord = expectOk(manager.getRecord("agt_transient_disconnect"));
+		expect(connectingRecord.state).toBe("connecting");
+		expect(connectingRecord.error).toBeUndefined();
+
+		expectOk(sidecars.get("agt_transient_disconnect").connect());
+		expectOk(sidecars.get("agt_transient_disconnect").message(
+			makeEnvelope("agt_transient_disconnect", "ready", 0, "2026-03-11T12:05:48.000Z", {
+				pid: 8181,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+
+		const readyRecord = expectOk(manager.getRecord("agt_transient_disconnect"));
+		expect(readyRecord.state).toBe("ready");
+		expect(sidecars.get("agt_transient_disconnect").sent.map((message) => message.type)).toEqual(["hello", "hello"]);
+	});
+
+	it("keeps connecting across transient transport disconnect reasons before ready", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:05:48.000Z",
+			"2026-03-11T12:05:49.000Z",
+		]);
+		const request = makeSpawnRequest("agt_transient_epipe");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_transient_epipe").connect());
+		expectOk(sidecars.get("agt_transient_epipe").disconnect("write EPIPE"));
+
+		const connectingRecord = expectOk(manager.getRecord("agt_transient_epipe"));
+		expect(connectingRecord.state).toBe("connecting");
+		expect(connectingRecord.error).toBeUndefined();
+
+		expectOk(sidecars.get("agt_transient_epipe").connect());
+		expectOk(sidecars.get("agt_transient_epipe").message(
+			makeEnvelope("agt_transient_epipe", "ready", 0, "2026-03-11T12:05:50.000Z", {
+				pid: 8282,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+
+		const readyRecord = expectOk(manager.getRecord("agt_transient_epipe"));
+		expect(readyRecord.state).toBe("ready");
+		expect(sidecars.get("agt_transient_epipe").sent.map((message) => message.type)).toEqual(["hello", "hello"]);
+	});
+
 	it("anchors connect-timeout failure timestamps to accepted record chronology", () => {
 		vi.useFakeTimers();
 		try {
@@ -1142,7 +1201,7 @@ describe("SubagentManager", () => {
 		}
 	});
 
-	it("marks pre-ready disconnects and unexpected exits as failures", () => {
+	it("marks reasoned pre-ready disconnects and unexpected exits as failures", () => {
 		const first = createManager([
 			"2026-03-11T12:06:00.000Z",
 			"2026-03-11T12:06:01.000Z",

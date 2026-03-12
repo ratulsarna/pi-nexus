@@ -161,6 +161,14 @@ function maxIsoTimestamp(first: string, second: string): string {
 	return first >= second ? first : second;
 }
 
+function isTransientPreReadyDisconnectReason(reason: string | undefined): boolean {
+	if (!reason?.trim()) {
+		return true;
+	}
+
+	return /(EPIPE|ECONNRESET|socket hang up|broken pipe|write after end)/i.test(reason);
+}
+
 export class SubagentManager<TData = unknown> {
 	private readonly runtimes = new Map<string, ManagedRuntime<TData>>();
 
@@ -374,19 +382,21 @@ export class SubagentManager<TData = unknown> {
 		const runtimeResult = this.getRuntime(agentId);
 		if (!runtimeResult.ok) return runtimeResult;
 		const runtime = runtimeResult.value;
-		this.clearConnectingTimeout(runtime);
 		runtime.connectionOpen = false;
 		runtime.trusted = false;
 
 		if (this.isTerminalReportedState(runtime.lastReportedState)) {
+			this.clearConnectingTimeout(runtime);
 			return ok(cloneValue(runtime.record));
 		}
 
 		if (this.isTerminal(runtime.record.state)) {
+			this.clearConnectingTimeout(runtime);
 			return ok(cloneValue(runtime.record));
 		}
 
 		if (runtime.record.state === "ready" || runtime.record.state === "running" || runtime.record.state === "waiting") {
+			this.clearConnectingTimeout(runtime);
 			const degradedResult = this.transitionRecord(runtime.record, "degraded", {
 				degradedAt: this.deriveTerminalTimestamp(runtime.record),
 			});
@@ -396,9 +406,15 @@ export class SubagentManager<TData = unknown> {
 		}
 
 		if (runtime.record.state === "degraded") {
+			this.clearConnectingTimeout(runtime);
 			return ok(cloneValue(runtime.record));
 		}
 
+		if (isTransientPreReadyDisconnectReason(reason)) {
+			return ok(cloneValue(runtime.record));
+		}
+
+		this.clearConnectingTimeout(runtime);
 		const failedResult = this.transitionRecord(runtime.record, "failed", {
 			error: {
 				message: reason
@@ -477,6 +493,10 @@ export class SubagentManager<TData = unknown> {
 
 	public sendAbort(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {
 		return this.sendControl(agentId, "abort", {});
+	}
+
+	public sendPing(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {
+		return this.sendControl(agentId, "ping", {});
 	}
 
 	public shutdownAll(): ValidationOutcome<ReadonlyArray<SubagentRecord<TData>>> {
