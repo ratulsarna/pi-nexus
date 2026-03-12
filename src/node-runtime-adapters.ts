@@ -201,7 +201,7 @@ export class ChildProcessSubagentProcessAdapter implements SubagentProcessAdapte
 
 		return {
 			terminate(reason) {
-				child.kill(reason === "abort" ? "SIGINT" : "SIGTERM");
+				child.kill(reason === "interrupt" ? "SIGINT" : "SIGTERM");
 			},
 		};
 	}
@@ -347,7 +347,7 @@ export class TmuxSubagentProcessAdapter implements SubagentProcessAdapter {
 				} finally {
 					finalizeExit({
 						code: null,
-						signal: reason === "abort" ? "SIGINT" : "SIGTERM",
+						signal: reason === "interrupt" ? "SIGINT" : "SIGTERM",
 					});
 				}
 				if (terminateError) {

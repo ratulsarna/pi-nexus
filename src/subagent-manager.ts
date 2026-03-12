@@ -50,7 +50,7 @@ export interface SidecarSessionAdapter<TData = unknown> {
 }
 
 export interface SubagentProcessHandle {
-	terminate(reason: "abort" | "shutdown"): void;
+	terminate(reason: "interrupt" | "shutdown"): void;
 }
 
 export interface SubagentProcessAdapter {
@@ -323,7 +323,7 @@ export class SubagentManager<TData = unknown> {
 		if (runtime.connectionOpen) {
 			return fail(`sidecar is already connected for agent ${agentId}`);
 		}
-		if (runtime.record.state === "degraded") {
+		if (this.isDegraded(runtime.record)) {
 			return fail(`cannot reconnect sidecar for degraded agent ${agentId}`);
 		}
 		if (this.isTerminalReportedState(runtime.lastReportedState)) {
@@ -395,18 +395,20 @@ export class SubagentManager<TData = unknown> {
 			return ok(cloneValue(runtime.record));
 		}
 
-		if (runtime.record.state === "ready" || runtime.record.state === "running" || runtime.record.state === "waiting") {
+		if (
+			runtime.record.state === "ready"
+			|| runtime.record.state === "running"
+			|| runtime.record.state === "waiting"
+			|| runtime.record.state === "needs_input"
+			|| runtime.record.state === "failed"
+		) {
 			this.clearConnectingTimeout(runtime);
-			const degradedResult = this.transitionRecord(runtime.record, "degraded", {
+			const degradedResult = normalizeRecord<TData>({
+				...runtime.record,
 				degradedAt: this.deriveTerminalTimestamp(runtime.record),
 			});
 			if (!degradedResult.ok) return degradedResult;
 			runtime.record = degradedResult.value;
-			return ok(cloneValue(runtime.record));
-		}
-
-		if (runtime.record.state === "degraded") {
-			this.clearConnectingTimeout(runtime);
 			return ok(cloneValue(runtime.record));
 		}
 
@@ -452,11 +454,7 @@ export class SubagentManager<TData = unknown> {
 		}
 		const terminalTimestamp = this.deriveTerminalTimestamp(runtime.record);
 
-		if (
-			runtime.lastReportedState === "completed"
-			&& exitResult.value.code === 0
-			&& exitResult.value.signal === null
-		) {
+		if (exitResult.value.code === 0 && exitResult.value.signal === null) {
 			const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
 				stoppedAt: terminalTimestamp,
 			});
@@ -474,6 +472,7 @@ export class SubagentManager<TData = unknown> {
 				recordedAt: terminalTimestamp,
 				fatal: true,
 			},
+			pendingInputRequest: undefined,
 		});
 		if (!failedResult.ok) return failedResult;
 
@@ -491,8 +490,23 @@ export class SubagentManager<TData = unknown> {
 		return this.sendControl(agentId, "follow_up", { message });
 	}
 
-	public sendAbort(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {
-		return this.sendControl(agentId, "abort", {});
+	public sendInterrupt(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {
+		const controlResult = this.sendControl(agentId, "interrupt", {});
+		if (!controlResult.ok) return controlResult;
+
+		const runtimeResult = this.getRuntime(agentId);
+		if (!runtimeResult.ok) return runtimeResult;
+		const runtime = runtimeResult.value;
+		const normalizedResult = normalizeRecord<TData>({
+			...runtime.record,
+			state: "waiting",
+			pendingInputRequest: undefined,
+			error: undefined,
+		});
+		if (!normalizedResult.ok) return normalizedResult;
+
+		runtime.record = normalizedResult.value;
+		return ok(cloneValue(controlResult.value));
 	}
 
 	public sendPing(agentId: string): ValidationOutcome<SidecarControlMessage<TData>> {
@@ -509,7 +523,7 @@ export class SubagentManager<TData = unknown> {
 
 		for (const runtime of this.runtimes.values()) {
 			this.clearConnectingTimeout(runtime);
-			if (!this.isTerminal(runtime.record.state)) {
+			if (runtime.record.state !== "stopped") {
 				const stoppedResult = this.transitionRecord(runtime.record, "stopped", {
 					stoppedAt: this.deriveTerminalTimestamp(runtime.record),
 				});
@@ -617,7 +631,6 @@ export class SubagentManager<TData = unknown> {
 				data: event.payload.data,
 			},
 			runtime.record.state,
-			Boolean(runtime.record.finalResult),
 		);
 		if (!reportResult.ok) return reportResult;
 		const cloneableDataResult = ensureCloneable(reportResult.value.data ?? null, "progress.data");
@@ -627,6 +640,7 @@ export class SubagentManager<TData = unknown> {
 		const nextRecord = {
 			...runtime.record,
 			state: nextState,
+			error: undefined,
 			lastProgressReport: this.makeReport(
 				"progress",
 				reportResult.value.summary,
@@ -655,14 +669,14 @@ export class SubagentManager<TData = unknown> {
 				summary: event.payload.question,
 			},
 			runtime.record.state,
-			Boolean(runtime.record.finalResult),
 		);
 		if (!reportResult.ok) return reportResult;
 
-		const nextState: RuntimeState = "waiting";
+		const nextState: RuntimeState = "needs_input";
 		const nextRecord = {
 			...runtime.record,
 			state: nextState,
+			error: undefined,
 			pendingInputRequest: this.makeReport("needs_input", reportResult.value.summary, null, event.time),
 		};
 		const normalizedResult = this.normalizeWithTransition(runtime.record, nextState, nextRecord);
@@ -675,11 +689,9 @@ export class SubagentManager<TData = unknown> {
 		runtime: ManagedRuntime<TData>,
 		event: Extract<SidecarEventMessage<TData>, { type: "final_result" }>,
 	): ValidationOutcome<SubagentRecord<TData>> {
-		const canAcceptAfterCompletedState = runtime.lastReportedState === "completed" && !runtime.record.finalResult;
-		if (!runtime.trusted && !canAcceptAfterCompletedState) {
+		if (!runtime.trusted) {
 			return fail("cannot accept final_result before handshake is complete");
 		}
-		const currentState = this.deriveAuthoritativeCompletionSourceState(runtime.record);
 
 		const reportResult = validateReportToParentInput<TData>(
 			{
@@ -687,39 +699,30 @@ export class SubagentManager<TData = unknown> {
 				summary: event.payload.summary,
 				data: event.payload.data,
 			},
-			currentState,
-			Boolean(runtime.record.finalResult),
+			runtime.record.state,
 		);
 		if (!reportResult.ok) return reportResult;
 		const cloneableDataResult = ensureCloneable(reportResult.value.data ?? null, "final_result.data");
 		if (!cloneableDataResult.ok) return cloneableDataResult;
 
-		const nextState: RuntimeState = "completed";
-		const nextRecord = {
-			...runtime.record,
-			state: nextState,
-			completedAt: event.time,
-			stoppedAt: undefined,
-			finalResult: this.makeReport(
+		const nextHistory = [
+			...(runtime.record.finalResultHistory ?? []),
+			this.makeReport(
 				"final_result",
 				reportResult.value.summary,
 				cloneableDataResult.value,
 				event.time,
 			),
-			pendingInputRequest: undefined,
+		];
+		const nextRecord = {
+			...runtime.record,
+			finalResult: nextHistory.at(-1),
+			finalResultHistory: nextHistory,
 		};
-		const normalizedResult =
-			currentState === runtime.record.state
-				? this.normalizeWithTransition(runtime.record, nextState, nextRecord)
-				: this.normalizeWithTransition(
-					{ ...runtime.record, state: currentState },
-					nextState,
-					nextRecord,
-				);
+		const normalizedResult = normalizeRecord<TData>(nextRecord);
 		if (!normalizedResult.ok) return normalizedResult;
 
 		runtime.record = normalizedResult.value;
-		runtime.trusted = false;
 		return ok(cloneValue(runtime.record));
 	}
 
@@ -730,7 +733,7 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted) {
 			return fail("cannot accept user_intervened before handshake is complete");
 		}
-		if (runtime.record.state === "degraded") {
+		if (this.isDegraded(runtime.record)) {
 			return fail("cannot accept user_intervened while agent is degraded");
 		}
 
@@ -739,7 +742,10 @@ export class SubagentManager<TData = unknown> {
 
 		const nextRecord = {
 			...runtime.record,
-			userIntervened: metadataResult.value as UserIntervenedMetadata,
+			userIntervenedHistory: [
+				...(runtime.record.userIntervenedHistory ?? []),
+				metadataResult.value as UserIntervenedMetadata,
+			],
 		};
 		const normalizedResult = normalizeRecord<TData>(nextRecord);
 		if (!normalizedResult.ok) return normalizedResult;
@@ -765,11 +771,14 @@ export class SubagentManager<TData = unknown> {
 				runtime.lastReportedState = event.payload.status;
 				return ok(cloneValue(runtime.record));
 			case "running":
-			case "waiting": {
+			case "waiting":
+			case "needs_input": {
 				const nextState = event.payload.status;
 				const nextRecord = {
 					...runtime.record,
 					state: nextState,
+					error: undefined,
+					pendingInputRequest: nextState === "needs_input" ? runtime.record.pendingInputRequest : undefined,
 				};
 				const normalizedResult = this.normalizeWithTransition(runtime.record, nextState, nextRecord);
 				if (!normalizedResult.ok) return normalizedResult;
@@ -787,13 +796,13 @@ export class SubagentManager<TData = unknown> {
 						recordedAt: event.time,
 						fatal: true,
 					},
+					pendingInputRequest: undefined,
 				};
 				const normalizedResult = this.normalizeWithTransition(runtime.record, "failed", nextRecord);
 				if (!normalizedResult.ok) return normalizedResult;
 
 				runtime.record = normalizedResult.value;
 				runtime.lastReportedState = event.payload.status;
-				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
 			}
 			case "stopped": {
@@ -807,13 +816,6 @@ export class SubagentManager<TData = unknown> {
 				runtime.trusted = false;
 				return ok(cloneValue(runtime.record));
 			}
-			case "completed":
-				if (event.time < this.deriveAcceptedRecordTimestamp(runtime.record)) {
-					return fail("completed state time must be on or after accepted record chronology");
-				}
-				runtime.lastReportedState = event.payload.status;
-				runtime.trusted = false;
-				return ok(cloneValue(runtime.record));
 		}
 	}
 
@@ -833,12 +835,12 @@ export class SubagentManager<TData = unknown> {
 				recordedAt: event.time,
 				fatal: event.payload.fatal,
 			},
+			pendingInputRequest: undefined,
 		};
 		const normalizedResult = this.normalizeWithTransition(runtime.record, "failed", nextRecord);
 		if (!normalizedResult.ok) return normalizedResult;
 
 		runtime.record = normalizedResult.value;
-		runtime.trusted = false;
 		return ok(cloneValue(runtime.record));
 	}
 
@@ -854,7 +856,7 @@ export class SubagentManager<TData = unknown> {
 		if (!runtime.trusted) {
 			return fail(`cannot send ${type} before handshake is complete`);
 		}
-		if (runtime.record.state === "degraded") {
+		if (this.isDegraded(runtime.record)) {
 			return fail(`cannot send ${type} while agent is degraded`);
 		}
 		if (this.isTerminal(runtime.record.state)) {
@@ -900,7 +902,8 @@ export class SubagentManager<TData = unknown> {
 	): ValidationOutcome<SubagentRecord<TData>> {
 		const nextRecord = {
 			...record,
-			degradedAt: nextState === "degraded" ? record.degradedAt : undefined,
+			error: nextState === "failed" ? record.error : undefined,
+			pendingInputRequest: nextState === "needs_input" ? record.pendingInputRequest : undefined,
 			...extras,
 			state: nextState,
 		};
@@ -943,11 +946,11 @@ export class SubagentManager<TData = unknown> {
 	}
 
 	private isTerminal(state: RuntimeState): boolean {
-		return state === "completed" || state === "failed" || state === "stopped";
+		return state === "stopped";
 	}
 
 	private isTerminalReportedState(state?: SidecarStateStatus): boolean {
-		return state === "completed" || state === "failed" || state === "stopped";
+		return state === "stopped";
 	}
 
 	private deriveAcceptedRecordTimestamp(record: SubagentRecord<TData>): string {
@@ -955,13 +958,13 @@ export class SubagentManager<TData = unknown> {
 		const candidates = [
 			record.startedAt,
 			record.connectedAt,
-			record.completedAt,
 			record.stoppedAt,
 			record.degradedAt,
 			record.lastProgressReport?.reportedAt,
 			record.pendingInputRequest?.reportedAt,
 			record.finalResult?.reportedAt,
-			record.userIntervened?.recordedAt,
+			record.finalResultHistory?.at(-1)?.reportedAt,
+			record.userIntervenedHistory?.at(-1)?.recordedAt,
 			record.error?.recordedAt,
 		];
 		for (const candidate of candidates) {
@@ -977,11 +980,8 @@ export class SubagentManager<TData = unknown> {
 		return maxIsoTimestamp(this.now(), this.deriveAcceptedRecordTimestamp(record));
 	}
 
-	private deriveAuthoritativeCompletionSourceState(record: SubagentRecord<TData>): RuntimeState {
-		if (record.pendingInputRequest) {
-			return "waiting";
-		}
-		return "running";
+	private isDegraded(record: SubagentRecord<TData>): boolean {
+		return Boolean(record.degradedAt);
 	}
 
 	private scheduleConnectingTimeout(agentId: string, runtime: ManagedRuntime<TData>): void {

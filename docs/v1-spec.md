@@ -84,7 +84,7 @@ The user wants to attach to the exact live sub-agent mid-turn, while it is:
 - streaming
 - using tools
 - thinking
-- waiting for interruption
+- waiting for more work or input
 
 That is only possible if the sub-agent already exists as a live tmux-backed process.
 
@@ -97,32 +97,41 @@ SubagentRecord
 - id
 - type
 - description
-- status
+- state
 - tmuxTarget
 - tmuxMode             // pane | window
 - sessionPath
+- socketPath
+- childMode
 - createdAt
 - startedAt
+- connectedAt?
 - stoppedAt?
-- completedAt?
-- userIntervenedAt?
+- degradedAt?
 - lastProgressReport?
 - pendingInputRequest?
-- finalReport?
+- finalResult?
+- finalResultHistory?
+- userIntervenedHistory?
 - error?
 ```
 
-Status values:
+Conversational posture values:
 
 - `starting`
 - `connecting`
 - `ready`
 - `running`
 - `waiting`
-- `completed`
+- `needs_input`
 - `failed`
 - `stopped`
-- `degraded`
+
+Separate trust condition:
+
+- `degradedAt`
+  - indicates the parent no longer trusts the sidecar connection
+  - does not replace the conversational posture
 
 ## Reporting model
 
@@ -140,12 +149,17 @@ progress
 final_result
 - summary
 - optional structured metadata
+- non-terminal current best answer
+- may be emitted multiple times
+- every accepted entry is preserved in `finalResultHistory`
+- the latest accepted entry is mirrored in `finalResult`
 
 needs_input
 - question or blocker
 
 user_intervened
 - metadata only
+- history only
 ```
 
 ### Critical rule
@@ -157,6 +171,7 @@ If the user directly interacts with the sub-agent:
 - the parent gets `user_intervened`
 - the parent does not receive the transcript automatically
 - the parent waits for the next explicit `progress` or `final_result`
+- `user_intervened` is only emitted on positive evidence of submitted direct input
 
 This prevents direct chat from being mistaken as the machine result.
 
@@ -176,7 +191,7 @@ This prevents direct chat from being mistaken as the machine result.
 - spawn sub-agent
 - request focus target info
 - send steer/follow-up through the sidecar control path
-- stop sub-agent
+- interrupt current work through the sidecar control path
 - poll or subscribe to explicit reports
 
 ## Chronology rule
@@ -208,9 +223,9 @@ spawn request
   -> create tmux target
   -> start sub-agent runtime
   -> connect sidecar
-  -> mark running
-  -> emit progress/final/user_intervened events
-  -> complete or fail
+  -> accept explicit child-authored posture updates
+  -> emit progress/final_result/needs_input/user_intervened events
+  -> remain conversational until child stops or the parent shuts down
   -> cleanup when main-agent lifecycle ends
 ```
 
@@ -223,12 +238,14 @@ spawn request
 
 ### If sub-agent process dies
 
-- mark sub-agent failed
+- clean exit marks the session `stopped`
+- child error or abnormal exit marks the session `failed`
 - keep tmux metadata if useful for debugging
 
 ### If sidecar channel dies but tmux process lives
 
-- mark sub-agent degraded or failed
+- mark the record degraded via `degradedAt`
+- preserve the last child-authored conversational posture
 - parent stops trusting it for orchestration
 - user may still inspect the pane manually
 
@@ -239,6 +256,8 @@ V1 should include:
 - spawn into tmux pane/window
 - focus/attach UX
 - explicit progress/final reporting
+- repeated non-terminal `final_result` history with cheap current-best access
+- explicit child-authored `running` / `waiting` / `needs_input`
 - metadata-only user intervention signaling
 - cleanup with main-agent lifecycle
 

@@ -109,7 +109,7 @@ class FakeSidecarSessions<TData = unknown> implements SidecarSessionAdapter<TDat
 }
 
 class FakeProcessHandle implements SubagentProcessHandle {
-	public readonly terminateReasons: Array<"abort" | "shutdown"> = [];
+	public readonly terminateReasons: Array<"interrupt" | "shutdown"> = [];
 
 	public constructor(
 		private readonly exitHandler: (exit: ManagedProcessExit) => ValidationOutcome<unknown>,
@@ -118,7 +118,7 @@ class FakeProcessHandle implements SubagentProcessHandle {
 		} = {},
 	) {}
 
-	public terminate(reason: "abort" | "shutdown"): void {
+	public terminate(reason: "interrupt" | "shutdown"): void {
 		this.terminateReasons.push(reason);
 		if (reason === "shutdown" && this.options.fireExitOnShutdown) {
 			this.exitHandler(this.options.fireExitOnShutdown);
@@ -429,13 +429,13 @@ describe("SubagentManager", () => {
 
 		expectOk(manager.sendSteer("agt_controls", "Steer now"));
 		expectOk(manager.sendFollowUp("agt_controls", "Follow up later"));
-		expectOk(manager.sendAbort("agt_controls"));
+		expectOk(manager.sendInterrupt("agt_controls"));
 		expectOk(manager.sendPing("agt_controls"));
 		expect(sidecars.get("agt_controls").sent.map((message) => message.type)).toEqual([
 			"hello",
 			"steer",
 			"follow_up",
-			"abort",
+			"interrupt",
 			"ping",
 		]);
 		expect(sidecars.get("agt_controls").sent.map((message) => message.seq)).toEqual([0, 1, 2, 3, 4]);
@@ -472,7 +472,7 @@ describe("SubagentManager", () => {
 				kind: "decision",
 			}),
 		));
-		expect(expectOk(manager.getRecord("agt_events")).state).toBe("waiting");
+		expect(expectOk(manager.getRecord("agt_events")).state).toBe("needs_input");
 		expect(expectOk(manager.getRecord("agt_events")).pendingInputRequest?.summary).toBe("Need a decision");
 
 		expectOk(sidecars.get("agt_events").message(
@@ -481,7 +481,9 @@ describe("SubagentManager", () => {
 				mode: "direct-chat",
 			}),
 		));
-		expect(expectOk(manager.getRecord("agt_events")).userIntervened?.recordedAt).toBe("2026-03-11T12:03:05.000Z");
+		expect(expectOk(manager.getRecord("agt_events")).userIntervenedHistory?.at(-1)?.recordedAt).toBe(
+			"2026-03-11T12:03:05.000Z",
+		);
 
 		expectOk(sidecars.get("agt_events").message(
 			makeEnvelope("agt_events", "progress", 4, "2026-03-11T12:03:06.000Z", {
@@ -498,56 +500,56 @@ describe("SubagentManager", () => {
 				data: null,
 			}),
 		));
-		expect(expectOk(manager.getRecord("agt_events")).state).toBe("completed");
-		expect(expectOk(manager.getRecord("agt_events")).completedAt).toBe("2026-03-11T12:03:07.000Z");
-		expect(expectOk(manager.getRecord("agt_events")).finalResult?.summary).toBe("all done");
+		const finalResultRecord = expectOk(manager.getRecord("agt_events"));
+		expect(finalResultRecord.state).toBe("running");
+		expect(finalResultRecord.finalResult?.summary).toBe("all done");
+		expect(finalResultRecord.finalResultHistory).toHaveLength(1);
 	});
 
-	it("accepts final_result after child completion state without reopening later activity", () => {
+	it("accepts repeated final_result reports and preserves append-only current-best history", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:03:10.000Z",
 			"2026-03-11T12:03:11.000Z",
 		]);
-		const request = makeSpawnRequest("agt_completed_final_result");
+		const request = makeSpawnRequest("agt_repeated_final_result");
 		expectOk(manager.spawn(request));
-		expectOk(sidecars.get("agt_completed_final_result").connect());
-		expectOk(sidecars.get("agt_completed_final_result").message(
-			makeEnvelope("agt_completed_final_result", "ready", 0, "2026-03-11T12:03:12.000Z", {
+		expectOk(sidecars.get("agt_repeated_final_result").connect());
+		expectOk(sidecars.get("agt_repeated_final_result").message(
+			makeEnvelope("agt_repeated_final_result", "ready", 0, "2026-03-11T12:03:12.000Z", {
 				pid: 9102,
 				sessionPath: request.launchSpec.sessionPath,
 				tmuxTarget: request.launchSpec.tmuxTarget,
 			}),
 		));
-		expectOk(sidecars.get("agt_completed_final_result").message(
-			makeEnvelope("agt_completed_final_result", "state", 1, "2026-03-11T12:03:13.000Z", {
+		expectOk(sidecars.get("agt_repeated_final_result").message(
+			makeEnvelope("agt_repeated_final_result", "state", 1, "2026-03-11T12:03:13.000Z", {
 				status: "running",
 			}),
 		));
-		expectOk(sidecars.get("agt_completed_final_result").message(
-			makeEnvelope("agt_completed_final_result", "state", 2, "2026-03-11T12:03:13.500Z", {
-				status: "completed",
-			}),
-		));
-		expect(manager.sendSteer("agt_completed_final_result", "too late").ok).toBe(false);
-		expectOk(sidecars.get("agt_completed_final_result").message(
-			makeEnvelope("agt_completed_final_result", "final_result", 3, "2026-03-11T12:03:14.000Z", {
-				summary: "authoritative completion",
+		expectOk(sidecars.get("agt_repeated_final_result").message(
+			makeEnvelope("agt_repeated_final_result", "final_result", 2, "2026-03-11T12:03:14.000Z", {
+				summary: "first best answer",
 				data: { findings: 2 },
 			}),
 		));
-		const record = expectOk(manager.getRecord("agt_completed_final_result"));
-		expect(record.state).toBe("completed");
-		expect(record.finalResult?.summary).toBe("authoritative completion");
-		expect(
-			sidecars.get("agt_completed_final_result").message(
-				makeEnvelope("agt_completed_final_result", "progress", 4, "2026-03-11T12:03:15.000Z", {
-					summary: "too late",
-				}),
-			).ok,
-		).toBe(false);
+		expectOk(sidecars.get("agt_repeated_final_result").message(
+			makeEnvelope("agt_repeated_final_result", "final_result", 3, "2026-03-11T12:03:15.000Z", {
+				summary: "better answer",
+				data: { findings: 3 },
+			}),
+		));
+		expectOk(manager.sendSteer("agt_repeated_final_result", "keep going"));
+
+		const record = expectOk(manager.getRecord("agt_repeated_final_result"));
+		expect(record.state).toBe("running");
+		expect(record.finalResult?.summary).toBe("better answer");
+		expect(record.finalResultHistory?.map((entry) => entry.summary)).toEqual([
+			"first best answer",
+			"better answer",
+		]);
 	});
 
-	it("accepts final_result directly from ready and after completed state while the record is still ready", () => {
+	it("accepts final_result directly from ready and preserves the existing conversational posture", () => {
 		const direct = createManager([
 			"2026-03-11T12:03:20.000Z",
 			"2026-03-11T12:03:21.000Z",
@@ -569,40 +571,41 @@ describe("SubagentManager", () => {
 			}),
 		));
 		const directRecord = expectOk(direct.manager.getRecord("agt_ready_final_result"));
-		expect(directRecord.state).toBe("completed");
+		expect(directRecord.state).toBe("ready");
 		expect(directRecord.finalResult?.summary).toBe("done straight from ready");
+		expect(directRecord.finalResultHistory).toHaveLength(1);
 
 		const late = createManager([
 			"2026-03-11T12:03:30.000Z",
 			"2026-03-11T12:03:31.000Z",
 		]);
-		const lateRequest = makeSpawnRequest("agt_ready_completed_then_result");
+		const lateRequest = makeSpawnRequest("agt_waiting_then_result");
 		expectOk(late.manager.spawn(lateRequest));
-		expectOk(late.sidecars.get("agt_ready_completed_then_result").connect());
-		expectOk(late.sidecars.get("agt_ready_completed_then_result").message(
-			makeEnvelope("agt_ready_completed_then_result", "ready", 0, "2026-03-11T12:03:32.000Z", {
+		expectOk(late.sidecars.get("agt_waiting_then_result").connect());
+		expectOk(late.sidecars.get("agt_waiting_then_result").message(
+			makeEnvelope("agt_waiting_then_result", "ready", 0, "2026-03-11T12:03:32.000Z", {
 				pid: 9104,
 				sessionPath: lateRequest.launchSpec.sessionPath,
 				tmuxTarget: lateRequest.launchSpec.tmuxTarget,
 			}),
 		));
-		expectOk(late.sidecars.get("agt_ready_completed_then_result").message(
-			makeEnvelope("agt_ready_completed_then_result", "state", 1, "2026-03-11T12:03:33.000Z", {
-				status: "completed",
+		expectOk(late.sidecars.get("agt_waiting_then_result").message(
+			makeEnvelope("agt_waiting_then_result", "state", 1, "2026-03-11T12:03:33.000Z", {
+				status: "waiting",
 			}),
 		));
-		expectOk(late.sidecars.get("agt_ready_completed_then_result").message(
-			makeEnvelope("agt_ready_completed_then_result", "final_result", 2, "2026-03-11T12:03:34.000Z", {
-				summary: "done after completed state",
+		expectOk(late.sidecars.get("agt_waiting_then_result").message(
+			makeEnvelope("agt_waiting_then_result", "final_result", 2, "2026-03-11T12:03:34.000Z", {
+				summary: "done while waiting",
 				data: null,
 			}),
 		));
-		const lateRecord = expectOk(late.manager.getRecord("agt_ready_completed_then_result"));
-		expect(lateRecord.state).toBe("completed");
-		expect(lateRecord.finalResult?.summary).toBe("done after completed state");
+		const lateRecord = expectOk(late.manager.getRecord("agt_waiting_then_result"));
+		expect(lateRecord.state).toBe("waiting");
+		expect(lateRecord.finalResult?.summary).toBe("done while waiting");
 	});
 
-	it("preserves final_result when clean exit arrives before sidecar flush", () => {
+	it("rejects late final_result after clean exit and keeps the stopped record authoritative", () => {
 		const { manager, sidecars, processes } = createManager([
 			"2026-03-11T12:03:40.000Z",
 			"2026-03-11T12:03:41.000Z",
@@ -620,7 +623,7 @@ describe("SubagentManager", () => {
 		));
 		expectOk(sidecars.get("agt_late_final_result").message(
 			makeEnvelope("agt_late_final_result", "state", 1, "2026-03-11T12:03:43.000Z", {
-				status: "completed",
+				status: "running",
 			}),
 		));
 		expectOk(processes.get("agt_late_final_result").exit({ code: 0, signal: null }));
@@ -629,16 +632,19 @@ describe("SubagentManager", () => {
 		expect(stoppedRecord.state).toBe("stopped");
 		expect(stoppedRecord.finalResult).toBeUndefined();
 
-		expectOk(sidecars.get("agt_late_final_result").message(
+		const lateFinalResult = sidecars.get("agt_late_final_result").message(
 			makeEnvelope("agt_late_final_result", "final_result", 2, "2026-03-11T12:03:44.000Z", {
 				summary: "flushed after clean exit",
 				data: { findings: 1 },
 			}),
-		));
-		const completedRecord = expectOk(manager.getRecord("agt_late_final_result"));
-		expect(completedRecord.state).toBe("completed");
-		expect(completedRecord.finalResult?.summary).toBe("flushed after clean exit");
-		expect(completedRecord.stoppedAt).toBeUndefined();
+		);
+		expect(lateFinalResult.ok).toBe(false);
+		if (!lateFinalResult.ok) {
+			expect(lateFinalResult.error).toContain("cannot accept final_result before handshake is complete");
+		}
+		const stoppedAfterLateResult = expectOk(manager.getRecord("agt_late_final_result"));
+		expect(stoppedAfterLateResult.state).toBe("stopped");
+		expect(stoppedAfterLateResult.finalResult).toBeUndefined();
 	});
 
 	it("ignores duplicate and stale child seq values without mutating authoritative state", () => {
@@ -794,7 +800,7 @@ describe("SubagentManager", () => {
 		expect(after).toEqual(before);
 	});
 
-	it("honors terminal child state updates and avoids later exit misclassification", () => {
+	it("honors child-authored state updates and only treats stopped as terminal", () => {
 		const stopped = createManager([
 			"2026-03-11T12:04:50.000Z",
 			"2026-03-11T12:04:51.000Z",
@@ -839,74 +845,68 @@ describe("SubagentManager", () => {
 		));
 		expect(expectOk(failed.manager.getRecord("agt_state_failed")).state).toBe("failed");
 
-		const completed = createManager([
+		const waiting = createManager([
 			"2026-03-11T12:04:58.000Z",
 			"2026-03-11T12:04:59.000Z",
 			"2026-03-11T12:05:02.000Z",
 		]);
-		const completedRequest = makeSpawnRequest("agt_state_completed");
-		expectOk(completed.manager.spawn(completedRequest));
-		expectOk(completed.sidecars.get("agt_state_completed").connect());
-		expectOk(completed.sidecars.get("agt_state_completed").message(
-			makeEnvelope("agt_state_completed", "ready", 0, "2026-03-11T12:05:00.000Z", {
+		const waitingRequest = makeSpawnRequest("agt_state_waiting");
+		expectOk(waiting.manager.spawn(waitingRequest));
+		expectOk(waiting.sidecars.get("agt_state_waiting").connect());
+		expectOk(waiting.sidecars.get("agt_state_waiting").message(
+			makeEnvelope("agt_state_waiting", "ready", 0, "2026-03-11T12:05:00.000Z", {
 				pid: 1114,
-				sessionPath: completedRequest.launchSpec.sessionPath,
-				tmuxTarget: completedRequest.launchSpec.tmuxTarget,
+				sessionPath: waitingRequest.launchSpec.sessionPath,
+				tmuxTarget: waitingRequest.launchSpec.tmuxTarget,
 			}),
 		));
-		expectOk(completed.sidecars.get("agt_state_completed").message(
-			makeEnvelope("agt_state_completed", "state", 1, "2026-03-11T12:05:01.000Z", {
-				status: "completed",
+		expectOk(waiting.sidecars.get("agt_state_waiting").message(
+			makeEnvelope("agt_state_waiting", "state", 1, "2026-03-11T12:05:01.000Z", {
+				status: "waiting",
 			}),
 		));
-		expect(completed.manager.sendSteer("agt_state_completed", "too late").ok).toBe(false);
-		expect(
-			completed.sidecars.get("agt_state_completed").message(
-				makeEnvelope("agt_state_completed", "progress", 2, "2026-03-11T12:05:01.250Z", {
-					summary: "should not apply",
-				}),
-			).ok,
-		).toBe(false);
-		const completedBeforeNonTerminal = expectOk(completed.manager.getRecord("agt_state_completed"));
-		expect(
-			completed.sidecars.get("agt_state_completed").message(
-				makeEnvelope("agt_state_completed", "state", 3, "2026-03-11T12:05:01.500Z", {
-					status: "running",
-				}),
-			).ok,
-		).toBe(false);
-		expect(expectOk(completed.manager.getRecord("agt_state_completed"))).toEqual(completedBeforeNonTerminal);
-		expectOk(completed.processes.get("agt_state_completed").exit({ code: 0, signal: null }));
-		const completedRecord = expectOk(completed.manager.getRecord("agt_state_completed"));
-		expect(completedRecord.state).toBe("stopped");
-		expect(completedRecord.error).toBeUndefined();
+		expect(waiting.manager.sendSteer("agt_state_waiting", "still accepted").ok).toBe(true);
+		expectOk(waiting.sidecars.get("agt_state_waiting").message(
+			makeEnvelope("agt_state_waiting", "progress", 2, "2026-03-11T12:05:01.250Z", {
+				summary: "work resumed",
+			}),
+		));
+		expect(expectOk(waiting.manager.getRecord("agt_state_waiting")).state).toBe("running");
+		expectOk(waiting.processes.get("agt_state_waiting").exit({ code: 0, signal: null }));
+		const waitingRecord = expectOk(waiting.manager.getRecord("agt_state_waiting"));
+		expect(waitingRecord.state).toBe("stopped");
+		expect(waitingRecord.error).toBeUndefined();
 
-		const completedFailure = createManager([
+		const failedRecovery = createManager([
 			"2026-03-11T12:05:10.000Z",
 			"2026-03-11T12:05:14.000Z",
 		]);
-		const completedFailureRequest = makeSpawnRequest("agt_state_completed_fail");
-		expectOk(completedFailure.manager.spawn(completedFailureRequest));
-		expectOk(completedFailure.sidecars.get("agt_state_completed_fail").connect());
-		expectOk(completedFailure.sidecars.get("agt_state_completed_fail").message(
-			makeEnvelope("agt_state_completed_fail", "ready", 0, "2026-03-11T12:05:12.000Z", {
+		const failedRecoveryRequest = makeSpawnRequest("agt_state_failed_recovery");
+		expectOk(failedRecovery.manager.spawn(failedRecoveryRequest));
+		expectOk(failedRecovery.sidecars.get("agt_state_failed_recovery").connect());
+		expectOk(failedRecovery.sidecars.get("agt_state_failed_recovery").message(
+			makeEnvelope("agt_state_failed_recovery", "ready", 0, "2026-03-11T12:05:12.000Z", {
 				pid: 1115,
-				sessionPath: completedFailureRequest.launchSpec.sessionPath,
-				tmuxTarget: completedFailureRequest.launchSpec.tmuxTarget,
+				sessionPath: failedRecoveryRequest.launchSpec.sessionPath,
+				tmuxTarget: failedRecoveryRequest.launchSpec.tmuxTarget,
 			}),
 		));
-		expectOk(completedFailure.sidecars.get("agt_state_completed_fail").message(
-			makeEnvelope("agt_state_completed_fail", "state", 1, "2026-03-11T12:05:13.000Z", {
-				status: "completed",
+		expectOk(failedRecovery.sidecars.get("agt_state_failed_recovery").message(
+			makeEnvelope("agt_state_failed_recovery", "state", 1, "2026-03-11T12:05:13.000Z", {
+				status: "failed",
 			}),
 		));
-		expectOk(completedFailure.processes.get("agt_state_completed_fail").exit({ code: 1, signal: null }));
-		const completedFailureRecord = expectOk(completedFailure.manager.getRecord("agt_state_completed_fail"));
-		expect(completedFailureRecord.state).toBe("failed");
-		expect(completedFailureRecord.error?.message).toContain("code 1");
+		expectOk(failedRecovery.sidecars.get("agt_state_failed_recovery").message(
+			makeEnvelope("agt_state_failed_recovery", "state", 2, "2026-03-11T12:05:14.000Z", {
+				status: "running",
+			}),
+		));
+		const failedRecoveryRecord = expectOk(failedRecovery.manager.getRecord("agt_state_failed_recovery"));
+		expect(failedRecoveryRecord.state).toBe("running");
+		expect(failedRecoveryRecord.error).toBeUndefined();
 	});
 
-	it("marks a ready agent degraded on disconnect and rejects further trusted controls", () => {
+	it("marks a ready agent degraded on disconnect and keeps posture separate from trust", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:05:00.000Z",
 			"2026-03-11T12:05:01.000Z",
@@ -924,7 +924,9 @@ describe("SubagentManager", () => {
 		));
 
 		expectOk(sidecars.get("agt_degraded").disconnect("lost socket"));
-		expect(expectOk(manager.getRecord("agt_degraded")).state).toBe("degraded");
+		const degradedRecord = expectOk(manager.getRecord("agt_degraded"));
+		expect(degradedRecord.state).toBe("ready");
+		expect(degradedRecord.degradedAt).toBe("2026-03-11T12:05:04.000Z");
 		expect(manager.sendSteer("agt_degraded", "no longer trusted").ok).toBe(false);
 		expect(manager.handleSidecarConnect("agt_degraded")).toEqual({
 			ok: false,
@@ -964,7 +966,7 @@ describe("SubagentManager", () => {
 
 		expectOk(sidecars.get("agt_degraded_timestamp").disconnect("lost socket"));
 		const record = expectOk(manager.getRecord("agt_degraded_timestamp"));
-		expect(record.state).toBe("degraded");
+		expect(record.state).toBe("running");
 		expect(record.degradedAt).toBe("2026-03-11T12:05:11.000Z");
 	});
 
@@ -994,48 +996,49 @@ describe("SubagentManager", () => {
 
 		expectOk(sidecars.get("agt_rejected_terminal_state").disconnect("lost socket"));
 		const record = expectOk(manager.getRecord("agt_rejected_terminal_state"));
-		expect(record.state).toBe("degraded");
+		expect(record.state).toBe("ready");
 		expect(record.degradedAt).toBe("2026-03-11T12:05:09.000Z");
 	});
 
-	it("rejects stale completed state events without poisoning later lifecycle handling", () => {
+	it("rejects stale stopped state events without poisoning later lifecycle handling", () => {
 		const { manager, sidecars } = createManager([
 			"2026-03-11T12:05:30.000Z",
 			"2026-03-11T12:05:31.000Z",
 		]);
-		const request = makeSpawnRequest("agt_rejected_completed_state");
+		const request = makeSpawnRequest("agt_rejected_stopped_state");
 		expectOk(manager.spawn(request));
-		expectOk(sidecars.get("agt_rejected_completed_state").connect());
-		expectOk(sidecars.get("agt_rejected_completed_state").message(
-			makeEnvelope("agt_rejected_completed_state", "ready", 0, "2026-03-11T12:05:32.000Z", {
+		expectOk(sidecars.get("agt_rejected_stopped_state").connect());
+		expectOk(sidecars.get("agt_rejected_stopped_state").message(
+			makeEnvelope("agt_rejected_stopped_state", "ready", 0, "2026-03-11T12:05:32.000Z", {
 				pid: 1360,
 				sessionPath: request.launchSpec.sessionPath,
 				tmuxTarget: request.launchSpec.tmuxTarget,
 			}),
 		));
-		expectOk(sidecars.get("agt_rejected_completed_state").message(
-			makeEnvelope("agt_rejected_completed_state", "progress", 1, "2026-03-11T12:05:33.000Z", {
+		expectOk(sidecars.get("agt_rejected_stopped_state").message(
+			makeEnvelope("agt_rejected_stopped_state", "progress", 1, "2026-03-11T12:05:33.000Z", {
 				summary: "newest accepted state",
 			}),
 		));
 
-		const rejected = sidecars.get("agt_rejected_completed_state").message(
-			makeEnvelope("agt_rejected_completed_state", "state", 2, "2026-03-11T12:05:32.500Z", {
-				status: "completed",
+		const rejected = sidecars.get("agt_rejected_stopped_state").message(
+			makeEnvelope("agt_rejected_stopped_state", "state", 2, "2026-03-11T12:05:32.500Z", {
+				status: "stopped",
 			}),
 		);
 		expect(rejected.ok).toBe(false);
 		if (!rejected.ok) {
-			expect(rejected.error).toContain("completed state time");
+			expect(rejected.error).toContain("lastProgressReport.reportedAt must be on or before terminal stop");
 		}
 
-		expectOk(sidecars.get("agt_rejected_completed_state").disconnect("lost socket"));
-		const record = expectOk(manager.getRecord("agt_rejected_completed_state"));
-		expect(record.state).toBe("degraded");
+		expectOk(sidecars.get("agt_rejected_stopped_state").disconnect("lost socket"));
+		const record = expectOk(manager.getRecord("agt_rejected_stopped_state"));
+		expect(record.state).toBe("running");
 		expect(record.finalResult).toBeUndefined();
+		expect(record.degradedAt).toBe("2026-03-11T12:05:33.000Z");
 	});
 
-	it("clears degradedAt when degraded agents later fail or stop", () => {
+	it("preserves degradedAt when degraded agents later fail or stop", () => {
 		const first = createManager([
 			"2026-03-11T12:05:10.000Z",
 			"2026-03-11T12:05:11.000Z",
@@ -1056,7 +1059,7 @@ describe("SubagentManager", () => {
 		expectOk(first.processes.get("agt_degraded_fail").exit({ code: 1, signal: null }));
 		const failedRecord = expectOk(first.manager.getRecord("agt_degraded_fail"));
 		expect(failedRecord.state).toBe("failed");
-		expect(failedRecord.degradedAt).toBeUndefined();
+		expect(failedRecord.degradedAt).toBe("2026-03-11T12:05:14.000Z");
 
 		const second = createManager([
 			"2026-03-11T12:05:20.000Z",
@@ -1078,7 +1081,7 @@ describe("SubagentManager", () => {
 		expectOk(second.manager.shutdownAll());
 		const stoppedRecord = expectOk(second.manager.getRecord("agt_degraded_stop"));
 		expect(stoppedRecord.state).toBe("stopped");
-		expect(stoppedRecord.degradedAt).toBeUndefined();
+		expect(stoppedRecord.degradedAt).toBe("2026-03-11T12:05:24.000Z");
 	});
 
 	it("fails connecting agents that never establish a sidecar session", () => {
@@ -1386,28 +1389,28 @@ describe("SubagentManager", () => {
 		expect(sidecars.get("agt_shutdown_sync_exit").closeCount).toBe(1);
 	});
 
-	it("still terminates and closes terminal runtimes during shutdownAll", () => {
-		const completed = createManager([
+	it("stops conversational and failed runtimes during shutdownAll", () => {
+		const conversational = createManager([
 			"2026-03-11T12:07:20.000Z",
 			"2026-03-11T12:07:21.000Z",
 		]);
-		const completedRequest = makeSpawnRequest("agt_shutdown_completed");
-		expectOk(completed.manager.spawn(completedRequest));
-		expectOk(completed.sidecars.get("agt_shutdown_completed").connect());
-		expectOk(completed.sidecars.get("agt_shutdown_completed").message(
-			makeEnvelope("agt_shutdown_completed", "ready", 0, "2026-03-11T12:07:22.000Z", {
+		const conversationalRequest = makeSpawnRequest("agt_shutdown_conversational");
+		expectOk(conversational.manager.spawn(conversationalRequest));
+		expectOk(conversational.sidecars.get("agt_shutdown_conversational").connect());
+		expectOk(conversational.sidecars.get("agt_shutdown_conversational").message(
+			makeEnvelope("agt_shutdown_conversational", "ready", 0, "2026-03-11T12:07:22.000Z", {
 				pid: 4444,
-				sessionPath: completedRequest.launchSpec.sessionPath,
-				tmuxTarget: completedRequest.launchSpec.tmuxTarget,
+				sessionPath: conversationalRequest.launchSpec.sessionPath,
+				tmuxTarget: conversationalRequest.launchSpec.tmuxTarget,
 			}),
 		));
-		expectOk(completed.sidecars.get("agt_shutdown_completed").message(
-			makeEnvelope("agt_shutdown_completed", "progress", 1, "2026-03-11T12:07:23.000Z", {
+		expectOk(conversational.sidecars.get("agt_shutdown_conversational").message(
+			makeEnvelope("agt_shutdown_conversational", "progress", 1, "2026-03-11T12:07:23.000Z", {
 				summary: "done",
 			}),
 		));
-		expectOk(completed.sidecars.get("agt_shutdown_completed").message(
-			makeEnvelope("agt_shutdown_completed", "final_result", 2, "2026-03-11T12:07:24.000Z", {
+		expectOk(conversational.sidecars.get("agt_shutdown_conversational").message(
+			makeEnvelope("agt_shutdown_conversational", "final_result", 2, "2026-03-11T12:07:24.000Z", {
 				summary: "finished",
 				data: null,
 			}),
@@ -1429,16 +1432,16 @@ describe("SubagentManager", () => {
 		));
 		expectOk(failed.processes.get("agt_shutdown_failed").exit({ code: 1, signal: null }));
 
-		expectOk(completed.manager.shutdownAll());
+		expectOk(conversational.manager.shutdownAll());
 		expectOk(failed.manager.shutdownAll());
 
-		expect(completed.processes.get("agt_shutdown_completed").terminateReasons).toEqual(["shutdown"]);
-		expect(completed.sidecars.get("agt_shutdown_completed").closeCount).toBe(1);
-		expect(expectOk(completed.manager.getRecord("agt_shutdown_completed")).state).toBe("completed");
+		expect(conversational.processes.get("agt_shutdown_conversational").terminateReasons).toEqual(["shutdown"]);
+		expect(conversational.sidecars.get("agt_shutdown_conversational").closeCount).toBe(1);
+		expect(expectOk(conversational.manager.getRecord("agt_shutdown_conversational")).state).toBe("stopped");
 
 		expect(failed.processes.get("agt_shutdown_failed").terminateReasons).toEqual(["shutdown"]);
 		expect(failed.sidecars.get("agt_shutdown_failed").closeCount).toBe(1);
-		expect(expectOk(failed.manager.getRecord("agt_shutdown_failed")).state).toBe("failed");
+		expect(expectOk(failed.manager.getRecord("agt_shutdown_failed")).state).toBe("stopped");
 	});
 
 	it("continues shutdown cleanup when a stop transition cannot be normalized", () => {
