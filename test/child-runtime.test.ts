@@ -70,12 +70,26 @@ class FakeSocket extends EventEmitter {
 
 class FakeExtensionContext {
 	public shutdownCalls = 0;
+	public abortCalls = 0;
+	public idle = true;
 
 	public constructor(
 		private readonly options: {
+			throwOnAbort?: Error;
 			throwOnShutdown?: Error;
 		} = {},
 	) {}
+
+	public abort(): void {
+		this.abortCalls += 1;
+		if (this.options.throwOnAbort) {
+			throw this.options.throwOnAbort;
+		}
+	}
+
+	public isIdle(): boolean {
+		return this.idle;
+	}
 
 	public shutdown(): void {
 		this.shutdownCalls += 1;
@@ -89,6 +103,10 @@ class FakePiApi {
 	public readonly handlers = new Map<string, ExtensionHandler[]>();
 	public readonly registeredTools: Array<Record<string, unknown>> = [];
 	public readonly sentUserMessages: string[] = [];
+	public readonly sentUserMessageCalls: Array<{
+		content: string;
+		options?: { deliverAs?: "steer" | "followUp" };
+	}> = [];
 
 	public on(event: string, handler: ExtensionHandler): void {
 		const existing = this.handlers.get(event) ?? [];
@@ -100,8 +118,9 @@ class FakePiApi {
 		this.registeredTools.push(definition);
 	}
 
-	public sendUserMessage(content: string): void {
+	public sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" }): void {
 		this.sentUserMessages.push(content);
+		this.sentUserMessageCalls.push({ content, options });
 	}
 
 	public async emit(event: string, payload: unknown, ctx: FakeExtensionContext): Promise<void> {
@@ -127,6 +146,60 @@ function makeBootstrap(agentId: string, runtimeDir: string, extensionPath: strin
 
 function parseSentEnvelopes(socket: FakeSocket): Array<Record<string, unknown>> {
 	return socket.writes.map((entry) => JSON.parse(entry.trim()) as Record<string, unknown>);
+}
+
+function getReportTool(pi: FakePiApi): { execute: (...args: unknown[]) => Promise<unknown> } {
+	const tool = pi.registeredTools.find((entry) => entry.name === "report_to_parent");
+	if (!tool) {
+		throw new Error("expected report_to_parent tool to be registered");
+	}
+
+	return tool as { execute: (...args: unknown[]) => Promise<unknown> };
+}
+
+async function startReadyBootstrapSession(agentId: string, timestamp: string): Promise<{
+	bootstrap: RuntimeBootstrapConfig;
+	socket: FakeSocket;
+	pi: FakePiApi;
+	ctx: FakeExtensionContext;
+}> {
+	const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+	const bootstrap = makeBootstrap(agentId, runtimeDir, fakeExtensionPath);
+	const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+	fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+	const socket = new FakeSocket();
+	const pi = new FakePiApi();
+	const ctx = new FakeExtensionContext();
+	installSubagentBootstrapExtension(pi, {
+		env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+		connectSocket: () => socket,
+		now: () => timestamp,
+		pid: () => 7777,
+	});
+
+	const sessionStart = pi.emit("session_start", {}, ctx);
+	socket.connect();
+	socket.receive({
+		version: 1,
+		agentId: bootstrap.agentId,
+		type: "hello",
+		seq: 0,
+		time: "2026-03-12T10:09:01.000Z",
+		payload: {
+			sessionPath: bootstrap.sessionPath,
+			tmuxTarget: bootstrap.tmuxTarget,
+			mode: bootstrap.tmuxMode,
+		},
+	});
+	await sessionStart;
+
+	return {
+		bootstrap,
+		socket,
+		pi,
+		ctx,
+	};
 }
 
 let fakeRepoDir = os.tmpdir();
@@ -283,6 +356,197 @@ describe("installSubagentBootstrapExtension", () => {
 		const sent = parseSentEnvelopes(socket);
 		expect(sent.map((message) => message.type)).toEqual(["ready", "pong"]);
 		expect(sent.map((message) => message.seq)).toEqual([0, 1]);
+		expect(ctx.shutdownCalls).toBe(0);
+	});
+
+	it("forwards live report_to_parent progress and final_result events after ready", async () => {
+		const { socket, pi } = await startReadyBootstrapSession(
+			"agt_child_report_events",
+			"2026-03-12T10:09:00.000Z",
+		);
+
+		const reportTool = getReportTool(pi);
+		await reportTool.execute("call-progress", {
+			kind: "progress",
+			summary: "Working through the task",
+			data: { step: 1 },
+		});
+		await reportTool.execute("call-final", {
+			kind: "final_result",
+			summary: "Completed the task",
+			data: { status: "done" },
+		});
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "progress", "final_result"]);
+		expect(sent.map((message) => message.seq)).toEqual([0, 1, 2]);
+		expect(sent[1]?.payload).toEqual({
+			summary: "Working through the task",
+			data: { step: 1 },
+		});
+		expect(sent[2]?.payload).toEqual({
+			summary: "Completed the task",
+			data: { status: "done" },
+		});
+	});
+
+	it("routes post-ready steer and follow_up through pi sendUserMessage", async () => {
+		const { bootstrap, socket, pi } = await startReadyBootstrapSession(
+			"agt_child_controls",
+			"2026-03-12T10:09:10.000Z",
+		);
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "steer",
+			seq: 1,
+			time: "2026-03-12T10:09:11.000Z",
+			payload: {
+				message: "Adjust course",
+			},
+		});
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "follow_up",
+			seq: 2,
+			time: "2026-03-12T10:09:12.000Z",
+			payload: {
+				message: "Continue from the last result",
+			},
+		});
+
+		expect(pi.sentUserMessageCalls).toEqual([
+			{ content: bootstrap.initialPrompt, options: undefined },
+			{ content: "Adjust course", options: { deliverAs: "steer" } },
+			{ content: "Continue from the last result", options: { deliverAs: "followUp" } },
+		]);
+		expect(parseSentEnvelopes(socket).map((message) => message.type)).toEqual(["ready"]);
+	});
+
+	it("waits for child-authored agent_end before publishing waiting after interrupting active work", async () => {
+		const { bootstrap, socket, pi, ctx } = await startReadyBootstrapSession(
+			"agt_child_interrupt_running",
+			"2026-03-12T10:09:20.000Z",
+		);
+
+		ctx.idle = false;
+		const reportTool = getReportTool(pi);
+		await reportTool.execute("call-progress", {
+			kind: "progress",
+			summary: "Still working",
+		});
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "interrupt",
+			seq: 1,
+			time: "2026-03-12T10:09:21.000Z",
+			payload: {},
+		});
+
+		expect(ctx.abortCalls).toBe(1);
+		expect(parseSentEnvelopes(socket).map((message) => message.type)).toEqual(["ready", "progress"]);
+
+		await pi.emit("agent_end", {}, ctx);
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "progress", "state"]);
+		expect(sent[2]?.payload).toEqual({
+			status: "waiting",
+		});
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
+	});
+
+	it("clears a pending input posture to waiting only after the child handles interrupt", async () => {
+		const { bootstrap, socket, pi, ctx } = await startReadyBootstrapSession(
+			"agt_child_interrupt_needs_input",
+			"2026-03-12T10:09:30.000Z",
+		);
+
+		const reportTool = getReportTool(pi);
+		await reportTool.execute("call-needs-input", {
+			kind: "needs_input",
+			summary: "Need approval",
+		});
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "interrupt",
+			seq: 1,
+			time: "2026-03-12T10:09:31.000Z",
+			payload: {},
+		});
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "needs_input", "state"]);
+		expect(sent[1]?.payload).toEqual({
+			question: "Need approval",
+			kind: "question",
+		});
+		expect(sent[2]?.payload).toEqual({
+			status: "waiting",
+		});
+		expect(ctx.abortCalls).toBe(1);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
+	});
+
+	it("emits user_intervened only for interactive input events", async () => {
+		const { socket, pi, ctx } = await startReadyBootstrapSession(
+			"agt_child_user_intervened",
+			"2026-03-12T10:09:40.000Z",
+		);
+
+		await pi.emit("input", { source: "rpc" }, ctx);
+		await pi.emit("input", { source: "extension" }, ctx);
+		await pi.emit("input", { source: "interactive" }, ctx);
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "user_intervened"]);
+		expect(sent[1]?.payload).toEqual({
+			source: "tmux",
+			mode: "direct-chat",
+		});
+	});
+
+	it("surfaces a recoverable error when a malformed report arrives after ready", async () => {
+		const { socket, pi } = await startReadyBootstrapSession(
+			"agt_child_report_error",
+			"2026-03-12T10:09:50.000Z",
+		);
+
+		const reportTool = getReportTool(pi);
+		await expect(
+			reportTool.execute("call-invalid", {
+				kind: "progress",
+				summary: "   ",
+			}),
+		).rejects.toThrow("summary must be a non-empty string");
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "error"]);
+		expect(sent[1]?.payload).toEqual({
+			message: "summary must be a non-empty string",
+			fatal: false,
+		});
+	});
+
+	it("keeps the post-ready bootstrap session alive across session_shutdown churn", async () => {
+		const { socket, pi, ctx } = await startReadyBootstrapSession(
+			"agt_child_post_ready_shutdown",
+			"2026-03-12T10:10:00.000Z",
+		);
+
+		await pi.emit("session_shutdown", {}, ctx);
+
+		expect(parseSentEnvelopes(socket).map((message) => message.type)).toEqual(["ready"]);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
 		expect(ctx.shutdownCalls).toBe(0);
 	});
 

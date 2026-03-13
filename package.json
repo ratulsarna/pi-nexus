@@ -5,6 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"accept:rat-134": "node ./scripts/accept-rat-134.mjs",
+		"accept:rat-135": "node ./scripts/accept-rat-135.mjs",
 		"build": "tsc -p tsconfig.build.json",
 		"test": "vitest --run"
 	},
