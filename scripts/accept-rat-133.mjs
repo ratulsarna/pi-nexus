@@ -219,6 +219,59 @@ function latestLineContaining(text, needle) {
 	return undefined;
 }
 
+function extractLatestSubagentListBlock(text) {
+	const lines = text.split("\n");
+	for (let index = lines.length - 1; index >= 0; index -= 1) {
+		if (lines[index].trim() !== "Managed subagents:") {
+			continue;
+		}
+
+		const blockLines = ["Managed subagents:"];
+		for (let rowIndex = index + 1; rowIndex < lines.length; rowIndex += 1) {
+			const trimmed = lines[rowIndex].trim();
+			if (trimmed.length === 0) {
+				continue;
+			}
+			if (!trimmed.startsWith("- ")) {
+				break;
+			}
+			blockLines.push(trimmed);
+		}
+
+		return {
+			text: blockLines.join("\n"),
+			agentLine: (agentId) => latestLineContaining(blockLines.join("\n"), agentId),
+		};
+	}
+
+	return undefined;
+}
+
+async function runSubagentsListAndWaitForAgentLine(target, agentId, predicate, timeoutMs, label) {
+	const previousBlock = extractLatestSubagentListBlock(capturePane(target))?.text;
+	sendLine(target, "/subagents list");
+
+	return waitFor(() => {
+		const latestBlock = extractLatestSubagentListBlock(capturePane(target));
+		if (!latestBlock) {
+			return false;
+		}
+		if (latestBlock.text === previousBlock) {
+			return false;
+		}
+
+		const agentLine = latestBlock.agentLine(agentId);
+		if (!agentLine || !predicate(agentLine)) {
+			return false;
+		}
+
+		return {
+			block: latestBlock.text,
+			agentLine,
+		};
+	}, timeoutMs, label);
+}
+
 async function main() {
 	log("RAT-133 manual acceptance started");
 	const tmuxPath = requireExecutable("tmux");
@@ -267,10 +320,14 @@ async function main() {
 		await waitForPaneText(mainPaneTarget, "RAT133 child finished", 180_000);
 		await waitForStablePane(mainPaneTarget, 1500, 60_000);
 
-		sendLine(mainPaneTarget, "/subagents list");
-		const listCapture = await waitForPaneText(mainPaneTarget, "Managed subagents:", 30_000);
-		const listedAgentLine = latestLineContaining(listCapture, agentId);
-		if (!listedAgentLine?.includes("focus=live")) {
+		const listedAgent = await runSubagentsListAndWaitForAgentLine(
+			mainPaneTarget,
+			agentId,
+			(line) => line.includes("focus=live"),
+			30_000,
+			`fresh /subagents list row for ${agentId} with focus=live`,
+		);
+		if (!listedAgent.agentLine.includes("focus=live")) {
 			fail(`expected /subagents list to show live focus availability for ${agentId}`);
 		}
 		log("verified /subagents list output");
@@ -295,10 +352,14 @@ async function main() {
 		await waitForPaneText(mainPaneTarget, "assumptions are stale", 60_000);
 		log("verified stale-after-intervention status surfaced in parent");
 
-		sendLine(mainPaneTarget, "/subagents list");
-		const staleListCapture = await waitForPaneText(mainPaneTarget, "stale@", 30_000);
-		const staleAgentLine = latestLineContaining(staleListCapture, agentId);
-		if (!staleAgentLine?.includes("stale@")) {
+		const staleAgent = await runSubagentsListAndWaitForAgentLine(
+			mainPaneTarget,
+			agentId,
+			(line) => line.includes("stale@"),
+			30_000,
+			`fresh /subagents list row for ${agentId} with stale marker`,
+		);
+		if (!staleAgent.agentLine.includes("stale@")) {
 			fail("expected /subagents list to show stale marker after direct child intervention");
 		}
 
@@ -306,10 +367,14 @@ async function main() {
 		await waitForPaneText(mainPaneTarget, "RAT133 child refreshed", 120_000);
 		await waitForStablePane(mainPaneTarget, 1500, 60_000);
 
-		sendLine(mainPaneTarget, "/subagents list");
-		const refreshedListCapture = await waitForPaneText(mainPaneTarget, "markers=none", 30_000);
-		const refreshedAgentLine = latestLineContaining(refreshedListCapture, agentId);
-		if (!refreshedAgentLine?.includes("markers=none")) {
+		const refreshedAgent = await runSubagentsListAndWaitForAgentLine(
+			mainPaneTarget,
+			agentId,
+			(line) => line.includes("markers=none"),
+			30_000,
+			`fresh /subagents list row for ${agentId} with cleared markers`,
+		);
+		if (!refreshedAgent.agentLine.includes("markers=none")) {
 			fail("expected /subagents list to clear stale markers after a fresh child-authored report");
 		}
 		log("verified stale marker clears only after explicit child-authored report");
