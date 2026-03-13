@@ -18,6 +18,7 @@ Today, the real v1 user path is available:
 - load the parent extension into `pi`
 - ask the main agent to call the `Agent` tool with a named subagent type
 - list live subagents with `/subagents list`
+- send structured follow-ups with `/subagents send <agentId> <message>`
 - print the exact tmux focus action with `/subagents focus <agentId>`
 - define named agent types through embedded or custom definitions
 
@@ -35,7 +36,8 @@ If you want to try the current implementation from this repo, the practical path
 4. Start `pi`
 5. Ask the main agent to use the `Agent` tool with a named type such as `general-purpose`, `Explore`, or `Plan`
 6. Run `/subagents list`
-7. Run `/subagents focus <agentId>` and use the returned `focusCommand` to jump into the live tmux child
+7. Run `/subagents send <agentId> <message>` when you want to nudge a live child through the supported sidecar channel
+8. Run `/subagents focus <agentId>` and use the returned `focusCommand` to jump into the live tmux child
 
 This is the real first-user path, not just a repo-internal harness.
 
@@ -46,6 +48,7 @@ Prerequisites:
 The extension adds these user-facing surfaces:
 - `Agent` tool
 - `/subagents list`
+- `/subagents send <agentId> <message>`
 - `/subagents focus <agentId>`
 
 The default named agents are:
@@ -68,6 +71,8 @@ Supported frontmatter keys used by this loader are:
 Unknown frontmatter keys are ignored.
 
 Focus intentionally does not take over the current `pi` terminal. `/subagents focus <agentId>` prints the exact tmux action so you can jump into the live child yourself, including nested-tmux-safe behavior when `pi` is already running inside tmux.
+
+If you want to send the child another message from the parent session, prefer `/subagents send <agentId> <message>` over typing directly into tmux. Direct tmux input is treated as user intervention and marks the child assumptions as stale until it emits a fresh explicit report.
 
 ## For developers
 

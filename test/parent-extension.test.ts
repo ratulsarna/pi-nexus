@@ -376,6 +376,24 @@ Research the codebase carefully and report findings.`,
 		expect(focusContent).toContain("Focus command: if [ -n \"${TMUX:-}\" ]; then tmux switch-client");
 		expect(focusContent).toContain("else tmux attach-session");
 		expect(focusContent).toContain(launchSpec.tmuxTarget);
+
+		expect(sidecars.get(agentId).connect()).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecars.get(agentId).message(
+			makeEnvelope(agentId, "ready", 0, "2026-03-13T12:00:01.000Z", {
+				pid: 101,
+				sessionPath: launchSpec.sessionPath,
+				tmuxTarget: launchSpec.tmuxTarget,
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+
+		await command.handler(`send ${agentId} keep going`, ctx);
+		const sendContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
+		expect(sendContent).toContain(`Queued follow-up for ${agentId}.`);
+		expect(sendContent).toContain("Message: keep going");
+		expect(sidecars.get(agentId).sent.at(-1)).toMatchObject({
+			type: "follow_up",
+			payload: { message: "keep going" },
+		});
 	});
 
 	it("bridges accepted child progress and final_result back into the parent session", async () => {

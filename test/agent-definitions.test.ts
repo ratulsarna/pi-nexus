@@ -373,6 +373,8 @@ Look for security problems first.`,
 
 		expect(promptResult.value).toContain("general-purpose coding agent");
 		expect(promptResult.value).toContain("Look for security problems first.");
+		expect(promptResult.value).toContain("report_to_parent");
+		expect(promptResult.value).toContain("Do not finish a turn silently");
 		expect(promptResult.value).toContain("Task:\nReview the auth flow.");
 	});
 

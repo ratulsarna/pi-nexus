@@ -167,6 +167,13 @@ You are STRICTLY PROHIBITED from:
 # Output
 - Use absolute file paths
 - Be concise but complete`;
+const PARENT_REPORTING_INSTRUCTIONS = `# Parent Callback Protocol
+You have an LLM-callable tool named report_to_parent for communicating back to the parent Pi session.
+
+- When you have meaningful progress to share, call report_to_parent with kind: "progress"
+- When you are done for now, call report_to_parent with kind: "final_result"
+- When you need the parent or user to answer something before you can continue, call report_to_parent with kind: "needs_input"
+- Do not finish a turn silently when the parent is waiting on your work; send either final_result or needs_input before stopping`;
 
 export const DEFAULT_AGENT_DEFINITIONS: ReadonlyArray<EmbeddedAgentDefinitionInput> = [
 	{
@@ -717,6 +724,8 @@ export function composeNamedSubagentInitialPrompt(
 		`Description: ${definitionResult.value.description}`,
 		"",
 		instructions,
+		"",
+		PARENT_REPORTING_INSTRUCTIONS,
 		"",
 		"Task:",
 		taskPromptResult.value,

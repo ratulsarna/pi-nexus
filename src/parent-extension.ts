@@ -735,13 +735,14 @@ export function installParentExtension(
 	});
 
 	pi.registerCommand("subagents", {
-		description: "List subagents or print the exact tmux focus command for one.",
+		description: "List subagents, send follow-ups, or print the exact tmux focus command for one.",
 		getArgumentCompletions: (argumentPrefix) => {
 			const trimmed = argumentPrefix.trimStart();
 			if (trimmed.length === 0) {
 				return [
 					{ value: "list", label: "list" },
 					{ value: "focus ", label: "focus <agentId>" },
+					{ value: "send ", label: "send <agentId> <message>" },
 				];
 			}
 
@@ -756,7 +757,20 @@ export function installParentExtension(
 					}));
 			}
 
-			const commands = ["list", "focus"];
+			if (trimmed.startsWith("send ")) {
+				const sendPrefix = trimmed.slice("send ".length);
+				if (!sendPrefix.includes(" ")) {
+					const items = activeState?.manager.listRecords() ?? [];
+					return items
+						.filter((record) => record.id.startsWith(sendPrefix))
+						.map((record) => ({
+							value: `send ${record.id} `,
+							label: record.id,
+						}));
+				}
+			}
+
+			const commands = ["list", "focus", "send"];
 			return commands
 				.filter((entry) => entry.startsWith(trimmed))
 				.map((entry) => ({ value: entry, label: entry }));
@@ -829,10 +843,43 @@ export function installParentExtension(
 				return;
 			}
 
+			if (command === "send") {
+				const agentId = rest.shift()?.trim() ?? "";
+				const message = rest.join(" ").trim();
+				if (!agentId || !message) {
+					sendSessionMessage(
+						pi,
+						"pi-nexus-subagents-output",
+						"Usage: /subagents send <agentId> <message>",
+						{ command: "send", agentId },
+					);
+					return;
+				}
+
+				const sendResult = state.manager.sendFollowUp(agentId, message);
+				if (!sendResult.ok) {
+					sendSessionMessage(
+						pi,
+						"pi-nexus-subagents-output",
+						`Failed to send follow-up to ${agentId}: ${sendResult.error}`,
+						{ command: "send", agentId },
+					);
+					return;
+				}
+
+				sendSessionMessage(
+					pi,
+					"pi-nexus-subagents-output",
+					`Queued follow-up for ${agentId}.\nMessage: ${message}`,
+					{ command: "send", agentId },
+				);
+				return;
+			}
+
 			sendSessionMessage(
 				pi,
 				"pi-nexus-subagents-output",
-				"Usage:\n/subagents list\n/subagents focus <agentId>",
+				"Usage:\n/subagents list\n/subagents focus <agentId>\n/subagents send <agentId> <message>",
 				{ command: "usage" },
 			);
 		},

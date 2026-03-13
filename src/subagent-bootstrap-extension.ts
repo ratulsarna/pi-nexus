@@ -33,7 +33,7 @@ interface ExtensionToolLike {
 
 interface ExtensionApiLike {
 	on(
-		event: "session_start" | "session_shutdown" | "agent_end" | "input",
+		event: "session_start" | "session_shutdown" | "agent_start" | "agent_end" | "input",
 		handler: (event: unknown, ctx: ExtensionContextLike) => unknown | Promise<unknown>,
 	): void;
 	registerTool?(definition: ExtensionToolLike): void;
@@ -79,6 +79,54 @@ function normalizeError(error: unknown): Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function extractAssistantTextContent(message: unknown): string | undefined {
+	if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) {
+		return undefined;
+	}
+
+	const parts = message.content
+		.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+		.filter((entry) => entry.type === "text" && typeof entry.text === "string")
+		.map((entry) => {
+			const text = entry.text;
+			return typeof text === "string" ? text.trim() : "";
+		})
+		.filter((entry) => entry.length > 0);
+	if (parts.length === 0) {
+		return undefined;
+	}
+
+	return parts.join("\n\n");
+}
+
+function extractFallbackFinalResult(event: unknown): { summary: string; data: unknown } | undefined {
+	if (!isRecord(event) || !Array.isArray(event.messages)) {
+		return undefined;
+	}
+
+	for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+		const text = extractAssistantTextContent(event.messages[index]);
+		if (!text) {
+			continue;
+		}
+
+		const firstLine = text
+			.split("\n")
+			.map((line) => line.trim())
+			.find((line) => line.length > 0) ?? text;
+		const summary = firstLine.length > 240
+			? `${firstLine.slice(0, 237).trimEnd()}...`
+			: firstLine;
+
+		return {
+			summary,
+			data: text === summary ? null : { assistantText: text, synthesizedFrom: "agent_end" },
+		};
+	}
+
+	return undefined;
 }
 
 function loadBootstrapConfig(
@@ -165,6 +213,8 @@ class SubagentBootstrapSession {
 	private nextChildSeq = 0;
 
 	private buffer = "";
+
+	private terminalReportSentForCurrentTurn = false;
 
 	private buildStartupFailure(error: Error, cleanupErrors: Error[]): Error {
 		if (cleanupErrors.length === 0) {
@@ -263,6 +313,7 @@ class SubagentBootstrapSession {
 					summary: reportResult.value.summary,
 					data: reportResult.value.data ?? null,
 				});
+				this.terminalReportSentForCurrentTurn = true;
 				return;
 			case "needs_input":
 				this.sendEvent("needs_input", {
@@ -270,15 +321,40 @@ class SubagentBootstrapSession {
 					kind: "question",
 				});
 				this.currentState = "needs_input";
+				this.terminalReportSentForCurrentTurn = true;
 		}
 	}
 
-	public handleAgentEnd(): void {
-		if (!this.ready || !this.interruptPending) {
+	public handleAgentStart(): void {
+		if (!this.ready) {
 			return;
 		}
 
-		this.completeInterrupt();
+		this.terminalReportSentForCurrentTurn = false;
+	}
+
+	public handleAgentEnd(event: unknown): void {
+		if (!this.ready) {
+			return;
+		}
+		if (this.interruptPending) {
+			this.completeInterrupt();
+			return;
+		}
+		if (this.terminalReportSentForCurrentTurn) {
+			return;
+		}
+
+		const fallbackResult = extractFallbackFinalResult(event);
+		if (!fallbackResult) {
+			return;
+		}
+
+		this.sendEvent("final_result", {
+			summary: fallbackResult.summary,
+			data: fallbackResult.data,
+		});
+		this.terminalReportSentForCurrentTurn = true;
 	}
 
 	public handleInput(event: unknown): void {
@@ -589,8 +665,12 @@ export function installSubagentBootstrapExtension(
 		}
 	});
 
-	pi.on("agent_end", async () => {
-		activeSession?.handleAgentEnd();
+	pi.on("agent_start", async () => {
+		activeSession?.handleAgentStart();
+	});
+
+	pi.on("agent_end", async (event) => {
+		activeSession?.handleAgentEnd(event);
 	});
 
 	pi.on("input", async (event) => {
