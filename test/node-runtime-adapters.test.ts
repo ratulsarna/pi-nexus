@@ -97,14 +97,16 @@ describe("TmuxSubagentProcessAdapter", () => {
 	it("builds one focus command surface for pane targets", () => {
 		expect(createTmuxFocusCommand("pane", "session:1.2")).toEqual({
 			ok: true,
-			value: "tmux attach-session -t 'session' \\; select-window -t 'session:1' \\; select-pane -t 'session:1.2'",
+			value:
+				"if [ -n \"${TMUX:-}\" ]; then tmux switch-client -t 'session' \\; select-window -t 'session:1' \\; select-pane -t 'session:1.2' ; else tmux attach-session -t 'session' \\; select-window -t 'session:1' \\; select-pane -t 'session:1.2' ; fi",
 		});
 	});
 
 	it("builds one focus command surface for window targets", () => {
 		expect(createTmuxFocusCommand("window", "session:build")).toEqual({
 			ok: true,
-			value: "tmux attach-session -t 'session' \\; select-window -t 'session:build'",
+			value:
+				"if [ -n \"${TMUX:-}\" ]; then tmux switch-client -t 'session' \\; select-window -t 'session:build' ; else tmux attach-session -t 'session' \\; select-window -t 'session:build' ; fi",
 		});
 	});
 
@@ -126,7 +128,8 @@ describe("TmuxSubagentProcessAdapter", () => {
 				tmuxMode: "window",
 				tmuxTarget: "session:build",
 				sessionPath: "/tmp/agent-1.session.jsonl",
-				focusCommand: "tmux attach-session -t 'session' \\; select-window -t 'session:build'",
+				focusCommand:
+					"if [ -n \"${TMUX:-}\" ]; then tmux switch-client -t 'session' \\; select-window -t 'session:build' ; else tmux attach-session -t 'session' \\; select-window -t 'session:build' ; fi",
 				note: "historical target",
 			},
 		});

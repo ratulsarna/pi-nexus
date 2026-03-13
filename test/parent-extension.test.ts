@@ -372,7 +372,8 @@ Research the codebase carefully and report findings.`,
 		await command.handler(`focus ${agentId}`, ctx);
 		const focusContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
 		expect(focusContent).toContain(`Subagent focus target for ${agentId}`);
-		expect(focusContent).toContain("Focus command: tmux attach-session");
+		expect(focusContent).toContain("Focus command: if [ -n \"${TMUX:-}\" ]; then tmux switch-client");
+		expect(focusContent).toContain("else tmux attach-session");
 		expect(focusContent).toContain(launchSpec.tmuxTarget);
 	});
 

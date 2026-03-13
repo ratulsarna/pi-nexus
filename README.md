@@ -18,7 +18,7 @@ Today, the real v1 user path is available:
 - load the parent extension into `pi`
 - ask the main agent to call the `Agent` tool with a named subagent type
 - list live subagents with `/subagents list`
-- print the exact tmux attach action with `/subagents focus <agentId>`
+- print the exact tmux focus action with `/subagents focus <agentId>`
 - define named agent types through embedded or custom definitions
 
 ## Trying it right now
@@ -67,7 +67,7 @@ Supported frontmatter is intentionally strict:
 
 Unsupported legacy fields are rejected instead of being silently ignored.
 
-Focus intentionally does not take over the current `pi` terminal. `/subagents focus <agentId>` prints the exact tmux attach action so you can jump into the live child yourself.
+Focus intentionally does not take over the current `pi` terminal. `/subagents focus <agentId>` prints the exact tmux action so you can jump into the live child yourself, including nested-tmux-safe behavior when `pi` is already running inside tmux.
 
 ## For developers
 

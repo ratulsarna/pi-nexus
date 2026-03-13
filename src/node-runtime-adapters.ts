@@ -237,22 +237,44 @@ export function createTmuxFocusCommand(tmuxMode: TmuxMode, tmuxTarget: string): 
 	if (!parsedTargetResult.ok) return parsedTargetResult;
 
 	const parsedTarget = parsedTargetResult.value;
-	const commandParts = [
+	const selectionCommandParts = [
 		"tmux",
-		"attach-session",
-		"-t",
-		shQuote(parsedTarget.sessionTarget),
-		"\\;",
 		"select-window",
 		"-t",
 		shQuote(parsedTarget.windowTarget),
 	];
 
 	if (parsedTarget.paneTarget) {
-		commandParts.push("\\;", "select-pane", "-t", shQuote(parsedTarget.paneTarget));
+		selectionCommandParts.push("\\;", "select-pane", "-t", shQuote(parsedTarget.paneTarget));
 	}
 
-	return ok(commandParts.join(" "));
+	const attachCommandParts = [
+		"tmux",
+		"attach-session",
+		"-t",
+		shQuote(parsedTarget.sessionTarget),
+		"\\;",
+		...selectionCommandParts.slice(1),
+	];
+
+	const switchCommandParts = [
+		"tmux",
+		"switch-client",
+		"-t",
+		shQuote(parsedTarget.sessionTarget),
+		"\\;",
+		...selectionCommandParts.slice(1),
+	];
+
+	return ok(
+		[
+			"if [ -n \"${TMUX:-}\" ]; then",
+			switchCommandParts.join(" "),
+			"; else",
+			attachCommandParts.join(" "),
+			"; fi",
+		].join(" "),
+	);
 }
 
 export function createSubagentFocusTarget(input: {
