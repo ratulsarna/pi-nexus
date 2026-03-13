@@ -3,7 +3,15 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
-import type { SidecarControlMessage, RuntimeLaunchSpec } from "./contracts.js";
+import {
+	validateSubagentFocusTarget,
+	type SidecarControlMessage,
+	type RuntimeLaunchSpec,
+	type SubagentFocusAvailability,
+	type SubagentFocusTarget,
+	type TmuxMode,
+	type ValidationOutcome,
+} from "./contracts.js";
 import type {
 	ManagedProcessExit,
 	SidecarSessionAdapter,
@@ -26,6 +34,14 @@ function normalizeError(error: unknown): Error {
 	}
 
 	return new Error(String(error));
+}
+
+function fail(error: string): ValidationOutcome<never> {
+	return { ok: false, error };
+}
+
+function ok<T>(value: T): ValidationOutcome<T> {
+	return { ok: true, value };
 }
 
 function cleanupSocketPath(socketPath: string): void {
@@ -213,6 +229,90 @@ function shQuote(value: string): string {
 
 function joinShellWords(words: ReadonlyArray<string>): string {
 	return words.map((word) => shQuote(word)).join(" ");
+}
+
+function parseTmuxFocusIdentity(
+	tmuxMode: TmuxMode,
+	tmuxTarget: string,
+): ValidationOutcome<{
+	sessionTarget: string;
+	windowTarget: string;
+	paneTarget?: string;
+}> {
+	const colonIndex = tmuxTarget.indexOf(":");
+	if (colonIndex <= 0 || colonIndex === tmuxTarget.length - 1) {
+		return fail("tmuxTarget must include a session and target segment");
+	}
+
+	const sessionTarget = tmuxTarget.slice(0, colonIndex).trim();
+	const targetRemainder = tmuxTarget.slice(colonIndex + 1).trim();
+	if (sessionTarget.length === 0 || targetRemainder.length === 0) {
+		return fail("tmuxTarget must include a session and target segment");
+	}
+
+	if (tmuxMode === "window") {
+		return ok({
+			sessionTarget,
+			windowTarget: tmuxTarget.trim(),
+		});
+	}
+
+	const paneSeparatorIndex = targetRemainder.lastIndexOf(".");
+	if (paneSeparatorIndex <= 0 || paneSeparatorIndex === targetRemainder.length - 1) {
+		return fail("pane tmuxTarget must include both window and pane selectors");
+	}
+
+	const windowSelector = targetRemainder.slice(0, paneSeparatorIndex).trim();
+	const paneSelector = targetRemainder.slice(paneSeparatorIndex + 1).trim();
+	if (windowSelector.length === 0 || paneSelector.length === 0) {
+		return fail("pane tmuxTarget must include both window and pane selectors");
+	}
+
+	return ok({
+		sessionTarget,
+		windowTarget: `${sessionTarget}:${windowSelector}`,
+		paneTarget: tmuxTarget.trim(),
+	});
+}
+
+export function createTmuxFocusCommand(tmuxMode: TmuxMode, tmuxTarget: string): ValidationOutcome<string> {
+	const parsedTargetResult = parseTmuxFocusIdentity(tmuxMode, tmuxTarget);
+	if (!parsedTargetResult.ok) return parsedTargetResult;
+
+	const parsedTarget = parsedTargetResult.value;
+	const commandParts = [
+		"tmux",
+		"attach-session",
+		"-t",
+		shQuote(parsedTarget.sessionTarget),
+		"\\;",
+		"select-window",
+		"-t",
+		shQuote(parsedTarget.windowTarget),
+	];
+
+	if (parsedTarget.paneTarget) {
+		commandParts.push("\\;", "select-pane", "-t", shQuote(parsedTarget.paneTarget));
+	}
+
+	return ok(commandParts.join(" "));
+}
+
+export function createSubagentFocusTarget(input: {
+	agentId: string;
+	availability: SubagentFocusAvailability;
+	tmuxMode: TmuxMode;
+	tmuxTarget: string;
+	sessionPath: string;
+	note?: string;
+}): ValidationOutcome<SubagentFocusTarget> {
+	const focusCommandResult = createTmuxFocusCommand(input.tmuxMode, input.tmuxTarget);
+	if (!focusCommandResult.ok) return focusCommandResult;
+
+	return validateSubagentFocusTarget({
+		...input,
+		focusCommand: focusCommandResult.value,
+	});
 }
 
 function validateTmuxLaunchEnvEntry(key: string, value: string): void {

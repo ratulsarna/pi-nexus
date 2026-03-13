@@ -69,6 +69,18 @@ export interface RuntimeFailure {
 	fatal: boolean;
 }
 
+export type SubagentFocusAvailability = "live" | "degraded" | "stopped";
+
+export interface SubagentFocusTarget {
+	agentId: string;
+	availability: SubagentFocusAvailability;
+	tmuxMode: TmuxMode;
+	tmuxTarget: string;
+	sessionPath: string;
+	focusCommand: string;
+	note?: string;
+}
+
 export interface SubagentRecord<TData = unknown> {
 	id: string;
 	type: string;
@@ -84,6 +96,7 @@ export interface SubagentRecord<TData = unknown> {
 	stoppedAt?: string;
 	connectedAt?: string;
 	degradedAt?: string;
+	assumptionsStaleAt?: string;
 	userIntervenedHistory?: UserIntervenedMetadata[];
 	lastProgressReport?: ExplicitReport<TData>;
 	pendingInputRequest?: ExplicitReport<TData> & { kind: "needs_input" };
@@ -282,6 +295,7 @@ const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
 	"stopped",
 ]);
 const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["interrupt", "ping", "pong"]);
+const SUBAGENT_FOCUS_AVAILABILITIES = new Set<SubagentFocusAvailability>(["live", "degraded", "stopped"]);
 const STATES_REQUIRING_CONNECTED_AT = new Set<RuntimeState>([
 	"ready",
 	"running",
@@ -1330,6 +1344,47 @@ export function createUserIntervenedMetadata(recordedAt: string): ValidationOutc
 	});
 }
 
+export function validateSubagentFocusTarget(input: unknown): ValidationOutcome<SubagentFocusTarget> {
+	if (!isRecord(input)) {
+		return fail("focus target must be an object");
+	}
+
+	const agentIdError = validateRequiredText("focusTarget.agentId", input.agentId);
+	if (agentIdError) return agentIdError;
+
+	if (typeof input.availability !== "string" || !SUBAGENT_FOCUS_AVAILABILITIES.has(input.availability as SubagentFocusAvailability)) {
+		return fail("focusTarget.availability must be one of: live, degraded, stopped");
+	}
+
+	if (input.tmuxMode !== "pane" && input.tmuxMode !== "window") {
+		return fail("focusTarget.tmuxMode must be either \"pane\" or \"window\"");
+	}
+
+	const tmuxTargetError = validateRequiredText("focusTarget.tmuxTarget", input.tmuxTarget);
+	if (tmuxTargetError) return tmuxTargetError;
+
+	const sessionPathError = validateRequiredPath("focusTarget.sessionPath", input.sessionPath);
+	if (sessionPathError) return sessionPathError;
+
+	const focusCommandError = validateRequiredText("focusTarget.focusCommand", input.focusCommand);
+	if (focusCommandError) return focusCommandError;
+
+	if (hasOwnField(input, "note") && input.note !== undefined) {
+		const noteError = validateRequiredText("focusTarget.note", input.note);
+		if (noteError) return noteError;
+	}
+
+	return ok({
+		agentId: (input.agentId as string).trim(),
+		availability: input.availability as SubagentFocusAvailability,
+		tmuxMode: input.tmuxMode,
+		tmuxTarget: (input.tmuxTarget as string).trim(),
+		sessionPath: input.sessionPath as string,
+		focusCommand: (input.focusCommand as string).trim(),
+		note: hasOwnField(input, "note") && input.note !== undefined ? (input.note as string).trim() : undefined,
+	});
+}
+
 export function validateSubagentRecord<TData = unknown>(record: unknown): ValidationOutcome<SubagentRecord<TData>> {
 	if (!isRecord(record)) {
 		return fail("subagent record must be an object");
@@ -1375,6 +1430,12 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 	}
 	if (hasOwnField(record, "degradedAt") && (typeof record.degradedAt !== "string" || !isIsoTimestamp(record.degradedAt))) {
 		return fail("degradedAt must be an ISO timestamp");
+	}
+	if (
+		hasOwnField(record, "assumptionsStaleAt")
+		&& (typeof record.assumptionsStaleAt !== "string" || !isIsoTimestamp(record.assumptionsStaleAt))
+	) {
+		return fail("assumptionsStaleAt must be an ISO timestamp");
 	}
 
 	const userIntervenedHistory = hasOwnField(record, "userIntervenedHistory") ? record.userIntervenedHistory : undefined;
@@ -1485,6 +1546,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 	const stoppedAt = record.stoppedAt as string | undefined;
 	const connectedAt = record.connectedAt as string | undefined;
 	const degradedAt = record.degradedAt as string | undefined;
+	const assumptionsStaleAt = record.assumptionsStaleAt as string | undefined;
 
 	if (
 		(
@@ -1494,6 +1556,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			|| normalizedFinalResult
 			|| normalizedFinalResultHistory
 			|| degradedAt
+			|| assumptionsStaleAt
 		)
 		&& !connectedAt
 	) {
@@ -1511,6 +1574,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			|| normalizedFinalResult
 			|| normalizedFinalResultHistory
 			|| degradedAt
+			|| assumptionsStaleAt
 		)
 	) {
 		return fail(`${state} records may not include post-handshake sidecar fields`);
@@ -1540,8 +1604,21 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			return fail(`degradedAt must be on or after ${degradedBaselineLabel}`);
 		}
 	}
+	if (assumptionsStaleAt) {
+		const assumptionsStaleBaseline = connectedAt ?? startedAt ?? (record.createdAt as string);
+		const assumptionsStaleBaselineLabel = connectedAt ? "connectedAt" : startedAt ? "startedAt" : "createdAt";
+		if (!isTimestampOnOrBefore(assumptionsStaleBaseline, assumptionsStaleAt)) {
+			return fail(`assumptionsStaleAt must be on or after ${assumptionsStaleBaselineLabel}`);
+		}
+	}
 	if (stoppedAt && degradedAt && !isTimestampOnOrBefore(degradedAt, stoppedAt)) {
 		return fail("degradedAt must be on or before stoppedAt");
+	}
+	if (stoppedAt && assumptionsStaleAt && !isTimestampOnOrBefore(assumptionsStaleAt, stoppedAt)) {
+		return fail("assumptionsStaleAt must be on or before stoppedAt");
+	}
+	if (degradedAt && assumptionsStaleAt && !isTimestampOnOrBefore(assumptionsStaleAt, degradedAt)) {
+		return fail("assumptionsStaleAt must be on or before degradedAt");
 	}
 
 	if (state === "stopped" && stoppedAt) {
@@ -1594,6 +1671,39 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			&& normalizedFinalResultHistory.some((entry) => !isTimestampOnOrBefore(entry.reportedAt, degradedAt))
 		) {
 			return fail("finalResultHistory entries must be on or before degradedAt");
+		}
+	}
+	if (assumptionsStaleAt) {
+		if (!normalizedUserIntervenedHistory) {
+			return fail("assumptionsStaleAt requires userIntervenedHistory");
+		}
+		const latestIntervention = normalizedUserIntervenedHistory.at(-1);
+		if (!latestIntervention || latestIntervention.recordedAt !== assumptionsStaleAt) {
+			return fail("assumptionsStaleAt must match the latest userIntervenedHistory entry");
+		}
+		if (
+			normalizedLastProgressReport
+			&& !isTimestampOnOrBefore(normalizedLastProgressReport.reportedAt, assumptionsStaleAt)
+		) {
+			return fail("lastProgressReport.reportedAt must be on or before assumptionsStaleAt");
+		}
+		if (
+			normalizedPendingInputRequest
+			&& !isTimestampOnOrBefore(normalizedPendingInputRequest.reportedAt, assumptionsStaleAt)
+		) {
+			return fail("pendingInputRequest.reportedAt must be on or before assumptionsStaleAt");
+		}
+		if (
+			normalizedFinalResultHistory
+			&& normalizedFinalResultHistory.some((entry) => !isTimestampOnOrBefore(entry.reportedAt, assumptionsStaleAt))
+		) {
+			return fail("finalResultHistory entries must be on or before assumptionsStaleAt");
+		}
+		if (
+			normalizedUserIntervenedHistory
+			&& normalizedUserIntervenedHistory.some((entry) => !isTimestampOnOrBefore(entry.recordedAt, assumptionsStaleAt))
+		) {
+			return fail("userIntervenedHistory entries must be on or before assumptionsStaleAt");
 		}
 	}
 	if (normalizedLastProgressReport) {
@@ -1683,6 +1793,7 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 		stoppedAt,
 		connectedAt,
 		degradedAt,
+		assumptionsStaleAt,
 		userIntervenedHistory: normalizedUserIntervenedHistory,
 		lastProgressReport: normalizedLastProgressReport,
 		pendingInputRequest: normalizedPendingInputRequest,

@@ -20,6 +20,7 @@ import {
 	validateSidecarHandshake,
 	validateMonotonicSeqAcceptance,
 	validateSidecarProtocolEnvelope,
+	validateSubagentFocusTarget,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
 	type RuntimeState,
@@ -305,6 +306,48 @@ describe("validateRuntimeBootstrapConfig", () => {
 		expect(result).toEqual({
 			ok: false,
 			error: "socketPath must not be a stale unix socket",
+		});
+	});
+});
+
+describe("validateSubagentFocusTarget", () => {
+	it("accepts a live focus target", () => {
+		expect(
+			validateSubagentFocusTarget({
+				agentId: "agt_focus",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t 'main' \\; select-window -t 'main:2' \\; select-pane -t 'main:2.1'",
+			}),
+		).toEqual({
+			ok: true,
+			value: {
+				agentId: "agt_focus",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t 'main' \\; select-window -t 'main:2' \\; select-pane -t 'main:2.1'",
+				note: undefined,
+			},
+		});
+	});
+
+	it("rejects malformed focus target payloads", () => {
+		expect(
+			validateSubagentFocusTarget({
+				agentId: "agt_focus",
+				availability: "unknown",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t 'main'",
+			}),
+		).toEqual({
+			ok: false,
+			error: "focusTarget.availability must be one of: live, degraded, stopped",
 		});
 	});
 });
@@ -2345,6 +2388,105 @@ describe("validateSubagentRecord", () => {
 				}),
 			).ok,
 		).toBe(true);
+	});
+
+	it("accepts assumptionsStaleAt when it matches the latest intervention and no newer explicit report exists", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					assumptionsStaleAt: "2026-03-10T10:03:00.000Z",
+					lastProgressReport: {
+						kind: "progress",
+						summary: "before intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("rejects assumptionsStaleAt without intervention history", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					assumptionsStaleAt: "2026-03-10T10:03:00.000Z",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "assumptionsStaleAt requires userIntervenedHistory",
+		});
+	});
+
+	it("rejects assumptionsStaleAt that does not match the latest intervention", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:02:00.000Z",
+						},
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					assumptionsStaleAt: "2026-03-10T10:02:00.000Z",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "assumptionsStaleAt must match the latest userIntervenedHistory entry",
+		});
+	});
+
+	it("rejects newer explicit reports while assumptionsStaleAt remains set", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					assumptionsStaleAt: "2026-03-10T10:03:00.000Z",
+					lastProgressReport: {
+						kind: "progress",
+						summary: "after intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "lastProgressReport.reportedAt must be on or before assumptionsStaleAt",
+		});
 	});
 
 	it("rejects stopped records whose degradedAt is later than stoppedAt", () => {

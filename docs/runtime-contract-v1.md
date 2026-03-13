@@ -150,6 +150,8 @@ Payload is metadata only:
 
 No transcript sync happens in v1.
 
+When `user_intervened` is accepted, the parent records `assumptionsStaleAt` and treats prior child understanding as potentially stale until a newer accepted explicit child-authored `progress`, `needs_input`, or `final_result` arrives.
+
 ## Runtime states
 
 Allowed states:
@@ -213,6 +215,16 @@ The parent-side record is the source of truth for:
 - append-only `finalResultHistory`
 - append-only `userIntervenedHistory`
 - degraded trust marker
+- `assumptionsStaleAt`
+
+The parent-side focus surface is also the supported source of truth for:
+
+- structured tmux focus metadata
+- one ready-to-run focus/attach command for the child target
+- explicit focus availability semantics:
+  - `live`
+  - `degraded`
+  - `stopped` (historical / non-live)
 
 The live tmux child is the source of truth for:
 

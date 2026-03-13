@@ -6,7 +6,12 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { RuntimeLaunchSpec } from "../src/contracts.js";
-import { NodeSidecarSessionAdapter, TmuxSubagentProcessAdapter } from "../src/node-runtime-adapters.js";
+import {
+	createSubagentFocusTarget,
+	createTmuxFocusCommand,
+	NodeSidecarSessionAdapter,
+	TmuxSubagentProcessAdapter,
+} from "../src/node-runtime-adapters.js";
 
 let originalPath: string | undefined;
 let fakeRootDir = os.tmpdir();
@@ -89,6 +94,51 @@ function makeLaunchSpec(overrides: Partial<RuntimeLaunchSpec> = {}): RuntimeLaun
 }
 
 describe("TmuxSubagentProcessAdapter", () => {
+	it("builds one focus command surface for pane targets", () => {
+		expect(createTmuxFocusCommand("pane", "session:1.2")).toEqual({
+			ok: true,
+			value: "tmux attach-session -t 'session' \\; select-window -t 'session:1' \\; select-pane -t 'session:1.2'",
+		});
+	});
+
+	it("builds one focus command surface for window targets", () => {
+		expect(createTmuxFocusCommand("window", "session:build")).toEqual({
+			ok: true,
+			value: "tmux attach-session -t 'session' \\; select-window -t 'session:build'",
+		});
+	});
+
+	it("returns a typed focus payload with explicit stopped semantics", () => {
+		expect(
+			createSubagentFocusTarget({
+				agentId: "agent-1",
+				availability: "stopped",
+				tmuxMode: "window",
+				tmuxTarget: "session:build",
+				sessionPath: "/tmp/agent-1.session.jsonl",
+				note: "historical target",
+			}),
+		).toEqual({
+			ok: true,
+			value: {
+				agentId: "agent-1",
+				availability: "stopped",
+				tmuxMode: "window",
+				tmuxTarget: "session:build",
+				sessionPath: "/tmp/agent-1.session.jsonl",
+				focusCommand: "tmux attach-session -t 'session' \\; select-window -t 'session:build'",
+				note: "historical target",
+			},
+		});
+	});
+
+	it("rejects malformed pane targets when building focus commands", () => {
+		expect(createTmuxFocusCommand("pane", "session:1")).toEqual({
+			ok: false,
+			error: "pane tmuxTarget must include both window and pane selectors",
+		});
+	});
+
 	it("writes launch env through env -i so non-identifier env keys stay safe", () => {
 		const exitMarkerDir = fs.mkdtempSync(path.join(fakeRootDir, "tmux-env-"));
 		const adapter = new TmuxSubagentProcessAdapter({

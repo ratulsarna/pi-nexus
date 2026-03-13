@@ -330,6 +330,89 @@ describe("SubagentManager", () => {
 		expect(expectOk(manager.getRecord("agt_spawn")).connectedAt).toBeUndefined();
 	});
 
+	it("returns a live focus target for trusted child sessions", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:00:00.000Z",
+			"2026-03-11T12:00:01.000Z",
+		]);
+		const request = makeSpawnRequest("agt_focus_live");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_focus_live").connect());
+		expectOk(sidecars.get("agt_focus_live").message(
+			makeEnvelope("agt_focus_live", "ready", 0, "2026-03-11T12:00:02.000Z", {
+				pid: 1111,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		const windowTarget = request.launchSpec.tmuxTarget.slice(0, request.launchSpec.tmuxTarget.lastIndexOf("."));
+		const sessionTarget = request.launchSpec.tmuxTarget.slice(0, request.launchSpec.tmuxTarget.indexOf(":"));
+
+		expect(manager.getFocusTarget("agt_focus_live")).toEqual({
+			ok: true,
+			value: {
+				agentId: "agt_focus_live",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: request.launchSpec.tmuxTarget,
+				sessionPath: request.launchSpec.sessionPath,
+				focusCommand: `tmux attach-session -t '${sessionTarget}' \\; select-window -t '${windowTarget}' \\; select-pane -t '${request.launchSpec.tmuxTarget}'`,
+				note: undefined,
+			},
+		});
+	});
+
+	it("returns explicit degraded and stopped focus semantics", () => {
+		const degraded = createManager([
+			"2026-03-11T12:00:10.000Z",
+			"2026-03-11T12:00:11.000Z",
+			"2026-03-11T12:00:12.000Z",
+		]);
+		const degradedRequest = makeSpawnRequest("agt_focus_degraded");
+		expectOk(degraded.manager.spawn(degradedRequest));
+		expectOk(degraded.sidecars.get("agt_focus_degraded").connect());
+		expectOk(degraded.sidecars.get("agt_focus_degraded").message(
+			makeEnvelope("agt_focus_degraded", "ready", 0, "2026-03-11T12:00:13.000Z", {
+				pid: 1112,
+				sessionPath: degradedRequest.launchSpec.sessionPath,
+				tmuxTarget: degradedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(degraded.sidecars.get("agt_focus_degraded").disconnect("lost socket"));
+
+		const degradedFocus = expectOk(degraded.manager.getFocusTarget("agt_focus_degraded"));
+		expect(degradedFocus.availability).toBe("degraded");
+		expect(degradedFocus.note).toContain("sidecar trust is degraded");
+
+		const stopped = createManager([
+			"2026-03-11T12:00:20.000Z",
+			"2026-03-11T12:00:21.000Z",
+		]);
+		const stoppedRequest = makeSpawnRequest("agt_focus_stopped");
+		expectOk(stopped.manager.spawn(stoppedRequest));
+		expectOk(stopped.sidecars.get("agt_focus_stopped").connect());
+		expectOk(stopped.sidecars.get("agt_focus_stopped").message(
+			makeEnvelope("agt_focus_stopped", "ready", 0, "2026-03-11T12:00:22.000Z", {
+				pid: 1113,
+				sessionPath: stoppedRequest.launchSpec.sessionPath,
+				tmuxTarget: stoppedRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(stopped.processes.get("agt_focus_stopped").exit({ code: 0, signal: null }));
+
+		const stoppedFocus = expectOk(stopped.manager.getFocusTarget("agt_focus_stopped"));
+		expect(stoppedFocus.availability).toBe("stopped");
+		expect(stoppedFocus.note).toContain("historical");
+	});
+
+	it("fails deterministically for unknown focus target lookups", () => {
+		const { manager } = createManager(["2026-03-11T12:00:30.000Z"]);
+		expect(manager.getFocusTarget("missing")).toEqual({
+			ok: false,
+			error: "unknown managed agent: missing",
+		});
+	});
+
 	it("rejects malformed spawn input without throwing", () => {
 		const { manager } = createManager(["2026-03-11T11:59:59.000Z"]);
 
@@ -513,6 +596,7 @@ describe("SubagentManager", () => {
 		expect(expectOk(manager.getRecord("agt_events")).userIntervenedHistory?.at(-1)?.recordedAt).toBe(
 			"2026-03-11T12:03:05.000Z",
 		);
+		expect(expectOk(manager.getRecord("agt_events")).assumptionsStaleAt).toBe("2026-03-11T12:03:05.000Z");
 
 		expectOk(sidecars.get("agt_events").message(
 			makeEnvelope("agt_events", "progress", 4, "2026-03-11T12:03:06.000Z", {
@@ -522,6 +606,7 @@ describe("SubagentManager", () => {
 		));
 		expect(expectOk(manager.getRecord("agt_events")).state).toBe("running");
 		expect(expectOk(manager.getRecord("agt_events")).pendingInputRequest).toBeUndefined();
+		expect(expectOk(manager.getRecord("agt_events")).assumptionsStaleAt).toBeUndefined();
 
 		expectOk(sidecars.get("agt_events").message(
 			makeEnvelope("agt_events", "final_result", 5, "2026-03-11T12:03:07.000Z", {
@@ -612,6 +697,49 @@ describe("SubagentManager", () => {
 			"first best answer",
 			"better answer",
 		]);
+	});
+
+	it("keeps assumptionsStaleAt set across parent-authored controls until a newer explicit child report arrives", () => {
+		const { manager, sidecars } = createManager([
+			"2026-03-11T12:03:16.000Z",
+			"2026-03-11T12:03:17.000Z",
+		]);
+		const request = makeSpawnRequest("agt_stale_controls");
+		expectOk(manager.spawn(request));
+		expectOk(sidecars.get("agt_stale_controls").connect());
+		expectOk(sidecars.get("agt_stale_controls").message(
+			makeEnvelope("agt_stale_controls", "ready", 0, "2026-03-11T12:03:18.000Z", {
+				pid: 9108,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(sidecars.get("agt_stale_controls").message(
+			makeEnvelope("agt_stale_controls", "progress", 1, "2026-03-11T12:03:19.000Z", {
+				summary: "before intervention",
+			}),
+		));
+		expectOk(sidecars.get("agt_stale_controls").message(
+			makeEnvelope("agt_stale_controls", "user_intervened", 2, "2026-03-11T12:03:20.000Z", {
+				source: "tmux",
+				mode: "direct-chat",
+			}),
+		));
+
+		expectOk(manager.sendSteer("agt_stale_controls", "keep going"));
+		expectOk(manager.sendFollowUp("agt_stale_controls", "one more pass"));
+		expectOk(manager.sendPing("agt_stale_controls"));
+		expect(expectOk(manager.getRecord("agt_stale_controls")).assumptionsStaleAt).toBe("2026-03-11T12:03:20.000Z");
+
+		expectOk(sidecars.get("agt_stale_controls").message(
+			makeEnvelope("agt_stale_controls", "needs_input", 3, "2026-03-11T12:03:21.000Z", {
+				question: "Need confirmation",
+				kind: "question",
+			}),
+		));
+		const refreshed = expectOk(manager.getRecord("agt_stale_controls"));
+		expect(refreshed.assumptionsStaleAt).toBeUndefined();
+		expect(refreshed.pendingInputRequest?.summary).toBe("Need confirmation");
 	});
 
 	it("accepts final_result directly from ready and preserves the existing conversational posture", () => {

@@ -12,6 +12,7 @@ import {
 	type ParentControlKind,
 	type RuntimeLaunchSpec,
 	type RuntimeState,
+	type SubagentFocusTarget,
 	type SidecarControlMessage,
 	type SidecarEventMessage,
 	type SidecarProtocolMessage,
@@ -22,6 +23,7 @@ import {
 	type ValidationOutcome,
 	type ValidationResult,
 } from "./contracts.js";
+import { createSubagentFocusTarget } from "./node-runtime-adapters.js";
 
 export interface ManagedProcessExit {
 	code: number | null;
@@ -323,6 +325,32 @@ export class SubagentManager<TData = unknown> {
 
 	public listRecords(): ReadonlyArray<SubagentRecord<TData>> {
 		return Array.from(this.runtimes.values(), (runtime) => cloneValue(runtime.record));
+	}
+
+	public getFocusTarget(agentId: string): ValidationOutcome<SubagentFocusTarget> {
+		const runtimeResult = this.getRuntime(agentId);
+		if (!runtimeResult.ok) return runtimeResult;
+		const { record } = runtimeResult.value;
+
+		const availability = record.state === "stopped"
+			? "stopped"
+			: this.isDegraded(record)
+				? "degraded"
+				: "live";
+		const note = availability === "degraded"
+			? "sidecar trust is degraded; use the tmux target for manual observation or direct interaction"
+			: availability === "stopped"
+				? "child session is stopped; tmux target metadata is historical and may no longer resolve live"
+				: undefined;
+
+		return createSubagentFocusTarget({
+			agentId: record.id,
+			availability,
+			tmuxMode: record.tmuxMode,
+			tmuxTarget: record.tmuxTarget,
+			sessionPath: record.sessionPath,
+			note,
+		});
 	}
 
 	public handleSidecarConnect(agentId: string): ValidationOutcome<SubagentRecord<TData>> {
@@ -679,6 +707,7 @@ export class SubagentManager<TData = unknown> {
 		const nextRecord = {
 			...runtime.record,
 			state: nextState,
+			assumptionsStaleAt: undefined,
 			error: undefined,
 			lastProgressReport: this.makeReport(
 				"progress",
@@ -717,6 +746,7 @@ export class SubagentManager<TData = unknown> {
 		const nextRecord = {
 			...runtime.record,
 			state: nextState,
+			assumptionsStaleAt: undefined,
 			error: undefined,
 			pendingInputRequest: this.makeReport("needs_input", reportResult.value.summary, null, event.time),
 		};
@@ -759,6 +789,7 @@ export class SubagentManager<TData = unknown> {
 		];
 		const nextRecord = {
 			...runtime.record,
+			assumptionsStaleAt: undefined,
 			finalResult: nextHistory.at(-1),
 			finalResultHistory: nextHistory,
 		};
@@ -787,6 +818,7 @@ export class SubagentManager<TData = unknown> {
 
 		const nextRecord = {
 			...runtime.record,
+			assumptionsStaleAt: metadataResult.value.recordedAt,
 			userIntervenedHistory: [
 				...(runtime.record.userIntervenedHistory ?? []),
 				metadataResult.value as UserIntervenedMetadata,

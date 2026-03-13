@@ -1,5 +1,9 @@
 # pi-nexus
 
+## Local Runtime
+
+- Built `pi` CLI path for manual/runtime acceptance on this system: `/Users/ratulsarna/Developer/pi/pi-mono/node_modules/.bin/pi`
+
 ## Learning
 
 - Contracts must model real execution, not just typed shapes. If a launch spec or persisted record cannot safely drive the runtime, the contract is incomplete even if TypeScript accepts it.
