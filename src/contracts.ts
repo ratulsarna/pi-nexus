@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 export type TmuxMode = "pane" | "window";
@@ -20,6 +21,9 @@ export type RuntimeChildMode = "interactive-cli";
 export type ParentControlKind = "hello" | "steer" | "follow_up" | "interrupt" | "ping";
 export type ReportKind = "progress" | "final_result" | "needs_input";
 export const BOOTSTRAP_CONFIG_ENV_VAR = "PI_SUBAGENT_BOOTSTRAP_CONFIG";
+export const RAT131_PI_PATH_ENV_VAR = "RAT131_PI_PATH";
+export const RAT131_PI_BIN_DIR_ENV_VAR = "RAT131_PI_BIN_DIR";
+const CONTRACTS_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export interface RuntimeBootstrapConfig {
 	agentId: string;
@@ -563,6 +567,99 @@ function resolveExecutablePath(
 	return fail(`command could not be resolved from env.PATH: ${command}`);
 }
 
+function listPiFallbackBinDirs(cwd: string, moduleDir: string = CONTRACTS_MODULE_DIR): string[] {
+	return [
+		path.join(cwd, "node_modules", ".bin"),
+		path.resolve(cwd, "..", "pi-mono", "node_modules", ".bin"),
+		path.resolve(moduleDir, "..", "node_modules", ".bin"),
+		path.resolve(moduleDir, "..", "..", "pi-mono", "node_modules", ".bin"),
+	]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+		.filter((value, index, values) => values.indexOf(value) === index);
+}
+
+function prependPathEntries(
+	pathValue: string | undefined,
+	entries: ReadonlyArray<string>,
+): string {
+	return [...entries, pathValue]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+			.join(path.delimiter);
+}
+
+function appendPathEntries(
+	pathValue: string | undefined,
+	entries: ReadonlyArray<string>,
+): string {
+	return [pathValue, ...entries]
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
+		.join(path.delimiter);
+}
+
+function resolvePiCommandForLaunch(
+	env: Readonly<Record<string, string>>,
+	cwd: string,
+	moduleDir: string = CONTRACTS_MODULE_DIR,
+): ValidationOutcome<{ command: string; env: Readonly<Record<string, string>> }> {
+	const explicitPiPath = env[RAT131_PI_PATH_ENV_VAR];
+	if (typeof explicitPiPath === "string" && explicitPiPath.length > 0) {
+		if (!canExecutePath(explicitPiPath)) {
+			return fail(`${RAT131_PI_PATH_ENV_VAR} is not executable: ${explicitPiPath}`);
+		}
+		if (path.basename(explicitPiPath) !== "pi") {
+			return fail(`${RAT131_PI_PATH_ENV_VAR} must point to an executable named pi`);
+		}
+
+		const resolvedEnv = {
+			...env,
+			PATH: prependPathEntries(env.PATH, [path.dirname(explicitPiPath)]),
+		};
+		return ok({
+			command: explicitPiPath,
+			env: resolvedEnv,
+		});
+	}
+
+	const explicitPiBinDir = env[RAT131_PI_BIN_DIR_ENV_VAR];
+	if (typeof explicitPiBinDir === "string" && explicitPiBinDir.length > 0) {
+		const explicitPiCandidate = path.join(explicitPiBinDir, "pi");
+		if (!canExecutePath(explicitPiCandidate)) {
+			return fail(`${RAT131_PI_BIN_DIR_ENV_VAR} does not contain an executable pi: ${explicitPiCandidate}`);
+		}
+
+		const resolvedEnv = {
+			...env,
+			PATH: prependPathEntries(env.PATH, [explicitPiBinDir]),
+		};
+		return ok({
+			command: explicitPiCandidate,
+			env: resolvedEnv,
+		});
+	}
+
+	const directPathResolution = resolveExecutablePath("pi", env, cwd);
+	if (directPathResolution.ok) {
+		return ok({
+			command: directPathResolution.value,
+			env,
+		});
+	}
+
+	const fallbackBinDirs = listPiFallbackBinDirs(cwd, moduleDir)
+		.filter((dirPath) => isExistingDirectory(dirPath));
+	const resolvedEnv = {
+		...env,
+		PATH: appendPathEntries(env.PATH, fallbackBinDirs),
+	};
+	const resolvedCommandResult = resolveExecutablePath("pi", resolvedEnv, cwd);
+	if (!resolvedCommandResult.ok) return resolvedCommandResult;
+
+	return ok({
+		command: resolvedCommandResult.value,
+		env: resolvedEnv,
+	});
+}
+
 function validateLaunchEnvironment(
 	command: string,
 	env: Readonly<Record<string, string>>,
@@ -752,6 +849,7 @@ export function validateRuntimeBootstrapConfig(input: unknown): ValidationOutcom
 export function createRuntimeLaunchSpec(
 	bootstrap: unknown,
 	bootstrapConfigPath: string,
+	options?: { moduleDir?: string },
 ): ValidationOutcome<RuntimeLaunchSpec> {
 	const bootstrapResult = validateRuntimeBootstrapConfig(bootstrap);
 	if (!bootstrapResult.ok) return bootstrapResult;
@@ -783,21 +881,25 @@ export function createRuntimeLaunchSpec(
 	]);
 	if (distinctPathError) return distinctPathError;
 
-	const env = {
+	const parentEnv = {
 		...getParentProcessEnv(),
 		[BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath,
 	};
-	const envError = validateLaunchEnvironment("pi", env);
+	const resolvedPiResult = resolvePiCommandForLaunch(
+		parentEnv,
+		bootstrapConfig.cwd,
+		options?.moduleDir,
+	);
+	if (!resolvedPiResult.ok) return resolvedPiResult;
+	const envError = validateLaunchEnvironment("pi", resolvedPiResult.value.env);
 	if (envError) return envError;
-	const resolvedCommandResult = resolveExecutablePath("pi", env, bootstrapConfig.cwd);
-	if (!resolvedCommandResult.ok) return resolvedCommandResult;
 
 	return ok({
 		agentId: bootstrapConfig.agentId,
 		initialPrompt: bootstrapConfig.initialPrompt,
-		command: resolvedCommandResult.value,
+		command: resolvedPiResult.value.command,
 		args: ["--session", bootstrapConfig.sessionPath, "--extension", bootstrapConfig.bootstrapExtensionPath],
-		env,
+		env: resolvedPiResult.value.env,
 		cwd: bootstrapConfig.cwd,
 		sessionPath: bootstrapConfig.sessionPath,
 		socketPath: bootstrapConfig.socketPath,

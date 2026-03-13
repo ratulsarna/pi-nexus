@@ -6,6 +6,8 @@ import path from "node:path";
 
 import {
 	BOOTSTRAP_CONFIG_ENV_VAR,
+	RAT131_PI_BIN_DIR_ENV_VAR,
+	RAT131_PI_PATH_ENV_VAR,
 	assertRuntimeStateTransition,
 	canTransitionRuntimeState,
 	createRuntimeLaunchSpec,
@@ -495,10 +497,17 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 
 	it("fails launch-spec creation when relative pi depends on missing PATH", () => {
 		const originalPath = process.env.PATH;
+		const isolatedModuleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nexus-isolated-module-root-"));
+		const isolatedModuleDir = path.join(isolatedModuleRoot, "dist");
+		fs.mkdirSync(isolatedModuleDir, { recursive: true });
 		delete process.env.PATH;
 
 		try {
-			const result = createRuntimeLaunchSpec(makeBootstrap(), fakeBootstrapConfigPath);
+			const result = createRuntimeLaunchSpec(
+				makeBootstrap(),
+				fakeBootstrapConfigPath,
+				{ moduleDir: isolatedModuleDir },
+			);
 			expect(result).toEqual({
 				ok: false,
 				error: "env.PATH must be a non-empty string",
@@ -509,6 +518,7 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 			} else {
 				process.env.PATH = originalPath;
 			}
+			fs.rmSync(isolatedModuleRoot, { recursive: true, force: true });
 		}
 	});
 
@@ -791,6 +801,125 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 				process.env.PATH = originalPath;
 			}
 			fs.rmSync(launchRepoDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves pi from the sibling pi-mono node_modules bin when PATH does not contain it", () => {
+		const originalPath = process.env.PATH;
+		const launchRootDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nexus-launch-root-"));
+		const launchRepoDir = path.join(launchRootDir, "pi-nexus");
+		const siblingPiMonoBinDir = path.join(launchRootDir, "pi-mono", "node_modules", ".bin");
+		const siblingPiPath = path.join(siblingPiMonoBinDir, "pi");
+		const siblingBootstrapPath = path.join(launchRepoDir, "bootstrap.json");
+		const siblingBootstrapExtensionPath = path.join(launchRepoDir, "subagent-bootstrap.ts");
+		fs.mkdirSync(launchRepoDir, { recursive: true });
+		fs.mkdirSync(siblingPiMonoBinDir, { recursive: true });
+		fs.writeFileSync(siblingPiPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		fs.writeFileSync(siblingBootstrapExtensionPath, "export {};\n");
+		fs.writeFileSync(
+			siblingBootstrapPath,
+			`${JSON.stringify(makeBootstrap({
+				cwd: launchRepoDir,
+				bootstrapExtensionPath: siblingBootstrapExtensionPath,
+			}), null, 2)}\n`,
+		);
+		process.env.PATH = "";
+
+		try {
+			const result = createRuntimeLaunchSpec(
+				makeBootstrap({
+					cwd: launchRepoDir,
+					bootstrapExtensionPath: siblingBootstrapExtensionPath,
+				}),
+				siblingBootstrapPath,
+			);
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(fs.realpathSync.native(result.value.command)).toBe(fs.realpathSync.native(siblingPiPath));
+			expect(result.value.env.PATH.split(path.delimiter)[0]).toBe(siblingPiMonoBinDir);
+		} finally {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+			fs.rmSync(launchRootDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves pi from the module-relative sibling pi-mono bin when cwd is unrelated", () => {
+		const originalPath = process.env.PATH;
+		const launchRootDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nexus-module-root-"));
+		const unrelatedCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nexus-unrelated-cwd-"));
+		const fakeModuleDir = path.join(launchRootDir, "pi-nexus", "dist");
+		const siblingPiMonoBinDir = path.join(launchRootDir, "pi-mono", "node_modules", ".bin");
+		const siblingPiPath = path.join(siblingPiMonoBinDir, "pi");
+		const bootstrapExtensionPath = path.join(unrelatedCwd, "subagent-bootstrap.ts");
+		const bootstrapPath = path.join(unrelatedCwd, "bootstrap.json");
+		fs.mkdirSync(fakeModuleDir, { recursive: true });
+		fs.mkdirSync(siblingPiMonoBinDir, { recursive: true });
+		fs.writeFileSync(siblingPiPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		fs.writeFileSync(bootstrapExtensionPath, "export {};\n");
+		fs.writeFileSync(
+			bootstrapPath,
+			`${JSON.stringify(makeBootstrap({
+				cwd: unrelatedCwd,
+				bootstrapExtensionPath,
+			}), null, 2)}\n`,
+		);
+		process.env.PATH = "";
+
+		try {
+			const result = createRuntimeLaunchSpec(
+				makeBootstrap({
+					cwd: unrelatedCwd,
+					bootstrapExtensionPath,
+				}),
+				bootstrapPath,
+				{ moduleDir: fakeModuleDir },
+			);
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(fs.realpathSync.native(result.value.command)).toBe(fs.realpathSync.native(siblingPiPath));
+			expect(result.value.env.PATH.split(path.delimiter)[0]).toBe(siblingPiMonoBinDir);
+		} finally {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+			fs.rmSync(launchRootDir, { recursive: true, force: true });
+			fs.rmSync(unrelatedCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("prefers RAT131_PI_PATH when provided", () => {
+		const originalOverride = process.env[RAT131_PI_PATH_ENV_VAR];
+		const originalBinOverride = process.env[RAT131_PI_BIN_DIR_ENV_VAR];
+		const overrideDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nexus-pi-override-"));
+		const overridePiPath = path.join(overrideDir, "pi");
+		fs.writeFileSync(overridePiPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		process.env[RAT131_PI_PATH_ENV_VAR] = overridePiPath;
+		process.env[RAT131_PI_BIN_DIR_ENV_VAR] = path.join(fakeRepoDir, "missing-bin-dir");
+
+		try {
+			const result = createRuntimeLaunchSpec(makeBootstrap(), fakeBootstrapConfigPath);
+			expect(result.ok).toBe(true);
+			if (!result.ok) return;
+			expect(fs.realpathSync.native(result.value.command)).toBe(fs.realpathSync.native(overridePiPath));
+			expect(result.value.env.PATH.split(path.delimiter)[0]).toBe(overrideDir);
+		} finally {
+			if (originalOverride === undefined) {
+				delete process.env[RAT131_PI_PATH_ENV_VAR];
+			} else {
+				process.env[RAT131_PI_PATH_ENV_VAR] = originalOverride;
+			}
+			if (originalBinOverride === undefined) {
+				delete process.env[RAT131_PI_BIN_DIR_ENV_VAR];
+			} else {
+				process.env[RAT131_PI_BIN_DIR_ENV_VAR] = originalBinOverride;
+			}
+			fs.rmSync(overrideDir, { recursive: true, force: true });
 		}
 	});
 
