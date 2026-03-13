@@ -292,6 +292,8 @@ class SubagentBootstrapSession {
 			return;
 		}
 
+		// pi emits "input" only from submitted prompt paths, so interactive input
+		// reaching this hook is already user-submitted rather than keystroke churn.
 		const inputOrigin =
 			event.source === "interactive"
 				? { origin: "interactive-user" as const, submitted: true }
@@ -439,7 +441,6 @@ class SubagentBootstrapSession {
 				this.completeInterrupt();
 			}
 		} catch (error) {
-			this.interruptPending = false;
 			const reason = `failed to inspect child idle state after interrupt: ${normalizeError(error).message}`;
 			this.sendRecoverableError(reason);
 			return;

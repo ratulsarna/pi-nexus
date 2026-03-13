@@ -735,6 +735,42 @@ describe("installSubagentBootstrapExtension", () => {
 		expect(socket.destroyed).toBe(false);
 	});
 
+	it("retains interrupt completion fallback when idle probing fails before a later agent_end", async () => {
+		const { bootstrap, socket, pi } = await startReadyBootstrapSession(
+			"agt_child_interrupt_idle_probe_then_end",
+			"2026-03-12T10:09:44.500Z",
+		);
+		const ctx = new FakeExtensionContext({
+			throwOnIsIdle: new Error("idle probe exploded"),
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "interrupt",
+			seq: 1,
+			time: "2026-03-12T10:09:45.500Z",
+			payload: {},
+		});
+
+		await pi.emit("agent_end", {}, ctx);
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "error", "state"]);
+		expect(sent[1]?.payload).toEqual({
+			message: "failed to inspect child idle state after interrupt: idle probe exploded",
+			fatal: false,
+		});
+		expect(sent[2]?.payload).toEqual({
+			status: "waiting",
+		});
+		expect(ctx.abortCalls).toBe(1);
+		expect(ctx.shutdownCalls).toBe(0);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
+	});
+
 	it("surfaces a recoverable error when a malformed report arrives after ready", async () => {
 		const { socket, pi } = await startReadyBootstrapSession(
 			"agt_child_report_error",
