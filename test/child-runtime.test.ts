@@ -77,6 +77,7 @@ class FakeExtensionContext {
 		private readonly options: {
 			onAbort?: () => void;
 			throwOnAbort?: Error;
+			throwOnIsIdle?: Error;
 			throwOnShutdown?: Error;
 		} = {},
 	) {}
@@ -90,6 +91,10 @@ class FakeExtensionContext {
 	}
 
 	public isIdle(): boolean {
+		if (this.options.throwOnIsIdle) {
+			throw this.options.throwOnIsIdle;
+		}
+
 		return this.idle;
 	}
 
@@ -679,6 +684,55 @@ describe("installSubagentBootstrapExtension", () => {
 			source: "tmux",
 			mode: "direct-chat",
 		});
+	});
+
+	it("ignores malformed input event payloads without breaking the post-ready session", async () => {
+		const { socket, pi, ctx } = await startReadyBootstrapSession(
+			"agt_child_malformed_input_event",
+			"2026-03-12T10:09:42.000Z",
+		);
+
+		await pi.emit("input", null, ctx);
+		await pi.emit("input", 42, ctx);
+		await pi.emit("input", { source: "unknown" }, ctx);
+		await pi.emit("input", { source: "interactive" }, ctx);
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "user_intervened"]);
+		expect(ctx.shutdownCalls).toBe(0);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
+	});
+
+	it("keeps the post-ready session alive when interrupt idle probing fails recoverably", async () => {
+		const { bootstrap, socket, pi } = await startReadyBootstrapSession(
+			"agt_child_interrupt_idle_probe_error",
+			"2026-03-12T10:09:44.000Z",
+		);
+		const ctx = new FakeExtensionContext({
+			throwOnIsIdle: new Error("idle probe exploded"),
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "interrupt",
+			seq: 1,
+			time: "2026-03-12T10:09:45.000Z",
+			payload: {},
+		});
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "error"]);
+		expect(sent[1]?.payload).toEqual({
+			message: "failed to inspect child idle state after interrupt: idle probe exploded",
+			fatal: false,
+		});
+		expect(ctx.abortCalls).toBe(1);
+		expect(ctx.shutdownCalls).toBe(0);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
 	});
 
 	it("surfaces a recoverable error when a malformed report arrives after ready", async () => {

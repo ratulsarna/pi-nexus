@@ -77,6 +77,10 @@ function normalizeError(error: unknown): Error {
 	return new Error(String(error));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function loadBootstrapConfig(
 	env: Readonly<Record<string, string | undefined>>,
 	readConfigText: (configPath: string) => string,
@@ -277,8 +281,14 @@ class SubagentBootstrapSession {
 		this.completeInterrupt();
 	}
 
-	public handleInput(event: { source?: unknown }): void {
+	public handleInput(event: unknown): void {
 		if (!this.ready) {
+			return;
+		}
+		if (!isRecord(event)) {
+			return;
+		}
+		if (event.source !== "interactive" && event.source !== "rpc" && event.source !== "extension") {
 			return;
 		}
 
@@ -424,8 +434,15 @@ class SubagentBootstrapSession {
 			return;
 		}
 
-		if (this.currentState === "needs_input" || this.ctx.isIdle()) {
-			this.completeInterrupt();
+		try {
+			if (this.currentState === "needs_input" || this.ctx.isIdle()) {
+				this.completeInterrupt();
+			}
+		} catch (error) {
+			this.interruptPending = false;
+			const reason = `failed to inspect child idle state after interrupt: ${normalizeError(error).message}`;
+			this.sendRecoverableError(reason);
+			return;
 		}
 	}
 
@@ -576,7 +593,7 @@ export function installSubagentBootstrapExtension(
 	});
 
 	pi.on("input", async (event) => {
-		activeSession?.handleInput(event as { source?: unknown });
+		activeSession?.handleInput(event);
 	});
 
 	pi.on("session_shutdown", async () => {
