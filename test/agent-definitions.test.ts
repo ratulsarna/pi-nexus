@@ -172,12 +172,13 @@ Project explore instructions.`,
 		expect(resolvedResult.value.definitionPath).toBe(projectDefinitionPath);
 	});
 
-	it("rejects unsupported legacy fields", () => {
-		writeProjectAgent(
+	it("ignores unsupported legacy fields", () => {
+		const definitionPath = writeProjectAgent(
 			"auditor",
 			`---
 description: Auditor
 tools: read, grep
+model: anthropic/claude-sonnet
 ---
 
 Audit the repository.`,
@@ -187,10 +188,21 @@ Audit the repository.`,
 			cwd: fakeRepoDir,
 			homeDir: fakeHomeDir,
 		});
-		expect(registryResult).toEqual({
-			ok: false,
-			error: "unsupported agent definition field: tools",
-		});
+		expect(registryResult.ok).toBe(true);
+		if (!registryResult.ok) {
+			return;
+		}
+
+		const resolvedResult = registryResult.value.resolve("auditor");
+		expect(resolvedResult.ok).toBe(true);
+		if (!resolvedResult.ok) {
+			return;
+		}
+
+		expect(resolvedResult.value.name).toBe("auditor");
+		expect(resolvedResult.value.description).toBe("Auditor");
+		expect(resolvedResult.value.instructions).toContain("Audit the repository.");
+		expect(resolvedResult.value.definitionPath).toBe(definitionPath);
 	});
 
 	it("allows a disabled override with no body and hard-fails resolution", () => {
@@ -252,7 +264,7 @@ describe("AgentDefinitionRegistry.refresh", () => {
 		});
 	});
 
-	it("does not poison previously loaded definitions when a later refresh fails", () => {
+	it("refreshes successfully when later files add unknown frontmatter fields", () => {
 		const registry = makeRegistry();
 		const firstRefresh = registry.refresh();
 		expect(firstRefresh.ok).toBe(true);
@@ -269,10 +281,7 @@ Broken definition.`,
 		);
 
 		const secondRefresh = registry.refresh();
-		expect(secondRefresh).toEqual({
-			ok: false,
-			error: "unsupported agent definition field: model",
-		});
+		expect(secondRefresh.ok).toBe(true);
 
 		const resolvedResult = registry.resolve("Plan");
 		expect(resolvedResult.ok).toBe(true);
@@ -282,6 +291,7 @@ Broken definition.`,
 
 		expect(resolvedResult.value.name).toBe("Plan");
 		expect(registry.listAvailableDefinitions().map((definition) => definition.name)).toContain("Plan");
+		expect(registry.resolve("broken").ok).toBe(true);
 	});
 });
 

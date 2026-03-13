@@ -560,6 +560,7 @@ function formatFocusText(
 		`Tmux mode: ${focusTarget.tmuxMode}`,
 		`Tmux target: ${focusTarget.tmuxTarget}`,
 		`Session path: ${focusTarget.sessionPath}`,
+		"Run the focus command in your shell to attach. /subagents focus only prints the action; it does not switch this Pi terminal.",
 		`Focus command: ${focusTarget.focusCommand}`,
 		focusTarget.note ? `Note: ${focusTarget.note}` : undefined,
 	].filter((entry): entry is string => entry !== undefined).join("\n");

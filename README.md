@@ -59,13 +59,13 @@ Named agent definitions are loaded from:
 - `.pi/agents/*.md` in the current repo
 - `~/.pi/agent/agents/*.md` globally
 
-Supported frontmatter is intentionally strict:
+Supported frontmatter keys used by this loader are:
 - `description`
 - `display_name`
 - `prompt_mode`
 - `enabled`
 
-Unsupported legacy fields are rejected instead of being silently ignored.
+Unknown frontmatter keys are ignored.
 
 Focus intentionally does not take over the current `pi` terminal. `/subagents focus <agentId>` prints the exact tmux action so you can jump into the live child yourself, including nested-tmux-safe behavior when `pi` is already running inside tmux.
 

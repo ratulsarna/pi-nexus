@@ -418,7 +418,7 @@ function splitFrontmatterDocument(documentText: string): ValidationOutcome<{
 
 		const key = trimmed.slice(0, separatorIndex).trim();
 		if (!SUPPORTED_AGENT_DEFINITION_FRONTMATTER_FIELDS.has(key)) {
-			return fail(`unsupported agent definition field: ${key}`);
+			continue;
 		}
 		if (Object.prototype.hasOwnProperty.call(frontmatter, key)) {
 			return fail(`duplicate agent definition field: ${key}`);
