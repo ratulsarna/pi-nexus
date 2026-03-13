@@ -607,6 +607,66 @@ function validateNonNegativeSafeInteger(field: string, value: unknown): Validati
 	return undefined;
 }
 
+export interface ParsedTmuxFocusIdentity {
+	sessionTarget: string;
+	windowTarget: string;
+	paneTarget?: string;
+}
+
+export function parseTmuxFocusIdentity(
+	tmuxMode: TmuxMode,
+	tmuxTarget: string,
+): ValidationOutcome<ParsedTmuxFocusIdentity> {
+	const colonIndex = tmuxTarget.indexOf(":");
+	if (colonIndex <= 0 || colonIndex === tmuxTarget.length - 1) {
+		return fail("tmuxTarget must include a session and target segment");
+	}
+
+	const sessionTarget = tmuxTarget.slice(0, colonIndex).trim();
+	const targetRemainder = tmuxTarget.slice(colonIndex + 1).trim();
+	if (sessionTarget.length === 0 || targetRemainder.length === 0) {
+		return fail("tmuxTarget must include a session and target segment");
+	}
+
+	if (tmuxMode === "window") {
+		return ok({
+			sessionTarget,
+			windowTarget: tmuxTarget.trim(),
+		});
+	}
+
+	const paneSeparatorIndex = targetRemainder.lastIndexOf(".");
+	if (paneSeparatorIndex <= 0 || paneSeparatorIndex === targetRemainder.length - 1) {
+		return fail("pane tmuxTarget must include both window and pane selectors");
+	}
+
+	const windowSelector = targetRemainder.slice(0, paneSeparatorIndex).trim();
+	const paneSelector = targetRemainder.slice(paneSeparatorIndex + 1).trim();
+	if (windowSelector.length === 0 || paneSelector.length === 0) {
+		return fail("pane tmuxTarget must include both window and pane selectors");
+	}
+
+	return ok({
+		sessionTarget,
+		windowTarget: `${sessionTarget}:${windowSelector}`,
+		paneTarget: tmuxTarget.trim(),
+	});
+}
+
+function validateParsedTmuxTarget(field: string, tmuxMode: TmuxMode, tmuxTarget: string): ValidationError | undefined {
+	const parsedTargetResult = parseTmuxFocusIdentity(tmuxMode, tmuxTarget);
+	if (parsedTargetResult.ok) {
+		return undefined;
+	}
+	if (parsedTargetResult.error === "tmuxTarget must include a session and target segment") {
+		return fail(`${field} must include a session and target segment`);
+	}
+	if (parsedTargetResult.error === "pane tmuxTarget must include both window and pane selectors") {
+		return fail(`${field} must include both window and pane selectors`);
+	}
+	return fail(`${field} is invalid`);
+}
+
 export function validateRuntimeBootstrapConfig(input: unknown): ValidationOutcome<RuntimeBootstrapConfig> {
 	if (!isRecord(input)) {
 		return fail("bootstrap config must be an object");
@@ -669,6 +729,8 @@ export function validateRuntimeBootstrapConfig(input: unknown): ValidationOutcom
 	if (input.tmuxMode !== "pane" && input.tmuxMode !== "window") {
 		return fail("tmuxMode must be either \"pane\" or \"window\"");
 	}
+	const tmuxTargetShapeError = validateParsedTmuxTarget("tmuxTarget", input.tmuxMode, input.tmuxTarget as string);
+	if (tmuxTargetShapeError) return tmuxTargetShapeError;
 
 	if (input.childMode !== "interactive-cli") {
 		return fail("childMode must be \"interactive-cli\"");
@@ -859,6 +921,8 @@ export function validateRuntimeLaunchSpec(input: unknown): ValidationOutcome<Run
 		return fail("tmuxMode must be either \"pane\" or \"window\"");
 	}
 	if (!isNonEmptyTrimmedString(input.tmuxTarget)) return fail("tmuxTarget must be a non-empty string");
+	const tmuxTargetShapeError = validateParsedTmuxTarget("tmuxTarget", input.tmuxMode, input.tmuxTarget);
+	if (tmuxTargetShapeError) return tmuxTargetShapeError;
 	if (input.childMode !== "interactive-cli") return fail("childMode must be \"interactive-cli\"");
 
 	const bootstrapConfigResult = readJsonFile(bootstrapConfigPath);
@@ -1082,6 +1146,12 @@ function validateSidecarPayload<TData = unknown>(
 			if (payload.mode !== "pane" && payload.mode !== "window") {
 				return fail("hello.payload.mode must be either \"pane\" or \"window\"");
 			}
+			const tmuxTargetShapeError = validateParsedTmuxTarget(
+				"hello.payload.tmuxTarget",
+				payload.mode,
+				payload.tmuxTarget as string,
+			);
+			if (tmuxTargetShapeError) return tmuxTargetShapeError;
 
 			return ok({
 				sessionPath: payload.sessionPath as string,
@@ -1362,6 +1432,12 @@ export function validateSubagentFocusTarget(input: unknown): ValidationOutcome<S
 
 	const tmuxTargetError = validateRequiredText("focusTarget.tmuxTarget", input.tmuxTarget);
 	if (tmuxTargetError) return tmuxTargetError;
+	const tmuxTargetShapeError = validateParsedTmuxTarget(
+		"focusTarget.tmuxTarget",
+		input.tmuxMode,
+		input.tmuxTarget as string,
+	);
+	if (tmuxTargetShapeError) return tmuxTargetShapeError;
 
 	const sessionPathError = validateRequiredPath("focusTarget.sessionPath", input.sessionPath);
 	if (sessionPathError) return sessionPathError;
@@ -1413,6 +1489,8 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 	if (record.tmuxMode !== "pane" && record.tmuxMode !== "window") {
 		return fail("tmuxMode must be either \"pane\" or \"window\"");
 	}
+	const tmuxTargetShapeError = validateParsedTmuxTarget("tmuxTarget", record.tmuxMode, record.tmuxTarget);
+	if (tmuxTargetShapeError) return tmuxTargetShapeError;
 	if (record.childMode !== "interactive-cli") {
 		return fail("childMode must be \"interactive-cli\"");
 	}

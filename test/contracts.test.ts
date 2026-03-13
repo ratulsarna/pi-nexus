@@ -308,6 +308,13 @@ describe("validateRuntimeBootstrapConfig", () => {
 			error: "socketPath must not be a stale unix socket",
 		});
 	});
+
+	it("rejects bootstrap configs whose tmuxTarget cannot drive the supported focus surface", () => {
+		expect(validateRuntimeBootstrapConfig(makeBootstrap({ tmuxTarget: "%42" }))).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
+		});
+	});
 });
 
 describe("validateSubagentFocusTarget", () => {
@@ -350,6 +357,22 @@ describe("validateSubagentFocusTarget", () => {
 			error: "focusTarget.availability must be one of: live, degraded, stopped",
 		});
 	});
+
+	it("rejects focus targets whose tmuxTarget cannot drive the supported focus surface", () => {
+		expect(
+			validateSubagentFocusTarget({
+				agentId: "agt_focus",
+				availability: "live",
+				tmuxMode: "window",
+				tmuxTarget: "@12",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t '@12'",
+			}),
+		).toEqual({
+			ok: false,
+			error: "focusTarget.tmuxTarget must include a session and target segment",
+		});
+	});
 });
 
 describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
@@ -375,6 +398,17 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 			[BOOTSTRAP_CONFIG_ENV_VAR]: fakeBootstrapConfigPath,
 		});
 		expect(result.value.bootstrapExtensionPath).toBe(fakeBootstrapExtensionPath);
+	});
+
+	it("rejects launch-spec creation when tmuxTarget cannot drive the supported focus surface", () => {
+		const bootstrapPath = path.join(fakeRepoDir, "invalid-tmux-target-bootstrap.json");
+		const bootstrap = makeBootstrap({ tmuxTarget: "child-pane-only" });
+		fs.writeFileSync(bootstrapPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		expect(createRuntimeLaunchSpec(bootstrap, bootstrapPath)).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
+		});
 	});
 
 	it("keeps dash-prefixed initial prompts in bootstrap config instead of argv", () => {
@@ -1167,6 +1201,16 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 		expect(result).toEqual({
 			ok: false,
 			error: "env must be a string-to-string map",
+		});
+	});
+
+	it("rejects persisted launch specs whose tmuxTarget cannot drive the supported focus surface", () => {
+		const created = createRuntimeLaunchSpec(makeBootstrap(), fakeBootstrapConfigPath);
+		if (!created.ok) throw new Error(created.error);
+
+		expect(validateRuntimeLaunchSpec({ ...created.value, tmuxTarget: "@14" })).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
 		});
 	});
 });
@@ -2027,6 +2071,13 @@ describe("validateSubagentRecord", () => {
 
 	it("accepts a minimal valid record", () => {
 		expect(validateSubagentRecord(makeRecord()).ok).toBe(true);
+	});
+
+	it("rejects persisted records whose tmuxTarget cannot drive the supported focus surface", () => {
+		expect(validateSubagentRecord(makeRecord({ tmuxTarget: "%42" }))).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
+		});
 	});
 
 	it("accepts current-best finalResult plus append-only finalResultHistory", () => {

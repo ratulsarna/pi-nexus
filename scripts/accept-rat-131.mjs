@@ -8,14 +8,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const distIndexPath = path.join(repoRoot, "dist", "index.js");
 const bootstrapExtensionPath = path.join(repoRoot, "dist", "subagent-bootstrap-extension.js");
 const artifactDir = path.join(os.homedir(), ".ai", "pi-nexus", "RAT-131");
-const logPath = path.join(artifactDir, "manual-acceptance-rat-131.log");
 const runId = Date.now().toString(36);
 const runtimeDir = path.join(artifactDir, `r-${runId}`);
+const logPath = path.join(runtimeDir, "manual-acceptance-rat-131.log");
 const summaryPath = path.join(runtimeDir, "summary.json");
 const runFocusProof = process.env.RAT131_RUN_FOCUS_PROOF === "1";
 const piPathOverride = process.env.RAT131_PI_PATH;
+const piBinDirOverride = process.env.RAT131_PI_BIN_DIR;
 const candidatePiBinDirs = [
-	process.env.RAT131_PI_BIN_DIR,
+	piBinDirOverride,
 	path.join(repoRoot, "node_modules", ".bin"),
 	path.resolve(repoRoot, "..", "pi-mono", "node_modules", ".bin"),
 ].filter((value, index, values) => typeof value === "string" && value.length > 0 && values.indexOf(value) === index);
@@ -54,6 +55,26 @@ function canExecute(filePath) {
 	} catch {
 		return false;
 	}
+}
+
+function sameExecutable(leftPath, rightPath) {
+	try {
+		return fs.realpathSync.native(leftPath) === fs.realpathSync.native(rightPath);
+	} catch {
+		return path.resolve(leftPath) === path.resolve(rightPath);
+	}
+}
+
+function makeAuthoritativePiShim(targetPath) {
+	const shimDir = path.join(runtimeDir, "pi-bin");
+	const shimPath = path.join(shimDir, "pi");
+	fs.mkdirSync(shimDir, { recursive: true });
+	fs.writeFileSync(
+		shimPath,
+		`#!/bin/sh\nexec ${JSON.stringify(targetPath)} "$@"\n`,
+		{ mode: 0o755 },
+	);
+	return shimPath;
 }
 
 function run(command, args, options = {}) {
@@ -128,19 +149,34 @@ async function waitForProcessExit(child, timeoutMs, label) {
 }
 
 function ensureBuiltPiOnPath() {
+	let expectedLaunchPiPath;
 	if (typeof piPathOverride === "string" && piPathOverride.length > 0) {
 		if (!canExecute(piPathOverride)) {
 			fail(`RAT131_PI_PATH is not executable: ${piPathOverride}`);
 		}
-		const overrideBinDir = path.dirname(piPathOverride);
+		expectedLaunchPiPath = path.basename(piPathOverride) === "pi"
+			? piPathOverride
+			: makeAuthoritativePiShim(piPathOverride);
+		const overrideBinDir = path.dirname(expectedLaunchPiPath);
 		process.env.PATH = [overrideBinDir, process.env.PATH]
 			.filter((value) => typeof value === "string" && value.length > 0)
 			.join(path.delimiter);
-		const version = run(piPathOverride, ["--version"], {
+		const resolvedPiPath = requireExecutable("pi");
+		if (!sameExecutable(resolvedPiPath, expectedLaunchPiPath)) {
+			fail(`RAT131_PI_PATH did not become the authoritative launch pi: resolved ${resolvedPiPath}`);
+		}
+		const version = run(resolvedPiPath, ["--version"], {
 			env: process.env,
 		});
-		log(`pi: ${piPathOverride} (${version}) [override]`);
-		return piPathOverride;
+		log(`pi: ${resolvedPiPath} (${version}) [override from ${piPathOverride}]`);
+		return resolvedPiPath;
+	}
+
+	if (typeof piBinDirOverride === "string" && piBinDirOverride.length > 0) {
+		expectedLaunchPiPath = path.join(piBinDirOverride, "pi");
+		if (!canExecute(expectedLaunchPiPath)) {
+			fail(`RAT131_PI_BIN_DIR does not contain an executable pi: ${expectedLaunchPiPath}`);
+		}
 	}
 
 	const candidateExistingBinDirs = candidatePiBinDirs.filter((binDir) => fs.existsSync(binDir));
@@ -149,6 +185,9 @@ function ensureBuiltPiOnPath() {
 		.join(path.delimiter);
 
 	const resolvedPiPath = requireExecutable("pi");
+	if (expectedLaunchPiPath && !sameExecutable(resolvedPiPath, expectedLaunchPiPath)) {
+		fail(`RAT131_PI_BIN_DIR did not become the authoritative launch pi: resolved ${resolvedPiPath}`);
+	}
 	const version = run(resolvedPiPath, ["--version"], {
 		env: process.env,
 	});
