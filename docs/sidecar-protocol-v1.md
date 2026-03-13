@@ -265,8 +265,8 @@ Rules:
 
 - no transcript included by default
 - emitted only on positive evidence of submitted direct user input in the child session
-- parent marks previous assumptions as potentially stale
-- parent waits for the next explicit `progress` or `final_result`
+- parent records `assumptionsStaleAt`
+- parent waits for the next explicit child-authored `progress`, `needs_input`, or `final_result`
 
 ### `state`
 
@@ -374,12 +374,19 @@ The sidecar is authoritative for:
 - current-best final result plus preserved `final_result` history
 - explicit child-authored lifecycle posture
 - user intervention metadata history
+- the stale-after-intervention signal carried as `assumptionsStaleAt`
 
 The tmux terminal is authoritative for:
 
 - live human-visible interaction
 - live streaming UI
 - exact in-flight sub-agent experience
+
+The supported parent-facing focus surface is authoritative for:
+
+- structured tmux target metadata
+- one ready-to-run focus/attach command
+- explicit `live`, `degraded`, and `stopped` focus availability semantics
 
 ## Failure semantics
 

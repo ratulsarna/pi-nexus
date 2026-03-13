@@ -20,6 +20,7 @@ import {
 	validateSidecarHandshake,
 	validateMonotonicSeqAcceptance,
 	validateSidecarProtocolEnvelope,
+	validateSubagentFocusTarget,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
 	type RuntimeState,
@@ -307,6 +308,71 @@ describe("validateRuntimeBootstrapConfig", () => {
 			error: "socketPath must not be a stale unix socket",
 		});
 	});
+
+	it("rejects bootstrap configs whose tmuxTarget cannot drive the supported focus surface", () => {
+		expect(validateRuntimeBootstrapConfig(makeBootstrap({ tmuxTarget: "%42" }))).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
+		});
+	});
+});
+
+describe("validateSubagentFocusTarget", () => {
+	it("accepts a live focus target", () => {
+		expect(
+			validateSubagentFocusTarget({
+				agentId: "agt_focus",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t 'main' \\; select-window -t 'main:2' \\; select-pane -t 'main:2.1'",
+			}),
+		).toEqual({
+			ok: true,
+			value: {
+				agentId: "agt_focus",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t 'main' \\; select-window -t 'main:2' \\; select-pane -t 'main:2.1'",
+				note: undefined,
+			},
+		});
+	});
+
+	it("rejects malformed focus target payloads", () => {
+		expect(
+			validateSubagentFocusTarget({
+				agentId: "agt_focus",
+				availability: "unknown",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t 'main'",
+			}),
+		).toEqual({
+			ok: false,
+			error: "focusTarget.availability must be one of: live, degraded, stopped",
+		});
+	});
+
+	it("rejects focus targets whose tmuxTarget cannot drive the supported focus surface", () => {
+		expect(
+			validateSubagentFocusTarget({
+				agentId: "agt_focus",
+				availability: "live",
+				tmuxMode: "window",
+				tmuxTarget: "@12",
+				sessionPath: path.join(fakeRuntimeDir, "focus.session.jsonl"),
+				focusCommand: "tmux attach-session -t '@12'",
+			}),
+		).toEqual({
+			ok: false,
+			error: "focusTarget.tmuxTarget must include a session and target segment",
+		});
+	});
 });
 
 describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
@@ -332,6 +398,17 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 			[BOOTSTRAP_CONFIG_ENV_VAR]: fakeBootstrapConfigPath,
 		});
 		expect(result.value.bootstrapExtensionPath).toBe(fakeBootstrapExtensionPath);
+	});
+
+	it("rejects launch-spec creation when tmuxTarget cannot drive the supported focus surface", () => {
+		const bootstrapPath = path.join(fakeRepoDir, "invalid-tmux-target-bootstrap.json");
+		const bootstrap = makeBootstrap({ tmuxTarget: "child-pane-only" });
+		fs.writeFileSync(bootstrapPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		expect(createRuntimeLaunchSpec(bootstrap, bootstrapPath)).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
+		});
 	});
 
 	it("keeps dash-prefixed initial prompts in bootstrap config instead of argv", () => {
@@ -1124,6 +1201,16 @@ describe("createRuntimeLaunchSpec / validateRuntimeLaunchSpec", () => {
 		expect(result).toEqual({
 			ok: false,
 			error: "env must be a string-to-string map",
+		});
+	});
+
+	it("rejects persisted launch specs whose tmuxTarget cannot drive the supported focus surface", () => {
+		const created = createRuntimeLaunchSpec(makeBootstrap(), fakeBootstrapConfigPath);
+		if (!created.ok) throw new Error(created.error);
+
+		expect(validateRuntimeLaunchSpec({ ...created.value, tmuxTarget: "@14" })).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
 		});
 	});
 });
@@ -1986,6 +2073,13 @@ describe("validateSubagentRecord", () => {
 		expect(validateSubagentRecord(makeRecord()).ok).toBe(true);
 	});
 
+	it("rejects persisted records whose tmuxTarget cannot drive the supported focus surface", () => {
+		expect(validateSubagentRecord(makeRecord({ tmuxTarget: "%42" }))).toEqual({
+			ok: false,
+			error: "tmuxTarget must include a session and target segment",
+		});
+	});
+
 	it("accepts current-best finalResult plus append-only finalResultHistory", () => {
 		const result = validateSubagentRecord(
 			makeRecord({
@@ -2220,11 +2314,11 @@ describe("validateSubagentRecord", () => {
 		});
 	});
 
-	it("accepts userIntervenedHistory as history-only metadata", () => {
+	it("accepts userIntervenedHistory as history-only metadata once a newer explicit report resolves it", () => {
 		expect(
 			validateSubagentRecord(
 				makeRecord({
-					state: "waiting",
+					state: "running",
 					connectedAt: "2026-03-10T10:01:00.000Z",
 					userIntervenedHistory: [
 						{
@@ -2240,6 +2334,12 @@ describe("validateSubagentRecord", () => {
 							recordedAt: "2026-03-10T10:03:00.000Z",
 						},
 					],
+					lastProgressReport: {
+						kind: "progress",
+						summary: "after intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
 				}),
 			).ok,
 		).toBe(true);
@@ -2342,6 +2442,191 @@ describe("validateSubagentRecord", () => {
 					state: "running",
 					connectedAt: "2026-03-10T10:02:00.000Z",
 					degradedAt: "2026-03-10T10:03:00.000Z",
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("accepts assumptionsStaleAt when it matches the latest intervention and no newer explicit report exists", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					assumptionsStaleAt: "2026-03-10T10:03:00.000Z",
+					lastProgressReport: {
+						kind: "progress",
+						summary: "before intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("rejects assumptionsStaleAt without intervention history", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					assumptionsStaleAt: "2026-03-10T10:03:00.000Z",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "assumptionsStaleAt requires userIntervenedHistory",
+		});
+	});
+
+	it("rejects assumptionsStaleAt that does not match the latest intervention", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:02:00.000Z",
+						},
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					assumptionsStaleAt: "2026-03-10T10:02:00.000Z",
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "assumptionsStaleAt must match the latest userIntervenedHistory entry",
+		});
+	});
+
+	it("rejects missing assumptionsStaleAt when the latest intervention is still unresolved", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					lastProgressReport: {
+						kind: "progress",
+						summary: "before intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "assumptionsStaleAt required when latest userIntervenedHistory is unresolved",
+		});
+	});
+
+	it("rejects newer explicit reports while assumptionsStaleAt remains set", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					assumptionsStaleAt: "2026-03-10T10:03:00.000Z",
+					lastProgressReport: {
+						kind: "progress",
+						summary: "after intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "lastProgressReport.reportedAt must be on or before assumptionsStaleAt",
+		});
+	});
+
+	it("accepts missing assumptionsStaleAt once a newer needs_input report resolves the intervention", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "needs_input",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					pendingInputRequest: {
+						kind: "needs_input",
+						summary: "Need confirmation",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("accepts missing assumptionsStaleAt once a newer final_result report resolves the intervention", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					finalResult: {
+						kind: "final_result",
+						summary: "done",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "done",
+							data: null,
+							reportedAt: "2026-03-10T10:04:00.000Z",
+						},
+					],
 				}),
 			).ok,
 		).toBe(true);

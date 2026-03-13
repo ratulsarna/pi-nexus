@@ -1,5 +1,9 @@
 # pi-nexus
 
+## Local Runtime
+
+- RAT-131 acceptance resolves `pi` in this order: `RAT131_PI_PATH`, `RAT131_PI_BIN_DIR`, local `node_modules/.bin`, sibling `../pi-mono/node_modules/.bin`, then `PATH`.
+
 ## Learning
 
 - Contracts must model real execution, not just typed shapes. If a launch spec or persisted record cannot safely drive the runtime, the contract is incomplete even if TypeScript accepts it.

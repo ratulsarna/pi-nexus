@@ -3,7 +3,16 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
-import type { SidecarControlMessage, RuntimeLaunchSpec } from "./contracts.js";
+import {
+	parseTmuxFocusIdentity,
+	validateSubagentFocusTarget,
+	type SidecarControlMessage,
+	type RuntimeLaunchSpec,
+	type SubagentFocusAvailability,
+	type SubagentFocusTarget,
+	type TmuxMode,
+	type ValidationOutcome,
+} from "./contracts.js";
 import type {
 	ManagedProcessExit,
 	SidecarSessionAdapter,
@@ -26,6 +35,14 @@ function normalizeError(error: unknown): Error {
 	}
 
 	return new Error(String(error));
+}
+
+function fail(error: string): ValidationOutcome<never> {
+	return { ok: false, error };
+}
+
+function ok<T>(value: T): ValidationOutcome<T> {
+	return { ok: true, value };
 }
 
 function cleanupSocketPath(socketPath: string): void {
@@ -213,6 +230,46 @@ function shQuote(value: string): string {
 
 function joinShellWords(words: ReadonlyArray<string>): string {
 	return words.map((word) => shQuote(word)).join(" ");
+}
+
+export function createTmuxFocusCommand(tmuxMode: TmuxMode, tmuxTarget: string): ValidationOutcome<string> {
+	const parsedTargetResult = parseTmuxFocusIdentity(tmuxMode, tmuxTarget);
+	if (!parsedTargetResult.ok) return parsedTargetResult;
+
+	const parsedTarget = parsedTargetResult.value;
+	const commandParts = [
+		"tmux",
+		"attach-session",
+		"-t",
+		shQuote(parsedTarget.sessionTarget),
+		"\\;",
+		"select-window",
+		"-t",
+		shQuote(parsedTarget.windowTarget),
+	];
+
+	if (parsedTarget.paneTarget) {
+		commandParts.push("\\;", "select-pane", "-t", shQuote(parsedTarget.paneTarget));
+	}
+
+	return ok(commandParts.join(" "));
+}
+
+export function createSubagentFocusTarget(input: {
+	agentId: string;
+	availability: SubagentFocusAvailability;
+	tmuxMode: TmuxMode;
+	tmuxTarget: string;
+	sessionPath: string;
+	note?: string;
+}): ValidationOutcome<SubagentFocusTarget> {
+	const focusCommandResult = createTmuxFocusCommand(input.tmuxMode, input.tmuxTarget);
+	if (!focusCommandResult.ok) return focusCommandResult;
+
+	return validateSubagentFocusTarget({
+		...input,
+		focusCommand: focusCommandResult.value,
+	});
 }
 
 function validateTmuxLaunchEnvEntry(key: string, value: string): void {

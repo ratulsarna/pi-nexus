@@ -108,6 +108,7 @@ SubagentRecord
 - connectedAt?
 - stoppedAt?
 - degradedAt?
+- assumptionsStaleAt?
 - lastProgressReport?
 - pendingInputRequest?
 - finalResult?
@@ -132,6 +133,9 @@ Separate trust condition:
 - `degradedAt`
   - indicates the parent no longer trusts the sidecar connection
   - does not replace the conversational posture
+- `assumptionsStaleAt`
+  - indicates the parent's prior child understanding is potentially stale after direct child-session user intervention
+  - remains set until a newer accepted explicit child-authored `progress`, `needs_input`, or `final_result` arrives
 
 ## Reporting model
 
@@ -170,7 +174,8 @@ If the user directly interacts with the sub-agent:
 
 - the parent gets `user_intervened`
 - the parent does not receive the transcript automatically
-- the parent waits for the next explicit `progress` or `final_result`
+- the parent records `assumptionsStaleAt`
+- the parent waits for the next explicit child-authored `progress`, `needs_input`, or `final_result`
 - `user_intervened` is only emitted on positive evidence of submitted direct input
 
 This prevents direct chat from being mistaken as the machine result.
@@ -189,7 +194,13 @@ This prevents direct chat from being mistaken as the machine result.
 ### Parent controls
 
 - spawn sub-agent
-- request focus target info
+- request supported focus target info
+  - returns structured tmux metadata plus one ready-to-run focus/attach command
+  - hides pane vs window differences behind one surface
+  - reports explicit availability semantics:
+    - `live`
+    - `degraded`
+    - `stopped` (historical / non-live)
 - send steer/follow-up through the sidecar control path
 - interrupt current work through the sidecar control path
 - poll or subscribe to explicit reports
