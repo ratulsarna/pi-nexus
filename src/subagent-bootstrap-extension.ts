@@ -3,11 +3,13 @@ import net from "node:net";
 
 import {
 	BOOTSTRAP_CONFIG_ENV_VAR,
+	shouldEmitUserIntervened,
 	validateMonotonicSeqAcceptance,
 	validateReportToParentInput,
 	validateRuntimeBootstrapConfig,
 	validateSidecarControlMessage,
 	validateSidecarEventMessage,
+	type RuntimeState,
 	type RuntimeBootstrapConfig,
 	type SidecarControlMessage,
 	type SidecarEnvelope,
@@ -16,6 +18,8 @@ import {
 } from "./contracts.js";
 
 interface ExtensionContextLike {
+	abort(): void;
+	isIdle(): boolean;
 	shutdown(): void;
 }
 
@@ -28,7 +32,10 @@ interface ExtensionToolLike {
 }
 
 interface ExtensionApiLike {
-	on(event: "session_start" | "session_shutdown", handler: (event: unknown, ctx: ExtensionContextLike) => unknown | Promise<unknown>): void;
+	on(
+		event: "session_start" | "session_shutdown" | "agent_end" | "input",
+		handler: (event: unknown, ctx: ExtensionContextLike) => unknown | Promise<unknown>,
+	): void;
 	registerTool?(definition: ExtensionToolLike): void;
 	sendUserMessage?(content: string, options?: { deliverAs?: "steer" | "followUp" }): void;
 }
@@ -70,6 +77,10 @@ function normalizeError(error: unknown): Error {
 	return new Error(String(error));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function loadBootstrapConfig(
 	env: Readonly<Record<string, string | undefined>>,
 	readConfigText: (configPath: string) => string,
@@ -90,7 +101,10 @@ function loadBootstrapConfig(
 	return validateRuntimeBootstrapConfig(parsed);
 }
 
-function registerReportTool(pi: ExtensionApiLike): void {
+function registerReportTool(
+	pi: ExtensionApiLike,
+	getActiveSession: () => SubagentBootstrapSession | undefined,
+): void {
 	if (!pi.registerTool) {
 		return;
 	}
@@ -115,12 +129,16 @@ function registerReportTool(pi: ExtensionApiLike): void {
 			additionalProperties: false,
 		},
 		async execute(_toolCallId, params) {
-			const reportResult = validateReportToParentInput(params, "ready");
-			if (!reportResult.ok) {
-				throw new Error(reportResult.error);
+			const activeSession = getActiveSession();
+			if (!activeSession) {
+				throw new Error("report_to_parent requires an active bootstrap session");
 			}
 
-			throw new Error("report_to_parent is reserved for post-ready lifecycle work in RAT-135");
+			await activeSession.handleReportToolCall(params);
+			return {
+				content: [{ type: "text", text: "Reported to parent." }],
+				details: undefined,
+			};
 		},
 	});
 }
@@ -137,6 +155,10 @@ class SubagentBootstrapSession {
 	private closed = false;
 
 	private ready = false;
+
+	private currentState: RuntimeState = "connecting";
+
+	private interruptPending = false;
 
 	private lastParentSeq: number | undefined;
 
@@ -217,6 +239,77 @@ class SubagentBootstrapSession {
 		}
 	}
 
+	public async handleReportToolCall(params: unknown): Promise<void> {
+		if (!this.ready) {
+			throw new Error("report_to_parent is not available before ready");
+		}
+
+		const reportResult = validateReportToParentInput(params, this.currentState);
+		if (!reportResult.ok) {
+			this.sendRecoverableError(reportResult.error);
+			throw new Error(reportResult.error);
+		}
+
+		switch (reportResult.value.kind) {
+			case "progress":
+				this.sendEvent("progress", {
+					summary: reportResult.value.summary,
+					data: reportResult.value.data ?? null,
+				});
+				this.currentState = "running";
+				return;
+			case "final_result":
+				this.sendEvent("final_result", {
+					summary: reportResult.value.summary,
+					data: reportResult.value.data ?? null,
+				});
+				return;
+			case "needs_input":
+				this.sendEvent("needs_input", {
+					question: reportResult.value.summary,
+					kind: "question",
+				});
+				this.currentState = "needs_input";
+		}
+	}
+
+	public handleAgentEnd(): void {
+		if (!this.ready || !this.interruptPending) {
+			return;
+		}
+
+		this.completeInterrupt();
+	}
+
+	public handleInput(event: unknown): void {
+		if (!this.ready) {
+			return;
+		}
+		if (!isRecord(event)) {
+			return;
+		}
+		if (event.source !== "interactive" && event.source !== "rpc" && event.source !== "extension") {
+			return;
+		}
+
+		// pi emits "input" only from submitted prompt paths, so interactive input
+		// reaching this hook is already user-submitted rather than keystroke churn.
+		const inputOrigin =
+			event.source === "interactive"
+				? { origin: "interactive-user" as const, submitted: true }
+				: event.source === "rpc"
+					? { origin: "system" as const, submitted: true }
+					: { origin: "extension" as const, submitted: true };
+		if (!shouldEmitUserIntervened(inputOrigin)) {
+			return;
+		}
+
+		this.sendEvent("user_intervened", {
+			source: "tmux",
+			mode: "direct-chat",
+		});
+	}
+
 	private handleChunk(chunk: Buffer | string): void {
 		this.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
 		while (true) {
@@ -271,8 +364,21 @@ class SubagentBootstrapSession {
 			return;
 		}
 
-		if (message.type === "ping") {
-			this.sendEvent("pong", {});
+		switch (message.type) {
+			case "ping":
+				this.sendEvent("pong", {});
+				return;
+			case "steer":
+				this.deliverUserMessage(message.payload.message, "steer");
+				return;
+			case "follow_up":
+				this.deliverUserMessage(message.payload.message, "followUp");
+				return;
+			case "interrupt":
+				this.handleInterrupt();
+				return;
+			case "hello":
+				throw new Error("hello has already been accepted for this child session");
 		}
 	}
 
@@ -298,14 +404,74 @@ class SubagentBootstrapSession {
 			tmuxTarget: this.config.tmuxTarget,
 		});
 		this.ready = true;
+		this.currentState = "ready";
 		this.clearTimeoutSafely();
 		this.startupResolve();
 	}
 
-	private sendEvent<TType extends Extract<SidecarEventMessage["type"], "ready" | "pong">>(
-		type: TType,
-		payload: SidecarEventMessage["payload"] & Record<string, unknown>,
-	): void {
+	private deliverUserMessage(message: string, deliverAs: "steer" | "followUp"): void {
+		if (!this.pi.sendUserMessage) {
+			const error = "pi.sendUserMessage must be available for post-ready control delivery";
+			this.sendRecoverableError(error);
+			return;
+		}
+
+		try {
+			this.pi.sendUserMessage(message, { deliverAs });
+		} catch (error) {
+			const reason = `failed to deliver ${deliverAs}: ${normalizeError(error).message}`;
+			this.sendRecoverableError(reason);
+			return;
+		}
+	}
+
+	private handleInterrupt(): void {
+		this.interruptPending = true;
+		try {
+			this.ctx.abort();
+		} catch (error) {
+			this.interruptPending = false;
+			const reason = `failed to interrupt current work: ${normalizeError(error).message}`;
+			this.sendRecoverableError(reason);
+			return;
+		}
+
+		try {
+			if (this.currentState === "needs_input" || this.ctx.isIdle()) {
+				this.completeInterrupt();
+			}
+		} catch (error) {
+			const reason = `failed to inspect child idle state after interrupt: ${normalizeError(error).message}`;
+			this.sendRecoverableError(reason);
+			return;
+		}
+	}
+
+	private completeInterrupt(): void {
+		if (!this.interruptPending) {
+			return;
+		}
+
+		this.interruptPending = false;
+		this.currentState = "waiting";
+		this.sendEvent("state", {
+			status: "waiting",
+		});
+	}
+
+	private sendRecoverableError(message: string): void {
+		if (!this.ready || this.closed) {
+			return;
+		}
+
+		this.currentState = "failed";
+		this.sendEvent("error", {
+			message,
+			fatal: false,
+		});
+	}
+
+	private sendEvent(type: SidecarEventMessage["type"], payload: Record<string, unknown>): void {
 		const eventResult = validateSidecarEventMessage({
 			version: 1,
 			agentId: this.config.agentId,
@@ -388,7 +554,7 @@ export function installSubagentBootstrapExtension(
 		}
 
 		if (!reportToolRegistered) {
-			registerReportTool(pi);
+			registerReportTool(pi, () => activeSession);
 			reportToolRegistered = true;
 		}
 
@@ -421,6 +587,14 @@ export function installSubagentBootstrapExtension(
 			}
 			throw error;
 		}
+	});
+
+	pi.on("agent_end", async () => {
+		activeSession?.handleAgentEnd();
+	});
+
+	pi.on("input", async (event) => {
+		activeSession?.handleInput(event);
 	});
 
 	pi.on("session_shutdown", async () => {
