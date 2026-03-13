@@ -2314,11 +2314,11 @@ describe("validateSubagentRecord", () => {
 		});
 	});
 
-	it("accepts userIntervenedHistory as history-only metadata", () => {
+	it("accepts userIntervenedHistory as history-only metadata once a newer explicit report resolves it", () => {
 		expect(
 			validateSubagentRecord(
 				makeRecord({
-					state: "waiting",
+					state: "running",
 					connectedAt: "2026-03-10T10:01:00.000Z",
 					userIntervenedHistory: [
 						{
@@ -2334,6 +2334,12 @@ describe("validateSubagentRecord", () => {
 							recordedAt: "2026-03-10T10:03:00.000Z",
 						},
 					],
+					lastProgressReport: {
+						kind: "progress",
+						summary: "after intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
 				}),
 			).ok,
 		).toBe(true);
@@ -2511,6 +2517,34 @@ describe("validateSubagentRecord", () => {
 		});
 	});
 
+	it("rejects missing assumptionsStaleAt when the latest intervention is still unresolved", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "waiting",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					lastProgressReport: {
+						kind: "progress",
+						summary: "before intervention",
+						data: null,
+						reportedAt: "2026-03-10T10:02:00.000Z",
+					},
+				}),
+			),
+		).toEqual({
+			ok: false,
+			error: "assumptionsStaleAt required when latest userIntervenedHistory is unresolved",
+		});
+	});
+
 	it("rejects newer explicit reports while assumptionsStaleAt remains set", () => {
 		expect(
 			validateSubagentRecord(
@@ -2538,6 +2572,64 @@ describe("validateSubagentRecord", () => {
 			ok: false,
 			error: "lastProgressReport.reportedAt must be on or before assumptionsStaleAt",
 		});
+	});
+
+	it("accepts missing assumptionsStaleAt once a newer needs_input report resolves the intervention", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "needs_input",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					pendingInputRequest: {
+						kind: "needs_input",
+						summary: "Need confirmation",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+				}),
+			).ok,
+		).toBe(true);
+	});
+
+	it("accepts missing assumptionsStaleAt once a newer final_result report resolves the intervention", () => {
+		expect(
+			validateSubagentRecord(
+				makeRecord({
+					state: "running",
+					connectedAt: "2026-03-10T10:01:00.000Z",
+					userIntervenedHistory: [
+						{
+							source: "tmux",
+							mode: "direct-chat",
+							inputSource: "interactive-user",
+							recordedAt: "2026-03-10T10:03:00.000Z",
+						},
+					],
+					finalResult: {
+						kind: "final_result",
+						summary: "done",
+						data: null,
+						reportedAt: "2026-03-10T10:04:00.000Z",
+					},
+					finalResultHistory: [
+						{
+							kind: "final_result",
+							summary: "done",
+							data: null,
+							reportedAt: "2026-03-10T10:04:00.000Z",
+						},
+					],
+				}),
+			).ok,
+		).toBe(true);
 	});
 
 	it("rejects stopped records whose degradedAt is later than stoppedAt", () => {

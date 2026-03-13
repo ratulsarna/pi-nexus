@@ -1132,11 +1132,11 @@ export class SubagentManager<TData = unknown> {
 		if (record.state === "stopped") {
 			return "stopped";
 		}
-		if (this.isDegraded(record)) {
-			return "degraded";
-		}
 		if (record.state === "failed") {
 			return "stopped";
+		}
+		if (this.isDegraded(record)) {
+			return "degraded";
 		}
 		return "live";
 	}

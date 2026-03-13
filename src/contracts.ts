@@ -1828,6 +1828,31 @@ export function validateSubagentRecord<TData = unknown>(record: unknown): Valida
 			}
 		}
 	}
+	const latestInterventionAt = normalizedUserIntervenedHistory?.at(-1)?.recordedAt;
+	const latestExplicitChildReportAt = [
+		normalizedLastProgressReport?.reportedAt,
+		normalizedPendingInputRequest?.reportedAt,
+		normalizedFinalResult?.reportedAt,
+		normalizedFinalResultHistory?.at(-1)?.reportedAt,
+	].reduce<string | undefined>(
+		(latest, candidate) => {
+			if (candidate === undefined) {
+				return latest;
+			}
+			if (latest === undefined || isTimestampOnOrBefore(latest, candidate)) {
+				return candidate;
+			}
+			return latest;
+		},
+		undefined,
+	);
+	if (
+		!assumptionsStaleAt
+		&& latestInterventionAt
+		&& (!latestExplicitChildReportAt || isTimestampOnOrBefore(latestExplicitChildReportAt, latestInterventionAt))
+	) {
+		return fail("assumptionsStaleAt required when latest userIntervenedHistory is unresolved");
+	}
 	if (normalizedRuntimeError) {
 		if (!isTimestampOnOrBefore(record.createdAt as string, normalizedRuntimeError.recordedAt)) {
 			return fail("error.recordedAt must be on or after createdAt");

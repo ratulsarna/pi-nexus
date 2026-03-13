@@ -558,7 +558,11 @@ async function main() {
 		};
 
 		fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
-		log(`PASS: real focus flow and direct-user-intervention stale/fresh flow verified`);
+		if (runFocusProof) {
+			log("PASS: real focus flow and direct-user-intervention stale/fresh flow verified");
+		} else {
+			log("PASS: direct-user-intervention stale/fresh flow verified (focus proof skipped)");
+		}
 		log(`saved summary to ${summaryPath}`);
 		log(`saved acceptance log to ${logPath}`);
 	} catch (error) {

@@ -439,6 +439,30 @@ describe("SubagentManager", () => {
 		expect(postReadyFocus.note).toContain("failed");
 	});
 
+	it("treats failed degraded runtimes as historical focus targets once the child is no longer live", () => {
+		const degradedFailure = createManager([
+			"2026-03-11T12:00:31.000Z",
+			"2026-03-11T12:00:32.000Z",
+			"2026-03-11T12:00:33.000Z",
+		]);
+		const request = makeSpawnRequest("agt_focus_failed_after_degrade");
+		expectOk(degradedFailure.manager.spawn(request));
+		expectOk(degradedFailure.sidecars.get("agt_focus_failed_after_degrade").connect());
+		expectOk(degradedFailure.sidecars.get("agt_focus_failed_after_degrade").message(
+			makeEnvelope("agt_focus_failed_after_degrade", "ready", 0, "2026-03-11T12:00:34.000Z", {
+				pid: 1115,
+				sessionPath: request.launchSpec.sessionPath,
+				tmuxTarget: request.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(degradedFailure.sidecars.get("agt_focus_failed_after_degrade").disconnect("lost socket"));
+		expectOk(degradedFailure.processes.get("agt_focus_failed_after_degrade").exit({ code: 1, signal: null }));
+
+		const degradedFailedFocus = expectOk(degradedFailure.manager.getFocusTarget("agt_focus_failed_after_degrade"));
+		expect(degradedFailedFocus.availability).toBe("stopped");
+		expect(degradedFailedFocus.note).toContain("failed");
+	});
+
 	it("fails deterministically for unknown focus target lookups", () => {
 		const { manager } = createManager(["2026-03-11T12:00:30.000Z"]);
 		expect(manager.getFocusTarget("missing")).toEqual({
