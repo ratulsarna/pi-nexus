@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -206,24 +206,43 @@ function resolveDefaultBootstrapExtensionPath(): string {
 	return path.join(path.dirname(currentPath), `subagent-bootstrap-extension${extension}`);
 }
 
-function defaultRunTmuxCommand(args: string[]): ValidationOutcome<string> {
-	const result = spawnSync("tmux", args, {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-	});
-	if (result.status !== 0) {
-		const stderr = result.stderr.trim();
-		const stdout = result.stdout.trim();
-		return fail(
-			stderr.length > 0
-				? `tmux ${args.join(" ")} failed: ${stderr}`
-				: stdout.length > 0
-					? `tmux ${args.join(" ")} failed: ${stdout}`
-					: `tmux ${args.join(" ")} failed`,
-		);
+function trimCommandOutput(output: string | Buffer | null | undefined): string {
+	if (typeof output === "string") {
+		return output.trim();
 	}
 
-	return ok(result.stdout.trim());
+	if (output instanceof Buffer) {
+		return output.toString("utf8").trim();
+	}
+
+	return "";
+}
+
+export function createTmuxCommandRunner(
+	spawnSyncImpl: typeof childProcess.spawnSync = childProcess.spawnSync,
+): (args: string[]) => ValidationOutcome<string> {
+	return (args: string[]): ValidationOutcome<string> => {
+		const result = spawnSyncImpl("tmux", args, {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const stderr = trimCommandOutput(result.stderr);
+		const stdout = trimCommandOutput(result.stdout);
+		if (result.status !== 0) {
+			const spawnError = result.error ? normalizeError(result.error).message : "";
+			return fail(
+				stderr.length > 0
+					? `tmux ${args.join(" ")} failed: ${stderr}`
+					: stdout.length > 0
+						? `tmux ${args.join(" ")} failed: ${stdout}`
+						: spawnError.length > 0
+							? `tmux ${args.join(" ")} failed: ${spawnError}`
+							: `tmux ${args.join(" ")} failed`,
+			);
+		}
+
+		return ok(stdout);
+	};
 }
 
 function ensureDirectory(directoryPath: string): void {
@@ -457,7 +476,7 @@ function allocateTmuxTarget(
 
 	const panesResult = runTmuxCommand(["list-panes", "-t", windowTarget, "-F", "#{session_name}:#{window_name}.#{pane_index}"]);
 	if (!panesResult.ok) {
-		runTmuxCommand(["kill-session", "-t", sessionName]);
+		killTmuxSession(runTmuxCommand, sessionName);
 		return panesResult;
 	}
 	const panes = panesResult.value
@@ -465,7 +484,7 @@ function allocateTmuxTarget(
 		.map((entry) => entry.trim())
 		.filter((entry) => entry.length > 0);
 	if (panes.length !== 1) {
-		runTmuxCommand(["kill-session", "-t", sessionName]);
+		killTmuxSession(runTmuxCommand, sessionName);
 		return fail(`expected exactly one pane for ${windowTarget}, found ${panes.length}`);
 	}
 
@@ -474,6 +493,13 @@ function allocateTmuxTarget(
 		tmuxTarget: panes[0],
 		tmuxMode,
 	});
+}
+
+function killTmuxSession(
+	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+	sessionName: string,
+): void {
+	runTmuxCommand(["kill-session", "-t", sessionName]);
 }
 
 function buildSpawnText(
@@ -545,7 +571,7 @@ function shutdownParentSession(
 
 	state.manager.shutdownAll();
 	for (const runtime of state.ownedTmuxRuntimes.values()) {
-		runTmuxCommand(["kill-session", "-t", runtime.sessionName]);
+		killTmuxSession(runTmuxCommand, runtime.sessionName);
 	}
 	state.ownedTmuxRuntimes.clear();
 }
@@ -558,7 +584,7 @@ export function installParentExtension(
 		bootstrapExtensionPath: options.bootstrapExtensionPath ?? resolveDefaultBootstrapExtensionPath(),
 		homeDir: options.homeDir ?? os.homedir(),
 		now: options.now ?? (() => new Date().toISOString()),
-		runTmuxCommand: options.runTmuxCommand ?? defaultRunTmuxCommand,
+		runTmuxCommand: options.runTmuxCommand ?? createTmuxCommandRunner(),
 		sidecarSessions: options.sidecarSessions ?? new NodeSidecarSessionAdapter(),
 		runtimeProcesses: options.runtimeProcesses ?? new TmuxSubagentProcessAdapter(),
 	};
@@ -615,7 +641,12 @@ export function installParentExtension(
 
 			const tmuxTarget = tmuxTargetResult.value;
 			const agentDir = path.join(state.sessionDir, agentId);
-			ensureDirectory(agentDir);
+			try {
+				ensureDirectory(agentDir);
+			} catch (error) {
+				killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
+				return textResult(`Failed to prepare agent runtime directory: ${normalizeError(error).message}`);
+			}
 
 			const preparedResult = prepareNamedSubagentSpawn({
 				registry: registryResult.value,
@@ -632,13 +663,13 @@ export function installParentExtension(
 				cwd: state.cwd,
 			});
 			if (!preparedResult.ok) {
-				effectiveOptions.runTmuxCommand(["kill-session", "-t", tmuxTarget.sessionName]);
+				killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
 				return textResult(`Failed to prepare named subagent spawn: ${preparedResult.error}`);
 			}
 
 			const spawnResult = state.manager.spawn(preparedResult.value.request);
 			if (!spawnResult.ok) {
-				effectiveOptions.runTmuxCommand(["kill-session", "-t", tmuxTarget.sessionName]);
+				killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
 				return textResult(`Failed to spawn subagent: ${spawnResult.error}`);
 			}
 

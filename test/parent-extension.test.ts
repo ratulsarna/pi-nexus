@@ -1,10 +1,11 @@
+import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { installParentExtension } from "../src/parent-extension.js";
+import { createTmuxCommandRunner, installParentExtension } from "../src/parent-extension.js";
 import type {
 	RuntimeLaunchSpec,
 	SidecarControlMessage,
@@ -298,6 +299,10 @@ afterAll(() => {
 	fs.rmSync(fakeRepoDir, { recursive: true, force: true });
 });
 
+afterEach(() => {
+	vi.restoreAllMocks();
+});
+
 beforeEach(() => {
 	fs.rmSync(path.join(fakeRepoDir, ".pi"), { recursive: true, force: true });
 });
@@ -435,6 +440,25 @@ Research the codebase carefully and report findings.`,
 		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Completed the task");
 	});
 
+	it("fails cleanly when tmux cannot execute and spawnSync omits stdout and stderr", async () => {
+		const runTmuxCommand = createTmuxCommandRunner(() => {
+			return {
+				pid: 0,
+				output: [null, undefined, undefined],
+				stdout: undefined,
+				stderr: undefined,
+				status: null,
+				signal: "SIGTERM",
+				error: new Error("spawn tmux ENOENT"),
+			} as unknown as ReturnType<typeof childProcess.spawnSync>;
+		});
+
+		expect(runTmuxCommand(["new-session", "-d", "-s", "missing", "-n", "child"])).toEqual({
+			ok: false,
+			error: "tmux new-session -d -s missing -n child failed: spawn tmux ENOENT",
+		});
+	});
+
 	it("keeps assumptions stale after direct intervention until the next explicit child report", async () => {
 		const sidecars = new FakeSidecarSessions();
 		const processes = new FakeProcesses();
@@ -507,6 +531,55 @@ Research the codebase carefully and report findings.`,
 		await listCommand.handler("list", ctx);
 		const refreshedListContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
 		expect(refreshedListContent).toContain("markers=none");
+	});
+
+	it("kills the allocated tmux session when agent runtime directory setup fails", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:25:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const fixedNow = 1_762_345_678_900;
+		vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "mkdir-failure.jsonl"));
+		await pi.emit("session_start", {}, ctx);
+
+		const agentId = `agt_001_${fixedNow.toString(36)}`;
+		const mkdirSync = fs.mkdirSync.bind(fs);
+		vi.spyOn(fs, "mkdirSync").mockImplementation((targetPath, options) => {
+			if (typeof targetPath === "string" && targetPath.endsWith(agentId)) {
+				throw new Error("disk full");
+			}
+
+			return mkdirSync(targetPath, options as Parameters<typeof fs.mkdirSync>[1]);
+		});
+
+		const tool = getRegisteredTool(pi, "Agent");
+		const result = await tool.execute(
+			"tool-call-mkdir-failure",
+			{
+				prompt: "Do the work.",
+				description: "Directory failure",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		expect(result.content[0]?.text).toContain("Failed to prepare agent runtime directory: disk full");
+		expect(tmux.killedSessions).toHaveLength(1);
+		expect(tmux.sessionTargets.size).toBe(0);
+		expect(processes.handles.size).toBe(0);
 	});
 
 	it("shuts down managed runtimes and kills owned tmux sessions on session shutdown", async () => {
