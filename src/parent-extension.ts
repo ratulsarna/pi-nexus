@@ -403,10 +403,14 @@ function createParentSessionState(
 		sidecarSessions: SidecarSessionAdapter;
 		runtimeProcesses: SubagentProcessAdapter;
 	},
-): ParentSessionState {
+): ValidationOutcome<ParentSessionState> {
 	const sessionKey = createSessionKey(sessionFile);
 	const sessionDir = path.join(options.homeDir, ".ai", "pi-nexus", sessionKey);
-	ensureDirectory(sessionDir);
+	try {
+		ensureDirectory(sessionDir);
+	} catch (error) {
+		return fail(`failed to prepare parent session runtime directory: ${normalizeError(error).message}`);
+	}
 
 	const state: ParentSessionState = {
 		sessionFile,
@@ -428,7 +432,7 @@ function createParentSessionState(
 		},
 	});
 
-	return state;
+	return ok(state);
 }
 
 function ensureCurrentState(
@@ -439,12 +443,12 @@ function ensureCurrentState(
 		sidecarSessions: SidecarSessionAdapter;
 		runtimeProcesses: SubagentProcessAdapter;
 	},
-): ParentSessionState {
+): ValidationOutcome<ParentSessionState> {
 	const sessionFile = ctx.sessionManager.getSessionFile();
 	if (currentState && currentState.sessionFile === sessionFile) {
 		currentState.cwd = ctx.cwd;
 		currentState.busy = !ctx.isIdle();
-		return currentState;
+		return ok(currentState);
 	}
 
 	return createParentSessionState(pi, sessionFile, ctx.cwd, options);
@@ -576,6 +580,10 @@ function shutdownParentSession(
 	state.ownedTmuxRuntimes.clear();
 }
 
+function notifyRuntimePreparationFailure(ctx: ExtensionContextLike, error: string): void {
+	ctx.ui.notify(`pi-nexus parent session setup failed: ${error}`, "error");
+}
+
 export function installParentExtension(
 	pi: ExtensionApiLike,
 	options: ParentExtensionOptions = {},
@@ -595,16 +603,34 @@ export function installParentExtension(
 		if (activeState && activeState.sessionFile !== ctx.sessionManager.getSessionFile()) {
 			shutdownParentSession(activeState, effectiveOptions.runTmuxCommand);
 		}
-		activeState = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+		const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+		if (!stateResult.ok) {
+			activeState = undefined;
+			notifyRuntimePreparationFailure(ctx, stateResult.error);
+			return;
+		}
+		activeState = stateResult.value;
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
-		activeState = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+		const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+		if (!stateResult.ok) {
+			activeState = undefined;
+			notifyRuntimePreparationFailure(ctx, stateResult.error);
+			return;
+		}
+		activeState = stateResult.value;
 		activeState.busy = true;
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		activeState = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+		const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+		if (!stateResult.ok) {
+			activeState = undefined;
+			notifyRuntimePreparationFailure(ctx, stateResult.error);
+			return;
+		}
+		activeState = stateResult.value;
 		activeState.busy = false;
 	});
 
@@ -624,7 +650,12 @@ export function installParentExtension(
 		],
 		parameters: AGENT_TOOL_PARAMETERS,
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-			activeState = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+			const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+			if (!stateResult.ok) {
+				activeState = undefined;
+				return textResult(`Failed to prepare parent session runtime: ${stateResult.error}`);
+			}
+			activeState = stateResult.value;
 			const state = activeState;
 			const registryResult = refreshRegistry(state);
 			if (!registryResult.ok) {
@@ -725,7 +756,18 @@ export function installParentExtension(
 				.map((entry) => ({ value: entry, label: entry }));
 		},
 		handler: async (args, ctx) => {
-			activeState = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+			const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
+			if (!stateResult.ok) {
+				activeState = undefined;
+				sendSessionMessage(
+					pi,
+					"pi-nexus-subagents-output",
+					`Failed to prepare parent session runtime: ${stateResult.error}`,
+					{ command: "subagents" },
+				);
+				return;
+			}
+			activeState = stateResult.value;
 			const state = activeState;
 			const trimmed = args.trim();
 			const [command, ...rest] = trimmed.split(/\s+/).filter((entry) => entry.length > 0);

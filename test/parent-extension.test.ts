@@ -582,6 +582,60 @@ Research the codebase carefully and report findings.`,
 		expect(processes.handles.size).toBe(0);
 	});
 
+	it("surfaces parent session runtime directory failures without crashing the extension", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:27:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const mkdirSync = fs.mkdirSync.bind(fs);
+		const stateRoot = path.join(fakeHomeDir, ".ai", "pi-nexus");
+		vi.spyOn(fs, "mkdirSync").mockImplementation((targetPath, options) => {
+			if (typeof targetPath === "string" && targetPath.startsWith(stateRoot)) {
+				throw new Error("home dir read only");
+			}
+
+			return mkdirSync(targetPath, options as Parameters<typeof fs.mkdirSync>[1]);
+		});
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "state-failure.jsonl"));
+		await expect(pi.emit("session_start", {}, ctx)).resolves.toBeUndefined();
+		expect(ctx.notifications.at(-1)).toEqual({
+			message: "pi-nexus parent session setup failed: failed to prepare parent session runtime directory: home dir read only",
+			type: "error",
+		});
+
+		const tool = getRegisteredTool(pi, "Agent");
+		const toolResult = await tool.execute(
+			"tool-call-state-failure",
+			{
+				prompt: "Do the work.",
+				description: "State failure",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(toolResult.content[0]?.text).toContain(
+			"Failed to prepare parent session runtime: failed to prepare parent session runtime directory: home dir read only",
+		);
+
+		const command = getRegisteredCommand(pi, "subagents");
+		await expect(command.handler("list", ctx)).resolves.toBeUndefined();
+		expect(String(pi.sentMessages.at(-1)?.message.content ?? "")).toContain(
+			"Failed to prepare parent session runtime: failed to prepare parent session runtime directory: home dir read only",
+		);
+	});
+
 	it("shuts down managed runtimes and kills owned tmux sessions on session shutdown", async () => {
 		const sidecars = new FakeSidecarSessions();
 		const processes = new FakeProcesses();
