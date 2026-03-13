@@ -290,4 +290,11 @@ We may later copy or adapt ideas from the old `pi-subagents` project:
 
 But V1 does not inherit the old in-memory execution engine.
 
+The reusable definitions/config layer in this repo stays outside lifecycle orchestration:
+
+- named agent definitions are loaded through an explicit registry surface
+- precedence is deterministic: project overrides global overrides default
+- unknown or disabled types fail before runtime launch preparation
+- the lifecycle manager still receives only normal validated runtime inputs
+
 The next implementation tickets should build against the executable contract module and tests in `src/contracts.ts` and `test/contracts.test.ts`.
