@@ -332,15 +332,13 @@ export class SubagentManager<TData = unknown> {
 		if (!runtimeResult.ok) return runtimeResult;
 		const { record } = runtimeResult.value;
 
-		const availability = record.state === "stopped"
-			? "stopped"
-			: this.isDegraded(record)
-				? "degraded"
-				: "live";
+		const availability = this.deriveFocusAvailability(record);
 		const note = availability === "degraded"
 			? "sidecar trust is degraded; use the tmux target for manual observation or direct interaction"
 			: availability === "stopped"
-				? "child session is stopped; tmux target metadata is historical and may no longer resolve live"
+				? record.state === "failed"
+					? "child session failed; tmux target metadata is historical and may no longer resolve live"
+					: "child session is stopped; tmux target metadata is historical and may no longer resolve live"
 				: undefined;
 
 		return createSubagentFocusTarget({
@@ -1128,6 +1126,19 @@ export class SubagentManager<TData = unknown> {
 
 	private isDegraded(record: SubagentRecord<TData>): boolean {
 		return Boolean(record.degradedAt);
+	}
+
+	private deriveFocusAvailability(record: SubagentRecord<TData>): "live" | "degraded" | "stopped" {
+		if (record.state === "stopped") {
+			return "stopped";
+		}
+		if (this.isDegraded(record)) {
+			return "degraded";
+		}
+		if (record.state === "failed") {
+			return "stopped";
+		}
+		return "live";
 	}
 
 	private scheduleConnectingTimeout(agentId: string, runtime: ManagedRuntime<TData>): void {

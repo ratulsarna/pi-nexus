@@ -405,6 +405,40 @@ describe("SubagentManager", () => {
 		expect(stoppedFocus.note).toContain("historical");
 	});
 
+	it("treats failed non-degraded runtimes as historical focus targets", () => {
+		const preReadyFailure = createManager([
+			"2026-03-11T12:00:24.000Z",
+			"2026-03-11T12:00:25.000Z",
+		]);
+		const preReadyRequest = makeSpawnRequest("agt_focus_failed_pre_ready");
+		expectOk(preReadyFailure.manager.spawn(preReadyRequest));
+		expectOk(preReadyFailure.processes.get("agt_focus_failed_pre_ready").exit({ code: 1, signal: null }));
+
+		const preReadyFocus = expectOk(preReadyFailure.manager.getFocusTarget("agt_focus_failed_pre_ready"));
+		expect(preReadyFocus.availability).toBe("stopped");
+		expect(preReadyFocus.note).toContain("failed");
+
+		const postReadyFailure = createManager([
+			"2026-03-11T12:00:26.000Z",
+			"2026-03-11T12:00:27.000Z",
+		]);
+		const postReadyRequest = makeSpawnRequest("agt_focus_failed_post_ready");
+		expectOk(postReadyFailure.manager.spawn(postReadyRequest));
+		expectOk(postReadyFailure.sidecars.get("agt_focus_failed_post_ready").connect());
+		expectOk(postReadyFailure.sidecars.get("agt_focus_failed_post_ready").message(
+			makeEnvelope("agt_focus_failed_post_ready", "ready", 0, "2026-03-11T12:00:28.000Z", {
+				pid: 1114,
+				sessionPath: postReadyRequest.launchSpec.sessionPath,
+				tmuxTarget: postReadyRequest.launchSpec.tmuxTarget,
+			}),
+		));
+		expectOk(postReadyFailure.processes.get("agt_focus_failed_post_ready").exit({ code: 1, signal: null }));
+
+		const postReadyFocus = expectOk(postReadyFailure.manager.getFocusTarget("agt_focus_failed_post_ready"));
+		expect(postReadyFocus.availability).toBe("stopped");
+		expect(postReadyFocus.note).toContain("failed");
+	});
+
 	it("fails deterministically for unknown focus target lookups", () => {
 		const { manager } = createManager(["2026-03-11T12:00:30.000Z"]);
 		expect(manager.getFocusTarget("missing")).toEqual({

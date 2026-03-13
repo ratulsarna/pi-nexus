@@ -2,7 +2,7 @@
 
 ## Local Runtime
 
-- Built `pi` CLI path for manual/runtime acceptance on this system: `/Users/ratulsarna/Developer/pi/pi-mono/node_modules/.bin/pi`
+- RAT-131 acceptance resolves `pi` in this order: `RAT131_PI_PATH`, `RAT131_PI_BIN_DIR`, local `node_modules/.bin`, sibling `../pi-mono/node_modules/.bin`, then `PATH`.
 
 ## Learning
 

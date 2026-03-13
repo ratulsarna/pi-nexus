@@ -7,14 +7,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const distIndexPath = path.join(repoRoot, "dist", "index.js");
 const bootstrapExtensionPath = path.join(repoRoot, "dist", "subagent-bootstrap-extension.js");
-const builtPiBinDir = "/Users/ratulsarna/Developer/pi/pi-mono/node_modules/.bin";
-const builtPiPath = path.join(builtPiBinDir, "pi");
 const artifactDir = path.join(os.homedir(), ".ai", "pi-nexus", "RAT-131");
 const logPath = path.join(artifactDir, "manual-acceptance-rat-131.log");
 const runId = Date.now().toString(36);
 const runtimeDir = path.join(artifactDir, `r-${runId}`);
 const summaryPath = path.join(runtimeDir, "summary.json");
 const runFocusProof = process.env.RAT131_RUN_FOCUS_PROOF === "1";
+const piPathOverride = process.env.RAT131_PI_PATH;
+const candidatePiBinDirs = [
+	process.env.RAT131_PI_BIN_DIR,
+	path.join(repoRoot, "node_modules", ".bin"),
+	path.resolve(repoRoot, "..", "pi-mono", "node_modules", ".bin"),
+].filter((value, index, values) => typeof value === "string" && value.length > 0 && values.indexOf(value) === index);
 
 fs.mkdirSync(artifactDir, { recursive: true });
 fs.mkdirSync(runtimeDir, { recursive: true });
@@ -41,6 +45,15 @@ function requireExecutable(command) {
 		fail(`missing prerequisite: ${command}`);
 	}
 	return result.stdout.trim();
+}
+
+function canExecute(filePath) {
+	try {
+		fs.accessSync(filePath, fs.constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function run(command, args, options = {}) {
@@ -115,14 +128,32 @@ async function waitForProcessExit(child, timeoutMs, label) {
 }
 
 function ensureBuiltPiOnPath() {
-	if (!fs.existsSync(builtPiPath)) {
-		fail(`built pi executable not found at ${builtPiPath}`);
+	if (typeof piPathOverride === "string" && piPathOverride.length > 0) {
+		if (!canExecute(piPathOverride)) {
+			fail(`RAT131_PI_PATH is not executable: ${piPathOverride}`);
+		}
+		const overrideBinDir = path.dirname(piPathOverride);
+		process.env.PATH = [overrideBinDir, process.env.PATH]
+			.filter((value) => typeof value === "string" && value.length > 0)
+			.join(path.delimiter);
+		const version = run(piPathOverride, ["--version"], {
+			env: process.env,
+		});
+		log(`pi: ${piPathOverride} (${version}) [override]`);
+		return piPathOverride;
 	}
-	process.env.PATH = [builtPiBinDir, process.env.PATH].filter((value) => typeof value === "string" && value.length > 0).join(path.delimiter);
-	const version = run(builtPiPath, ["--version"], {
+
+	const candidateExistingBinDirs = candidatePiBinDirs.filter((binDir) => fs.existsSync(binDir));
+	process.env.PATH = [...candidateExistingBinDirs, process.env.PATH]
+		.filter((value) => typeof value === "string" && value.length > 0)
+		.join(path.delimiter);
+
+	const resolvedPiPath = requireExecutable("pi");
+	const version = run(resolvedPiPath, ["--version"], {
 		env: process.env,
 	});
-	log(`pi: ${builtPiPath} (${version})`);
+	log(`pi: ${resolvedPiPath} (${version})`);
+	return resolvedPiPath;
 }
 
 function assertBuildArtifacts() {
