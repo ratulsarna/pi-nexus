@@ -75,6 +75,7 @@ class FakeExtensionContext {
 
 	public constructor(
 		private readonly options: {
+			onAbort?: () => void;
 			throwOnAbort?: Error;
 			throwOnShutdown?: Error;
 		} = {},
@@ -82,6 +83,7 @@ class FakeExtensionContext {
 
 	public abort(): void {
 		this.abortCalls += 1;
+		this.options.onAbort?.();
 		if (this.options.throwOnAbort) {
 			throw this.options.throwOnAbort;
 		}
@@ -461,6 +463,68 @@ describe("installSubagentBootstrapExtension", () => {
 		expect(socket.destroyed).toBe(false);
 	});
 
+	it("does not lose waiting when agent_end fires synchronously during abort", async () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrap = makeBootstrap("agt_child_interrupt_sync_end", runtimeDir, fakeExtensionPath);
+		const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+		fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+		const socket = new FakeSocket();
+		const pi = new FakePiApi();
+		const ctx = new FakeExtensionContext({
+			onAbort: () => {
+				void pi.emit("agent_end", {}, ctx);
+			},
+		});
+		installSubagentBootstrapExtension(pi, {
+			env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+			connectSocket: () => socket,
+			now: () => "2026-03-12T10:09:25.000Z",
+			pid: () => 8888,
+		});
+
+		const sessionStart = pi.emit("session_start", {}, ctx);
+		socket.connect();
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "hello",
+			seq: 0,
+			time: "2026-03-12T10:09:26.000Z",
+			payload: {
+				sessionPath: bootstrap.sessionPath,
+				tmuxTarget: bootstrap.tmuxTarget,
+				mode: bootstrap.tmuxMode,
+			},
+		});
+		await sessionStart;
+
+		ctx.idle = false;
+		const reportTool = getReportTool(pi);
+		await reportTool.execute("call-progress", {
+			kind: "progress",
+			summary: "Still working",
+		});
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "interrupt",
+			seq: 1,
+			time: "2026-03-12T10:09:27.000Z",
+			payload: {},
+		});
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "progress", "state"]);
+		expect(sent[2]?.payload).toEqual({
+			status: "waiting",
+		});
+		expect(ctx.abortCalls).toBe(1);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
+	});
+
 	it("clears a pending input posture to waiting only after the child handles interrupt", async () => {
 		const { bootstrap, socket, pi, ctx } = await startReadyBootstrapSession(
 			"agt_child_interrupt_needs_input",
@@ -492,6 +556,109 @@ describe("installSubagentBootstrapExtension", () => {
 			status: "waiting",
 		});
 		expect(ctx.abortCalls).toBe(1);
+		expect(socket.ended).toBe(false);
+		expect(socket.destroyed).toBe(false);
+	});
+
+	it.each([
+		["steer", "failed to deliver steer: delivery exploded"],
+		["follow_up", "failed to deliver followUp: delivery exploded"],
+	] as const)(
+		"keeps the post-ready session alive when %s delivery fails recoverably",
+		async (type, expectedMessage) => {
+			const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+			const bootstrap = makeBootstrap(`agt_child_${type}_recoverable_error`, runtimeDir, fakeExtensionPath);
+			const bootstrapConfigPath = path.join(runtimeDir, "bootstrap.json");
+			fs.writeFileSync(bootstrapConfigPath, `${JSON.stringify(bootstrap, null, 2)}\n`);
+
+			const socket = new FakeSocket();
+			const pi = new FakePiApi();
+			(pi as unknown as { sendUserMessage: (content: string, options?: { deliverAs?: "steer" | "followUp" }) => void }).sendUserMessage = (
+				content: string,
+				options?: { deliverAs?: "steer" | "followUp" },
+			) => {
+				if (content === bootstrap.initialPrompt) {
+					pi.sentUserMessages.push(content);
+					pi.sentUserMessageCalls.push({ content, options });
+					return;
+				}
+
+				throw new Error("delivery exploded");
+			};
+			const ctx = new FakeExtensionContext();
+			installSubagentBootstrapExtension(pi, {
+				env: { [BOOTSTRAP_CONFIG_ENV_VAR]: bootstrapConfigPath },
+				connectSocket: () => socket,
+				now: () => "2026-03-12T10:09:35.000Z",
+				pid: () => 9999,
+			});
+
+			const sessionStart = pi.emit("session_start", {}, ctx);
+			socket.connect();
+			socket.receive({
+				version: 1,
+				agentId: bootstrap.agentId,
+				type: "hello",
+				seq: 0,
+				time: "2026-03-12T10:09:36.000Z",
+				payload: {
+					sessionPath: bootstrap.sessionPath,
+					tmuxTarget: bootstrap.tmuxTarget,
+					mode: bootstrap.tmuxMode,
+				},
+			});
+			await sessionStart;
+
+			socket.receive({
+				version: 1,
+				agentId: bootstrap.agentId,
+				type,
+				seq: 1,
+				time: "2026-03-12T10:09:37.000Z",
+				payload: {
+					message: "Adjust course",
+				},
+			});
+
+			const sent = parseSentEnvelopes(socket);
+			expect(sent.map((message) => message.type)).toEqual(["ready", "error"]);
+			expect(sent[1]?.payload).toEqual({
+				message: expectedMessage,
+				fatal: false,
+			});
+			expect(ctx.shutdownCalls).toBe(0);
+			expect(socket.ended).toBe(false);
+			expect(socket.destroyed).toBe(false);
+		},
+	);
+
+	it("keeps the post-ready session alive when interrupt abort fails recoverably", async () => {
+		const { bootstrap, socket, pi } = await startReadyBootstrapSession(
+			"agt_child_interrupt_recoverable_error",
+			"2026-03-12T10:09:45.000Z",
+		);
+		const ctx = new FakeExtensionContext({
+			throwOnAbort: new Error("abort exploded"),
+		});
+		await pi.emit("session_start", {}, ctx);
+
+		socket.receive({
+			version: 1,
+			agentId: bootstrap.agentId,
+			type: "interrupt",
+			seq: 1,
+			time: "2026-03-12T10:09:46.000Z",
+			payload: {},
+		});
+
+		const sent = parseSentEnvelopes(socket);
+		expect(sent.map((message) => message.type)).toEqual(["ready", "error"]);
+		expect(sent[1]?.payload).toEqual({
+			message: "failed to interrupt current work: abort exploded",
+			fatal: false,
+		});
+		expect(ctx.abortCalls).toBe(1);
+		expect(ctx.shutdownCalls).toBe(0);
 		expect(socket.ended).toBe(false);
 		expect(socket.destroyed).toBe(false);
 	});

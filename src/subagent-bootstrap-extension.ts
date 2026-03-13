@@ -401,7 +401,7 @@ class SubagentBootstrapSession {
 		if (!this.pi.sendUserMessage) {
 			const error = "pi.sendUserMessage must be available for post-ready control delivery";
 			this.sendRecoverableError(error);
-			throw new Error(error);
+			return;
 		}
 
 		try {
@@ -409,20 +409,21 @@ class SubagentBootstrapSession {
 		} catch (error) {
 			const reason = `failed to deliver ${deliverAs}: ${normalizeError(error).message}`;
 			this.sendRecoverableError(reason);
-			throw new Error(reason);
+			return;
 		}
 	}
 
 	private handleInterrupt(): void {
+		this.interruptPending = true;
 		try {
 			this.ctx.abort();
 		} catch (error) {
+			this.interruptPending = false;
 			const reason = `failed to interrupt current work: ${normalizeError(error).message}`;
 			this.sendRecoverableError(reason);
-			throw new Error(reason);
+			return;
 		}
 
-		this.interruptPending = true;
 		if (this.currentState === "needs_input" || this.ctx.isIdle()) {
 			this.completeInterrupt();
 		}
