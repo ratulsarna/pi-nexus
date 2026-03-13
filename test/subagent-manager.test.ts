@@ -356,7 +356,8 @@ describe("SubagentManager", () => {
 				tmuxMode: "pane",
 				tmuxTarget: request.launchSpec.tmuxTarget,
 				sessionPath: request.launchSpec.sessionPath,
-				focusCommand: `tmux attach-session -t '${sessionTarget}' \\; select-window -t '${windowTarget}' \\; select-pane -t '${request.launchSpec.tmuxTarget}'`,
+				focusCommand:
+					`if [ -n "\${TMUX:-}" ]; then tmux switch-client -t '${sessionTarget}' \\; select-window -t '${windowTarget}' \\; select-pane -t '${request.launchSpec.tmuxTarget}' ; else tmux attach-session -t '${sessionTarget}' \\; select-window -t '${windowTarget}' \\; select-pane -t '${request.launchSpec.tmuxTarget}' ; fi`,
 				note: undefined,
 			},
 		});
