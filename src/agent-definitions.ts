@@ -32,6 +32,7 @@ export interface AgentDefinition {
 
 export interface ResolvedAgentDefinition extends AgentDefinition {
 	requestedName: string;
+	generalPurposeInstructions?: string;
 }
 
 export interface EmbeddedAgentDefinitionInput {
@@ -204,6 +205,101 @@ function isRegistryLike(value: unknown): value is AgentDefinitionRegistryLike {
 	return isRecord(value) && typeof value.resolve === "function";
 }
 
+function isValidationErrorLike(value: unknown): value is ValidationError {
+	return isRecord(value) && value.ok === false && typeof value.error === "string";
+}
+
+function normalizeResolvedAgentDefinition(
+	value: unknown,
+): ValidationOutcome<ResolvedAgentDefinition> {
+	if (!isRecord(value)) {
+		return fail("resolved agent definition must be an object");
+	}
+
+	const definitionResult = normalizeAgentDefinition({
+		name: value.name,
+		displayName: value.displayName,
+		description: value.description,
+		instructions: value.instructions,
+		promptMode: value.promptMode,
+		enabled: value.enabled,
+		source: value.source as AgentDefinitionSource,
+		definitionPath: value.definitionPath as string | undefined,
+	});
+	if (!definitionResult.ok) return definitionResult;
+
+	const requestedNameResult = normalizeTextField("requestedName", value.requestedName);
+	if (!requestedNameResult.ok) return requestedNameResult;
+
+	const generalPurposeInstructionsResult = normalizeOptionalTextField(
+		"generalPurposeInstructions",
+		value.generalPurposeInstructions,
+	);
+	if (!generalPurposeInstructionsResult.ok) return generalPurposeInstructionsResult;
+
+	return ok({
+		...definitionResult.value,
+		requestedName: requestedNameResult.value,
+		generalPurposeInstructions: generalPurposeInstructionsResult.value,
+	});
+}
+
+function normalizeResolvedAgentDefinitionOutcome(
+	value: unknown,
+): ValidationOutcome<ResolvedAgentDefinition> {
+	if (!isRecord(value) || typeof value.ok !== "boolean") {
+		return fail("registry.resolve must return a ValidationOutcome");
+	}
+
+	if (value.ok === false) {
+		if (!isValidationErrorLike(value)) {
+			return fail("registry.resolve must return a ValidationError with a string error");
+		}
+		return value;
+	}
+
+	return normalizeResolvedAgentDefinition(value.value);
+}
+
+function normalizeRegistryOptions(
+	options: unknown,
+): ValidationOutcome<{
+	cwd: string;
+	homeDir?: string;
+	projectDefinitionsDir?: string;
+	globalDefinitionsDir?: string;
+	defaultDefinitions: ReadonlyArray<EmbeddedAgentDefinitionInput>;
+}> {
+	if (!isRecord(options)) {
+		return fail("agent definition registry options must be an object");
+	}
+
+	const cwdResult = normalizeTextField("cwd", options.cwd);
+	if (!cwdResult.ok) return cwdResult;
+
+	const homeDirResult = normalizeOptionalTextField("homeDir", options.homeDir);
+	if (!homeDirResult.ok) return homeDirResult;
+
+	const projectDefinitionsDirResult = normalizeOptionalTextField("projectDefinitionsDir", options.projectDefinitionsDir);
+	if (!projectDefinitionsDirResult.ok) return projectDefinitionsDirResult;
+
+	const globalDefinitionsDirResult = normalizeOptionalTextField("globalDefinitionsDir", options.globalDefinitionsDir);
+	if (!globalDefinitionsDirResult.ok) return globalDefinitionsDirResult;
+
+	if (options.defaultDefinitions !== undefined && !Array.isArray(options.defaultDefinitions)) {
+		return fail("defaultDefinitions must be an array");
+	}
+
+	return ok({
+		cwd: cwdResult.value,
+		homeDir: homeDirResult.value,
+		projectDefinitionsDir: projectDefinitionsDirResult.value,
+		globalDefinitionsDir: globalDefinitionsDirResult.value,
+		defaultDefinitions: (options.defaultDefinitions as ReadonlyArray<EmbeddedAgentDefinitionInput> | undefined)
+			?? DEFAULT_AGENT_DEFINITIONS,
+	});
+}
+
 function bestEffortCleanupBootstrapConfig(bootstrapConfigPath: string): void {
 	try {
 		fs.rmSync(bootstrapConfigPath, { force: true });
@@ -260,6 +356,14 @@ function normalizeEnabled(value: unknown): ValidationOutcome<boolean> {
 	if (value === undefined) return ok(true);
 	if (typeof value === "boolean") return ok(value);
 	return fail("enabled must be a boolean");
+}
+
+function normalizeAgentDefinitionSource(value: unknown): ValidationOutcome<AgentDefinitionSource> {
+	if (value === "default" || value === "global" || value === "project") {
+		return ok(value);
+	}
+
+	return fail('source must be one of "default", "global", or "project"');
 }
 
 function parseFrontmatterScalar(rawValue: string): string | boolean {
@@ -361,6 +465,12 @@ function normalizeAgentDefinition(input: {
 		return fail("instructions must be a non-empty string");
 	}
 
+	const sourceResult = normalizeAgentDefinitionSource(input.source);
+	if (!sourceResult.ok) return sourceResult;
+
+	const definitionPathResult = normalizeOptionalTextField("definitionPath", input.definitionPath);
+	if (!definitionPathResult.ok) return definitionPathResult;
+
 	return ok({
 		name: nameResult.value,
 		displayName: displayNameResult.value,
@@ -368,9 +478,9 @@ function normalizeAgentDefinition(input: {
 		instructions: rawInstructions,
 		promptMode: promptModeResult.value,
 		enabled: enabledResult.value,
-		source: input.source,
-		isDefault: input.source === "default",
-		definitionPath: input.definitionPath,
+		source: sourceResult.value,
+		isDefault: sourceResult.value === "default",
+		definitionPath: definitionPathResult.value,
 	});
 }
 
@@ -487,12 +597,16 @@ function loadDefaultDefinitions(
 function buildRegistryDefinitions(
 	options: AgentDefinitionRegistryOptions,
 ): ValidationOutcome<Map<string, AgentDefinition>> {
-	const defaultDefinitionsResult = loadDefaultDefinitions(options.defaultDefinitions ?? DEFAULT_AGENT_DEFINITIONS);
+	const normalizedOptionsResult = normalizeRegistryOptions(options);
+	if (!normalizedOptionsResult.ok) return normalizedOptionsResult;
+	const normalizedOptions = normalizedOptionsResult.value;
+
+	const defaultDefinitionsResult = loadDefaultDefinitions(normalizedOptions.defaultDefinitions);
 	if (!defaultDefinitionsResult.ok) return defaultDefinitionsResult;
 
-	const homeDir = options.homeDir ?? os.homedir();
-	const globalDefinitionsDir = options.globalDefinitionsDir ?? path.join(homeDir, GLOBAL_DEFINITIONS_RELATIVE_DIR);
-	const projectDefinitionsDir = options.projectDefinitionsDir ?? path.join(options.cwd, PROJECT_DEFINITIONS_RELATIVE_DIR);
+	const homeDir = normalizedOptions.homeDir ?? os.homedir();
+	const globalDefinitionsDir = normalizedOptions.globalDefinitionsDir ?? path.join(homeDir, GLOBAL_DEFINITIONS_RELATIVE_DIR);
+	const projectDefinitionsDir = normalizedOptions.projectDefinitionsDir ?? path.join(normalizedOptions.cwd, PROJECT_DEFINITIONS_RELATIVE_DIR);
 
 	const globalDefinitionsResult = loadDefinitionsFromDir(globalDefinitionsDir, "global");
 	if (!globalDefinitionsResult.ok) return globalDefinitionsResult;
@@ -552,9 +666,14 @@ export class AgentDefinitionRegistry {
 			return fail(`agent type is disabled: ${definition.name}`);
 		}
 
+		const generalPurposeDefinition = this.definitions.get(toCanonicalLookupKey("general-purpose"));
+
 		return ok({
 			...cloneDefinition(definition),
 			requestedName: nameResult.value,
+			generalPurposeInstructions: generalPurposeDefinition?.enabled !== false
+				? generalPurposeDefinition?.instructions
+				: undefined,
 		});
 	}
 }
@@ -572,16 +691,26 @@ export function composeNamedSubagentInitialPrompt(
 	definition: AgentDefinition,
 	taskPrompt: string,
 ): ValidationOutcome<string> {
+	const definitionResult = normalizeResolvedAgentDefinition(
+		isRecord(definition)
+			? {
+				...definition,
+				requestedName: definition.requestedName ?? definition.name,
+			}
+			: definition,
+	);
+	if (!definitionResult.ok) return definitionResult;
+
 	const taskPromptResult = normalizeTextField("taskPrompt", taskPrompt);
 	if (!taskPromptResult.ok) return taskPromptResult;
 
-	const instructions = definition.promptMode === "append"
-		? `${GENERAL_PURPOSE_INSTRUCTIONS}\n\n${definition.instructions}`.trim()
-		: definition.instructions;
+	const instructions = definitionResult.value.promptMode === "append"
+		? `${definitionResult.value.generalPurposeInstructions ?? GENERAL_PURPOSE_INSTRUCTIONS}\n\n${definitionResult.value.instructions}`.trim()
+		: definitionResult.value.instructions;
 
 	return ok([
-		`Agent type: ${definition.name}`,
-		`Description: ${definition.description}`,
+		`Agent type: ${definitionResult.value.name}`,
+		`Description: ${definitionResult.value.description}`,
 		"",
 		instructions,
 		"",
@@ -606,7 +735,7 @@ export function prepareNamedSubagentSpawn(
 	const descriptionResult = normalizeTextField("description", input.description);
 	if (!descriptionResult.ok) return descriptionResult;
 
-	const resolvedDefinitionResult = input.registry.resolve(input.type);
+	const resolvedDefinitionResult = normalizeResolvedAgentDefinitionOutcome(input.registry.resolve(input.type));
 	if (!resolvedDefinitionResult.ok) return resolvedDefinitionResult;
 
 	const initialPromptResult = composeNamedSubagentInitialPrompt(resolvedDefinitionResult.value, input.taskPrompt);

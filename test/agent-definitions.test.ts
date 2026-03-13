@@ -80,6 +80,21 @@ beforeEach(() => {
 });
 
 describe("loadAgentDefinitionRegistry", () => {
+	it("returns a validation error for malformed registry options instead of throwing", () => {
+		expect(loadAgentDefinitionRegistry(null as unknown as AgentDefinitionRegistry["options"])).toEqual({
+			ok: false,
+			error: "agent definition registry options must be an object",
+		});
+		expect(loadAgentDefinitionRegistry({
+			cwd: fakeRepoDir,
+			homeDir: fakeHomeDir,
+			defaultDefinitions: "bad" as unknown as [],
+		})).toEqual({
+			ok: false,
+			error: "defaultDefinitions must be an array",
+		});
+	});
+
 	it("loads the embedded defaults into a strict runtime registry", () => {
 		const registryResult = loadAgentDefinitionRegistry({
 			cwd: fakeRepoDir,
@@ -221,6 +236,14 @@ enabled: false
 });
 
 describe("AgentDefinitionRegistry.refresh", () => {
+	it("returns a validation error for malformed constructor options instead of throwing", () => {
+		const registry = new AgentDefinitionRegistry(null as unknown as ConstructorParameters<typeof AgentDefinitionRegistry>[0]);
+		expect(registry.refresh()).toEqual({
+			ok: false,
+			error: "agent definition registry options must be an object",
+		});
+	});
+
 	it("does not poison previously loaded definitions when a later refresh fails", () => {
 		const registry = makeRegistry();
 		const firstRefresh = registry.refresh();
@@ -255,6 +278,50 @@ Broken definition.`,
 });
 
 describe("composeNamedSubagentInitialPrompt", () => {
+	it("uses the resolved overridden general-purpose base for append mode", () => {
+		writeProjectAgent(
+			"general-purpose",
+			`---
+description: Overridden base
+---
+
+Use the project-specific base instructions first.`,
+		);
+		writeProjectAgent(
+			"auditor",
+			`---
+description: Security auditor
+prompt_mode: append
+---
+
+Look for security problems first.`,
+		);
+		const registryResult = loadAgentDefinitionRegistry({
+			cwd: fakeRepoDir,
+			homeDir: fakeHomeDir,
+		});
+		expect(registryResult.ok).toBe(true);
+		if (!registryResult.ok) {
+			return;
+		}
+
+		const resolvedResult = registryResult.value.resolve("auditor");
+		expect(resolvedResult.ok).toBe(true);
+		if (!resolvedResult.ok) {
+			return;
+		}
+
+		const promptResult = composeNamedSubagentInitialPrompt(resolvedResult.value, "Review the auth flow.");
+		expect(promptResult.ok).toBe(true);
+		if (!promptResult.ok) {
+			return;
+		}
+
+		expect(promptResult.value).toContain("Use the project-specific base instructions first.");
+		expect(promptResult.value).not.toContain("You are a general-purpose coding agent for complex, multi-step tasks.");
+		expect(promptResult.value).toContain("Look for security problems first.");
+	});
+
 	it("supports append mode by combining the general-purpose base with custom instructions", () => {
 		writeProjectAgent(
 			"auditor",
@@ -289,6 +356,15 @@ Look for security problems first.`,
 		expect(promptResult.value).toContain("general-purpose coding agent");
 		expect(promptResult.value).toContain("Look for security problems first.");
 		expect(promptResult.value).toContain("Task:\nReview the auth flow.");
+	});
+
+	it("returns a validation error for malformed definition input instead of throwing", () => {
+		expect(
+			composeNamedSubagentInitialPrompt(null as unknown as Parameters<typeof composeNamedSubagentInitialPrompt>[0], "Review auth."),
+		).toEqual({
+			ok: false,
+			error: "resolved agent definition must be an object",
+		});
 	});
 });
 
@@ -457,6 +533,98 @@ enabled: false
 			ok: false,
 			error: "writeBootstrapConfig must be a function",
 		});
+	});
+
+	it("returns validation errors for malformed registry resolve results instead of throwing", () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrapConfigPath = path.join(runtimeDir, "malformed-result.bootstrap.json");
+
+		const nullResult = prepareNamedSubagentSpawn({
+			registry: {
+				resolve() {
+					return null as unknown as ReturnType<AgentDefinitionRegistry["resolve"]>;
+				},
+			} as unknown as AgentDefinitionRegistry,
+			type: "general-purpose",
+			description: "Malformed result",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_malformed_result",
+			sessionPath: path.join(runtimeDir, "malformed-result.session.jsonl"),
+			socketPath: path.join(runtimeDir, "malformed-result.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.5",
+			bootstrapConfigPath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+		});
+		expect(nullResult).toEqual({
+			ok: false,
+			error: "registry.resolve must return a ValidationOutcome",
+		});
+		expect(fs.existsSync(bootstrapConfigPath)).toBe(false);
+
+		const malformedSuccessPath = path.join(runtimeDir, "malformed-success.bootstrap.json");
+		const malformedSuccessResult = prepareNamedSubagentSpawn({
+			registry: {
+				resolve() {
+					return { ok: true, value: { name: "bad" } } as unknown as ReturnType<AgentDefinitionRegistry["resolve"]>;
+				},
+			} as unknown as AgentDefinitionRegistry,
+			type: "general-purpose",
+			description: "Malformed success result",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_malformed_success",
+			sessionPath: path.join(runtimeDir, "malformed-success.session.jsonl"),
+			socketPath: path.join(runtimeDir, "malformed-success.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.6",
+			bootstrapConfigPath: malformedSuccessPath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+		});
+		expect(malformedSuccessResult).toEqual({
+			ok: false,
+			error: "instructions must be a non-empty string",
+		});
+		expect(fs.existsSync(malformedSuccessPath)).toBe(false);
+
+		const malformedSourcePath = path.join(runtimeDir, "malformed-source.bootstrap.json");
+		const malformedSourceResult = prepareNamedSubagentSpawn({
+			registry: {
+				resolve() {
+					return {
+						ok: true,
+						value: {
+							name: "bad",
+							displayName: "Bad",
+							description: "Bad definition",
+							instructions: "Do the work.",
+							promptMode: "replace",
+							enabled: true,
+							source: "memory",
+							requestedName: "bad",
+							definitionPath: 42,
+						},
+					} as unknown as ReturnType<AgentDefinitionRegistry["resolve"]>;
+				},
+			} as unknown as AgentDefinitionRegistry,
+			type: "general-purpose",
+			description: "Malformed source result",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_malformed_source",
+			sessionPath: path.join(runtimeDir, "malformed-source.session.jsonl"),
+			socketPath: path.join(runtimeDir, "malformed-source.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.7",
+			bootstrapConfigPath: malformedSourcePath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+		});
+		expect(malformedSourceResult).toEqual({
+			ok: false,
+			error: 'source must be one of "default", "global", or "project"',
+		});
+		expect(fs.existsSync(malformedSourcePath)).toBe(false);
 	});
 
 	it("best-effort removes a partially written bootstrap file if the writer throws", () => {
