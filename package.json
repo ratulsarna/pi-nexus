@@ -5,6 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"accept:rat-131": "node ./scripts/accept-rat-131.mjs",
+		"accept:rat-133": "node ./scripts/accept-rat-133.mjs",
 		"accept:rat-134": "node ./scripts/accept-rat-134.mjs",
 		"accept:rat-135": "node ./scripts/accept-rat-135.mjs",
 		"build": "tsc -p tsconfig.build.json",
@@ -17,5 +18,8 @@
 		"@types/node": "^24.3.0",
 		"typescript": "^5.9.2",
 		"vitest": "^3.2.4"
+	},
+	"dependencies": {
+		"@sinclair/typebox": "^0.34.48"
 	}
 }

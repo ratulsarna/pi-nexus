@@ -67,6 +67,11 @@ export interface SubagentManagerOptions<TData = unknown> {
 	now?: () => string;
 	sidecarSessions: SidecarSessionAdapter<TData>;
 	runtimeProcesses: SubagentProcessAdapter;
+	onEventAccepted?: (
+		agentId: string,
+		event: SidecarEventMessage<TData>,
+		record: SubagentRecord<TData>,
+	) => void;
 	onSessionOpened?: (agentId: string, handle: SidecarSessionHandle<TData>) => void;
 }
 
@@ -410,6 +415,7 @@ export class SubagentManager<TData = unknown> {
 		if (!applyResult.ok) return applyResult;
 
 		runtime.lastInboundSeq = seqResult.value;
+		this.notifyAcceptedEvent(agentId, event, runtime.record);
 		return ok(cloneValue(runtime.record));
 	}
 
@@ -1087,6 +1093,18 @@ export class SubagentManager<TData = unknown> {
 			return fail(`unknown managed agent: ${agentId}`);
 		}
 		return ok(runtime);
+	}
+
+	private notifyAcceptedEvent(
+		agentId: string,
+		event: SidecarEventMessage<TData>,
+		record: SubagentRecord<TData>,
+	): void {
+		try {
+			this.options.onEventAccepted?.(agentId, cloneValue(event), cloneValue(record));
+		} catch {
+			// Best-effort observer hook for parent-session integration.
+		}
 	}
 
 	private isTerminal(state: RuntimeState): boolean {
