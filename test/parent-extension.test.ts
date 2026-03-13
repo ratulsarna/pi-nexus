@@ -676,4 +676,65 @@ Research the codebase carefully and report findings.`,
 		expect(sidecars.get(agentId).closeCount).toBe(1);
 		expect(tmux.killedSessions).toHaveLength(1);
 	});
+
+	it("ignores shutdown events for sessions that are no longer active", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:40:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const firstCtx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "first.jsonl"));
+		await pi.emit("session_start", {}, firstCtx);
+
+		const tool = getRegisteredTool(pi, "Agent");
+		await tool.execute(
+			"tool-call-first",
+			{
+				prompt: "Stay alive in first session.",
+				description: "First session agent",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			firstCtx,
+		);
+
+		const firstAgentId = Array.from(processes.handles.keys())[0];
+		expect(firstAgentId).toBeDefined();
+
+		const secondCtx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "second.jsonl"));
+		await pi.emit("session_start", {}, secondCtx);
+		expect(processes.get(firstAgentId).terminateReasons).toContain("shutdown");
+		expect(sidecars.get(firstAgentId).closeCount).toBe(1);
+
+		await tool.execute(
+			"tool-call-second",
+			{
+				prompt: "Stay alive in second session.",
+				description: "Second session agent",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			secondCtx,
+		);
+
+		const secondAgentId = Array.from(processes.handles.keys()).find((agentId) => agentId !== firstAgentId);
+		expect(secondAgentId).toBeDefined();
+		expect(tmux.sessionTargets.size).toBe(1);
+
+		await pi.emit("session_shutdown", {}, firstCtx);
+
+		expect(processes.get(secondAgentId!).terminateReasons).toEqual([]);
+		expect(sidecars.get(secondAgentId!).closeCount).toBe(0);
+		expect(tmux.sessionTargets.size).toBe(1);
+	});
 });

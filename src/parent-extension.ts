@@ -634,7 +634,12 @@ export function installParentExtension(
 		activeState.busy = false;
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const shuttingDownSessionFile = ctx.sessionManager.getSessionFile();
+		if (!activeState || activeState.sessionFile !== shuttingDownSessionFile) {
+			return;
+		}
+
 		shutdownParentSession(activeState, effectiveOptions.runTmuxCommand);
 		activeState = undefined;
 	});
