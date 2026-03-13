@@ -484,7 +484,11 @@ function normalizeAgentDefinition(input: {
 	});
 }
 
-function normalizeEmbeddedDefinitionInput(input: EmbeddedAgentDefinitionInput): ValidationOutcome<AgentDefinition> {
+function normalizeEmbeddedDefinitionInput(input: unknown): ValidationOutcome<AgentDefinition> {
+	if (!isRecord(input)) {
+		return fail("embedded agent definition must be an object");
+	}
+
 	return normalizeAgentDefinition({
 		name: input.name,
 		displayName: input.displayName,
@@ -735,7 +739,14 @@ export function prepareNamedSubagentSpawn(
 	const descriptionResult = normalizeTextField("description", input.description);
 	if (!descriptionResult.ok) return descriptionResult;
 
-	const resolvedDefinitionResult = normalizeResolvedAgentDefinitionOutcome(input.registry.resolve(input.type));
+	let rawResolvedDefinition: unknown;
+	try {
+		rawResolvedDefinition = input.registry.resolve(input.type);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return fail(`failed to resolve agent type: ${reason}`);
+	}
+	const resolvedDefinitionResult = normalizeResolvedAgentDefinitionOutcome(rawResolvedDefinition);
 	if (!resolvedDefinitionResult.ok) return resolvedDefinitionResult;
 
 	const initialPromptResult = composeNamedSubagentInitialPrompt(resolvedDefinitionResult.value, input.taskPrompt);

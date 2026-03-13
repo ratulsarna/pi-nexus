@@ -93,6 +93,14 @@ describe("loadAgentDefinitionRegistry", () => {
 			ok: false,
 			error: "defaultDefinitions must be an array",
 		});
+		expect(loadAgentDefinitionRegistry({
+			cwd: fakeRepoDir,
+			homeDir: fakeHomeDir,
+			defaultDefinitions: [null as unknown as never],
+		})).toEqual({
+			ok: false,
+			error: "embedded agent definition must be an object",
+		});
 	});
 
 	it("loads the embedded defaults into a strict runtime registry", () => {
@@ -625,6 +633,35 @@ enabled: false
 			error: 'source must be one of "default", "global", or "project"',
 		});
 		expect(fs.existsSync(malformedSourcePath)).toBe(false);
+	});
+
+	it("returns a validation error if registry.resolve throws instead of bubbling the throw", () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrapConfigPath = path.join(runtimeDir, "thrown-resolve.bootstrap.json");
+
+		const thrownResolveResult = prepareNamedSubagentSpawn({
+			registry: {
+				resolve() {
+					throw new Error("resolve exploded");
+				},
+			} as unknown as AgentDefinitionRegistry,
+			type: "general-purpose",
+			description: "Thrown resolve",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_thrown_resolve",
+			sessionPath: path.join(runtimeDir, "thrown-resolve.session.jsonl"),
+			socketPath: path.join(runtimeDir, "thrown-resolve.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.8",
+			bootstrapConfigPath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+		});
+		expect(thrownResolveResult).toEqual({
+			ok: false,
+			error: "failed to resolve agent type: resolve exploded",
+		});
+		expect(fs.existsSync(bootstrapConfigPath)).toBe(false);
 	});
 
 	it("best-effort removes a partially written bootstrap file if the writer throws", () => {
