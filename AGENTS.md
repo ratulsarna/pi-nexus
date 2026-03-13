@@ -25,3 +25,6 @@
 - For bind/create endpoints, validate availability, not just syntax. A path can be absolute and well-formed but still be unusable because the target is already occupied.
 - Lifecycle contracts need chronology checks, not just timestamp format checks. Well-formed timestamps can still describe impossible runtime histories.
 - Treat contract-boundary tickets as hardening work, not ordinary feature work. Start with an edge-case matrix covering shape, presence, filesystem reality, lifecycle state, and chronology, and expect a longer review tail than a normal feature ticket.
+- Contract-boundary validation must cover nested elements, callable collaborators, and collaborator return shapes, not just the top-level input object. If a caller-provided method can throw or return malformed data, convert that into a validation failure instead of letting it escape.
+- Once precedence or override resolution produces a canonical config, all downstream behavior must use that resolved value as execution truth. Do not reintroduce baked-in defaults in later composition paths.
+- When preparing runtime-owned files, use atomic create-or-fail semantics and track ownership for cleanup. Do not rely on exists-then-write checks, and do not delete paths unless this code path actually created them.
