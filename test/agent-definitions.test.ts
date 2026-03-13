@@ -405,4 +405,129 @@ enabled: false
 		});
 		expect(fs.existsSync(unknownPath)).toBe(false);
 	});
+
+	it("returns validation errors for malformed registry-like or writer inputs instead of throwing", () => {
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrapConfigPath = path.join(runtimeDir, "malformed.bootstrap.json");
+
+		const malformedRegistryResult = prepareNamedSubagentSpawn({
+			registry: null as unknown as AgentDefinitionRegistry,
+			type: "general-purpose",
+			description: "Malformed registry",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_malformed_registry",
+			sessionPath: path.join(runtimeDir, "malformed.session.jsonl"),
+			socketPath: path.join(runtimeDir, "malformed.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.1",
+			bootstrapConfigPath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+		});
+		expect(malformedRegistryResult).toEqual({
+			ok: false,
+			error: "registry must provide a resolve(name) function",
+		});
+
+		const registryResult = loadAgentDefinitionRegistry({
+			cwd: fakeRepoDir,
+			homeDir: fakeHomeDir,
+		});
+		expect(registryResult.ok).toBe(true);
+		if (!registryResult.ok) {
+			return;
+		}
+
+		const malformedWriterResult = prepareNamedSubagentSpawn({
+			registry: registryResult.value,
+			type: "general-purpose",
+			description: "Malformed writer",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_malformed_writer",
+			sessionPath: path.join(runtimeDir, "writer.session.jsonl"),
+			socketPath: path.join(runtimeDir, "writer.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.2",
+			bootstrapConfigPath: path.join(runtimeDir, "writer.bootstrap.json"),
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+			writeBootstrapConfig: 42 as unknown as (bootstrapConfigPath: string, serializedConfig: string) => void,
+		});
+		expect(malformedWriterResult).toEqual({
+			ok: false,
+			error: "writeBootstrapConfig must be a function",
+		});
+	});
+
+	it("best-effort removes a partially written bootstrap file if the writer throws", () => {
+		const registryResult = loadAgentDefinitionRegistry({
+			cwd: fakeRepoDir,
+			homeDir: fakeHomeDir,
+		});
+		expect(registryResult.ok).toBe(true);
+		if (!registryResult.ok) {
+			return;
+		}
+
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrapConfigPath = path.join(runtimeDir, "partial.bootstrap.json");
+		const preparedResult = prepareNamedSubagentSpawn({
+			registry: registryResult.value,
+			type: "general-purpose",
+			description: "Partial writer",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_partial_writer",
+			sessionPath: path.join(runtimeDir, "partial.session.jsonl"),
+			socketPath: path.join(runtimeDir, "partial.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.3",
+			bootstrapConfigPath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+			writeBootstrapConfig(targetPath, serializedConfig) {
+				fs.writeFileSync(targetPath, serializedConfig, "utf8");
+				throw new Error("writer exploded");
+			},
+		});
+		expect(preparedResult).toEqual({
+			ok: false,
+			error: "failed to write bootstrap config: writer exploded",
+		});
+		expect(fs.existsSync(bootstrapConfigPath)).toBe(false);
+	});
+
+	it("atomically refuses to reuse an existing bootstrap config path", () => {
+		const registryResult = loadAgentDefinitionRegistry({
+			cwd: fakeRepoDir,
+			homeDir: fakeHomeDir,
+		});
+		expect(registryResult.ok).toBe(true);
+		if (!registryResult.ok) {
+			return;
+		}
+
+		const runtimeDir = fs.mkdtempSync(path.join(fakeRepoDir, "runtime-"));
+		const bootstrapConfigPath = path.join(runtimeDir, "existing.bootstrap.json");
+		fs.writeFileSync(bootstrapConfigPath, "already here\n", "utf8");
+
+		const preparedResult = prepareNamedSubagentSpawn({
+			registry: registryResult.value,
+			type: "general-purpose",
+			description: "Existing path",
+			taskPrompt: "Inspect auth.",
+			agentId: "agt_existing_path",
+			sessionPath: path.join(runtimeDir, "existing.session.jsonl"),
+			socketPath: path.join(runtimeDir, "existing.sock"),
+			tmuxMode: "pane",
+			tmuxTarget: "main:2.4",
+			bootstrapConfigPath,
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			cwd: fakeRepoDir,
+		});
+		expect(preparedResult).toEqual({
+			ok: false,
+			error: "bootstrapConfigPath must not already exist",
+		});
+		expect(fs.readFileSync(bootstrapConfigPath, "utf8")).toBe("already here\n");
+	});
 });

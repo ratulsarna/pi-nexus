@@ -76,6 +76,10 @@ export interface PreparedNamedSubagentSpawn {
 	request: ManagedSubagentSpawnRequest;
 }
 
+interface AgentDefinitionRegistryLike {
+	resolve(name: string): ValidationOutcome<ResolvedAgentDefinition>;
+}
+
 export const SUPPORTED_AGENT_DEFINITION_FRONTMATTER_FIELDS = new Set([
 	"description",
 	"display_name",
@@ -194,6 +198,18 @@ function ok<T>(value: T): ValidationResult<T> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRegistryLike(value: unknown): value is AgentDefinitionRegistryLike {
+	return isRecord(value) && typeof value.resolve === "function";
+}
+
+function bestEffortCleanupBootstrapConfig(bootstrapConfigPath: string): void {
+	try {
+		fs.rmSync(bootstrapConfigPath, { force: true });
+	} catch {
+		// Best-effort cleanup for partially prepared bootstrap config files.
+	}
 }
 
 function cloneDefinition(definition: AgentDefinition): AgentDefinition {
@@ -580,6 +596,12 @@ export function prepareNamedSubagentSpawn(
 	if (!isRecord(input)) {
 		return fail("named subagent spawn input must be an object");
 	}
+	if (!isRegistryLike(input.registry)) {
+		return fail("registry must provide a resolve(name) function");
+	}
+	if (input.writeBootstrapConfig !== undefined && typeof input.writeBootstrapConfig !== "function") {
+		return fail("writeBootstrapConfig must be a function");
+	}
 
 	const descriptionResult = normalizeTextField("description", input.description);
 	if (!descriptionResult.ok) return descriptionResult;
@@ -594,9 +616,6 @@ export function prepareNamedSubagentSpawn(
 	if (!bootstrapConfigPathResult.ok) return bootstrapConfigPathResult;
 	if (!path.isAbsolute(bootstrapConfigPathResult.value)) {
 		return fail("bootstrapConfigPath must be an absolute path");
-	}
-	if (fs.existsSync(bootstrapConfigPathResult.value)) {
-		return fail("bootstrapConfigPath must not already exist");
 	}
 
 	const bootstrapConfig: RuntimeBootstrapConfig = {
@@ -613,25 +632,34 @@ export function prepareNamedSubagentSpawn(
 	const bootstrapValidation = validateRuntimeBootstrapConfig(bootstrapConfig);
 	if (!bootstrapValidation.ok) return bootstrapValidation;
 
+	let createdBootstrapConfig = false;
 	const writer = input.writeBootstrapConfig ?? ((bootstrapConfigPath: string, serializedConfig: string) => {
-		fs.writeFileSync(bootstrapConfigPath, serializedConfig, "utf8");
+		fs.writeFileSync(bootstrapConfigPath, serializedConfig, { encoding: "utf8", flag: "wx" });
 	});
 	try {
 		writer(
 			bootstrapConfigPathResult.value,
 			`${JSON.stringify(bootstrapValidation.value, null, 2)}\n`,
 		);
+		createdBootstrapConfig = fs.existsSync(bootstrapConfigPathResult.value);
 	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+			return fail("bootstrapConfigPath must not already exist");
+		}
+
+		createdBootstrapConfig = fs.existsSync(bootstrapConfigPathResult.value);
+		if (createdBootstrapConfig) {
+			bestEffortCleanupBootstrapConfig(bootstrapConfigPathResult.value);
+			createdBootstrapConfig = false;
+		}
 		const reason = error instanceof Error ? error.message : String(error);
 		return fail(`failed to write bootstrap config: ${reason}`);
 	}
 
 	const launchSpecResult = createRuntimeLaunchSpec(bootstrapValidation.value, bootstrapConfigPathResult.value);
 	if (!launchSpecResult.ok) {
-		try {
-			fs.rmSync(bootstrapConfigPathResult.value, { force: true });
-		} catch {
-			// Best-effort cleanup after launch-spec preparation failure.
+		if (createdBootstrapConfig) {
+			bestEffortCleanupBootstrapConfig(bootstrapConfigPathResult.value);
 		}
 		return launchSpecResult;
 	}
