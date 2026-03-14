@@ -397,34 +397,7 @@ describe("installSubagentBootstrapExtension", () => {
 		});
 	});
 
-	it("synthesizes a final_result from assistant output on agent_end when the child does not report explicitly", async () => {
-		const { socket, pi, ctx } = await startReadyBootstrapSession(
-			"agt_child_agent_end_fallback",
-			"2026-03-12T10:09:05.000Z",
-		);
-
-		await pi.emit("agent_start", {}, ctx);
-		await pi.emit("agent_end", {
-			type: "agent_end",
-			messages: [
-				{
-					role: "assistant",
-					content: [
-						{ type: "text", text: "Done. Hi from the child agent." },
-					],
-				},
-			],
-		}, ctx);
-
-		const sent = parseSentEnvelopes(socket);
-		expect(sent.map((message) => message.type)).toEqual(["ready", "final_result"]);
-		expect(sent[1]?.payload).toEqual({
-			summary: "Done. Hi from the child agent.",
-			data: null,
-		});
-	});
-
-	it("does not synthesize a duplicate final_result on agent_end after an explicit terminal report", async () => {
+	it("does not emit a duplicate final_result on agent_end after an explicit terminal report", async () => {
 		const { socket, pi, ctx } = await startReadyBootstrapSession(
 			"agt_child_agent_end_no_duplicate",
 			"2026-03-12T10:09:06.000Z",

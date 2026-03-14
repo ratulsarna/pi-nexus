@@ -81,54 +81,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function extractAssistantTextContent(message: unknown): string | undefined {
-	if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) {
-		return undefined;
-	}
-
-	const parts = message.content
-		.filter((entry): entry is Record<string, unknown> => isRecord(entry))
-		.filter((entry) => entry.type === "text" && typeof entry.text === "string")
-		.map((entry) => {
-			const text = entry.text;
-			return typeof text === "string" ? text.trim() : "";
-		})
-		.filter((entry) => entry.length > 0);
-	if (parts.length === 0) {
-		return undefined;
-	}
-
-	return parts.join("\n\n");
-}
-
-function extractFallbackFinalResult(event: unknown): { summary: string; data: unknown } | undefined {
-	if (!isRecord(event) || !Array.isArray(event.messages)) {
-		return undefined;
-	}
-
-	for (let index = event.messages.length - 1; index >= 0; index -= 1) {
-		const text = extractAssistantTextContent(event.messages[index]);
-		if (!text) {
-			continue;
-		}
-
-		const firstLine = text
-			.split("\n")
-			.map((line) => line.trim())
-			.find((line) => line.length > 0) ?? text;
-		const summary = firstLine.length > 240
-			? `${firstLine.slice(0, 237).trimEnd()}...`
-			: firstLine;
-
-		return {
-			summary,
-			data: text === summary ? null : { assistantText: text, synthesizedFrom: "agent_end" },
-		};
-	}
-
-	return undefined;
-}
-
 function loadBootstrapConfig(
 	env: Readonly<Record<string, string | undefined>>,
 	readConfigText: (configPath: string) => string,
@@ -333,7 +285,7 @@ class SubagentBootstrapSession {
 		this.terminalReportSentForCurrentTurn = false;
 	}
 
-	public handleAgentEnd(event: unknown): void {
+	public handleAgentEnd(_event: unknown): void {
 		if (!this.ready) {
 			return;
 		}
@@ -341,20 +293,6 @@ class SubagentBootstrapSession {
 			this.completeInterrupt();
 			return;
 		}
-		if (this.terminalReportSentForCurrentTurn) {
-			return;
-		}
-
-		const fallbackResult = extractFallbackFinalResult(event);
-		if (!fallbackResult) {
-			return;
-		}
-
-		this.sendEvent("final_result", {
-			summary: fallbackResult.summary,
-			data: fallbackResult.data,
-		});
-		this.terminalReportSentForCurrentTurn = true;
 	}
 
 	public handleInput(event: unknown): void {
