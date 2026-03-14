@@ -297,11 +297,11 @@ async function main() {
 
 		await sleep(3000);
 		const spawnPrompt = [
-			"Use the Agent tool exactly once right now.",
+			"Use the Subagent tool exactly once right now with action spawn.",
 			"Spawn a general-purpose subagent with description RAT133 acceptance and tmux_mode window.",
 			"The subagent prompt must instruct the child to call report_to_parent twice: first kind progress summary RAT133 child started, then kind final_result summary RAT133 child finished, then wait silently for more input.",
 			"Do not use any other tool.",
-			"After the Agent tool call succeeds, stop.",
+			"After the Subagent tool call succeeds, stop.",
 		].join(" ");
 		sendLine(mainPaneTarget, spawnPrompt);
 		log("sent parent spawn prompt");

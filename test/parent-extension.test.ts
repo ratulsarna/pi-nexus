@@ -338,10 +338,11 @@ Research the codebase carefully and report findings.`,
 		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "main.jsonl"));
 		await pi.emit("session_start", {}, ctx);
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		const result = await tool.execute(
 			"tool-call-1",
 			{
+				action: "spawn",
 				prompt: "Inspect the repository and summarize the architecture.",
 				description: "Architecture review",
 				subagent_type: "Researcher",
@@ -396,6 +397,97 @@ Research the codebase carefully and report findings.`,
 		});
 	});
 
+	it("manages live children through the generic Subagent tool", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:05:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "subagent-tool.jsonl"));
+		await pi.emit("session_start", {}, ctx);
+
+		const tool = getRegisteredTool(pi, "Subagent");
+		const spawnResult = await tool.execute(
+			"tool-call-subagent-spawn",
+			{
+				action: "spawn",
+				prompt: "Say hi and wait for the next instruction.",
+				description: "Greeting child",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		const spawnText = spawnResult.content[0]?.text ?? "";
+		expect(spawnText).toContain("Spawned subagent agt_001_");
+		expect(spawnText).toContain("Use the Subagent tool with action=list, send, interrupt, or focus");
+
+		const agentId = Array.from(processes.handles.keys())[0];
+		const launchSpec = processes.get(agentId).launchSpec;
+		expect(sidecars.get(agentId).connect()).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecars.get(agentId).message(
+			makeEnvelope(agentId, "ready", 0, "2026-03-13T12:05:01.000Z", {
+				pid: 303,
+				sessionPath: launchSpec.sessionPath,
+				tmuxTarget: launchSpec.tmuxTarget,
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+
+		const listResult = await tool.execute(
+			"tool-call-subagent-list",
+			{ action: "list" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(listResult.content[0]?.text ?? "").toContain(agentId);
+
+		const focusResult = await tool.execute(
+			"tool-call-subagent-focus",
+			{ action: "focus", agent_id: agentId },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(focusResult.content[0]?.text ?? "").toContain(`Subagent focus target for ${agentId}`);
+
+		const sendResult = await tool.execute(
+			"tool-call-subagent-send",
+			{ action: "send", agent_id: agentId, message: "send joke 2" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(sendResult.content[0]?.text ?? "").toContain(`Queued follow-up for ${agentId}.`);
+		expect(sidecars.get(agentId).sent.at(-1)).toMatchObject({
+			type: "follow_up",
+			payload: { message: "send joke 2" },
+		});
+
+		const interruptResult = await tool.execute(
+			"tool-call-subagent-interrupt",
+			{ action: "interrupt", agent_id: agentId },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(interruptResult.content[0]?.text ?? "").toContain(`Sent interrupt to ${agentId}.`);
+		expect(sidecars.get(agentId).sent.at(-1)).toMatchObject({
+			type: "interrupt",
+			payload: {},
+		});
+	});
+
 	it("bridges accepted child progress and final_result back into the parent session", async () => {
 		const sidecars = new FakeSidecarSessions();
 		const processes = new FakeProcesses();
@@ -415,10 +507,11 @@ Research the codebase carefully and report findings.`,
 		ctx.idle = false;
 		await pi.emit("agent_start", {}, ctx);
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		await tool.execute(
 			"tool-call-bridge",
 			{
+				action: "spawn",
 				prompt: "Do the work.",
 				description: "Bridge test",
 				subagent_type: "Explore",
@@ -496,10 +589,11 @@ Research the codebase carefully and report findings.`,
 		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "stale.jsonl"));
 		await pi.emit("session_start", {}, ctx);
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		await tool.execute(
 			"tool-call-stale",
 			{
+				action: "spawn",
 				prompt: "Wait for input.",
 				description: "Stale handling",
 				subagent_type: "Plan",
@@ -583,10 +677,11 @@ Research the codebase carefully and report findings.`,
 			return mkdirSync(targetPath, options as Parameters<typeof fs.mkdirSync>[1]);
 		});
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		const result = await tool.execute(
 			"tool-call-mkdir-failure",
 			{
+				action: "spawn",
 				prompt: "Do the work.",
 				description: "Directory failure",
 				subagent_type: "general-purpose",
@@ -633,10 +728,11 @@ Research the codebase carefully and report findings.`,
 			type: "error",
 		});
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		const toolResult = await tool.execute(
 			"tool-call-state-failure",
 			{
+				action: "spawn",
 				prompt: "Do the work.",
 				description: "State failure",
 				subagent_type: "general-purpose",
@@ -673,10 +769,11 @@ Research the codebase carefully and report findings.`,
 		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "shutdown.jsonl"));
 		await pi.emit("session_start", {}, ctx);
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		await tool.execute(
 			"tool-call-shutdown",
 			{
+				action: "spawn",
 				prompt: "Stay alive.",
 				description: "Shutdown cleanup",
 				subagent_type: "general-purpose",
@@ -713,10 +810,11 @@ Research the codebase carefully and report findings.`,
 		const firstCtx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "first.jsonl"));
 		await pi.emit("session_start", {}, firstCtx);
 
-		const tool = getRegisteredTool(pi, "Agent");
+		const tool = getRegisteredTool(pi, "Subagent");
 		await tool.execute(
 			"tool-call-first",
 			{
+				action: "spawn",
 				prompt: "Stay alive in first session.",
 				description: "First session agent",
 				subagent_type: "general-purpose",
@@ -737,6 +835,7 @@ Research the codebase carefully and report findings.`,
 		await tool.execute(
 			"tool-call-second",
 			{
+				action: "spawn",
 				prompt: "Stay alive in second session.",
 				description: "Second session agent",
 				subagent_type: "general-purpose",

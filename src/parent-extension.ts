@@ -142,12 +142,15 @@ interface TmuxSpawnTarget {
 	tmuxMode: TmuxMode;
 }
 
-interface SpawnToolDetails {
-	agentId: string;
-	state: string;
-	subagentType: string;
-	displayName: string;
-	focusAvailability: string;
+type EffectiveParentExtensionOptions = Required<ParentExtensionOptions>;
+
+interface SubagentToolDetails {
+	action: "spawn" | "list" | "send" | "interrupt" | "focus";
+	agentId?: string;
+	state?: string;
+	subagentType?: string;
+	displayName?: string;
+	focusAvailability?: string;
 }
 
 const AGENT_TOOL_PARAMETERS = Type.Object({
@@ -163,6 +166,38 @@ const AGENT_TOOL_PARAMETERS = Type.Object({
 	tmux_mode: Type.Optional(
 		Type.Union([Type.Literal("window"), Type.Literal("pane")], {
 			description: "Tmux focus target type. Defaults to window.",
+		}),
+	),
+});
+
+const SUBAGENT_TOOL_PARAMETERS = Type.Object({
+	action: Type.Union([
+		Type.Literal("spawn"),
+		Type.Literal("list"),
+		Type.Literal("send"),
+		Type.Literal("interrupt"),
+		Type.Literal("focus"),
+	], {
+		description: "Subagent action to perform.",
+	}),
+	agent_id: Type.Optional(Type.String({
+		description: "Managed subagent id for send, interrupt, or focus actions.",
+	})),
+	message: Type.Optional(Type.String({
+		description: "Follow-up message for the send action.",
+	})),
+	prompt: Type.Optional(Type.String({
+		description: "The task for the spawned subagent when action is spawn.",
+	})),
+	description: Type.Optional(Type.String({
+		description: "A short description for the spawned subagent when action is spawn.",
+	})),
+	subagent_type: Type.Optional(Type.String({
+		description: "Named subagent type to use when action is spawn, such as general-purpose, Explore, or Plan.",
+	})),
+	tmux_mode: Type.Optional(
+		Type.Union([Type.Literal("window"), Type.Literal("pane")], {
+			description: "Tmux focus target type for spawn. Defaults to window.",
 		}),
 	),
 });
@@ -517,8 +552,161 @@ function buildSpawnText(
 		`Type: ${displayName} (${record.type})`,
 		`State: ${record.state}`,
 		`Focus availability: ${focusTarget?.availability ?? "unknown"}`,
+		`Use the Subagent tool with action=list, send, interrupt, or focus to keep interacting from the parent session.`,
 		`Use /subagents list or /subagents focus ${record.id} for the live tmux target.`,
 	].join("\n");
+}
+
+function spawnNamedSubagent(
+	state: ParentSessionState,
+	params: Static<typeof AGENT_TOOL_PARAMETERS>,
+	effectiveOptions: EffectiveParentExtensionOptions,
+): ToolResultLike<SubagentToolDetails> {
+	const registryResult = refreshRegistry(state);
+	if (!registryResult.ok) {
+		return textResult(`Failed to load agent definitions: ${registryResult.error}`);
+	}
+
+	state.nextAgentOrdinal += 1;
+	const agentId = `agt_${String(state.nextAgentOrdinal).padStart(3, "0")}_${Date.now().toString(36)}`;
+	const tmuxMode = params.tmux_mode ?? "window";
+	const tmuxTargetResult = allocateTmuxTarget(state, tmuxMode, effectiveOptions.now, effectiveOptions.runTmuxCommand);
+	if (!tmuxTargetResult.ok) {
+		return textResult(`Failed to provision tmux target: ${tmuxTargetResult.error}`);
+	}
+
+	const tmuxTarget = tmuxTargetResult.value;
+	const agentDir = path.join(state.sessionDir, agentId);
+	try {
+		ensureDirectory(agentDir);
+	} catch (error) {
+		killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
+		return textResult(`Failed to prepare agent runtime directory: ${normalizeError(error).message}`);
+	}
+
+	const preparedResult = prepareNamedSubagentSpawn({
+		registry: registryResult.value,
+		type: params.subagent_type,
+		description: params.description,
+		taskPrompt: params.prompt,
+		agentId,
+		sessionPath: path.join(agentDir, "session.jsonl"),
+		socketPath: path.join(agentDir, "sidecar.sock"),
+		tmuxMode: tmuxTarget.tmuxMode,
+		tmuxTarget: tmuxTarget.tmuxTarget,
+		bootstrapConfigPath: path.join(agentDir, "bootstrap.json"),
+		bootstrapExtensionPath: effectiveOptions.bootstrapExtensionPath,
+		cwd: state.cwd,
+	});
+	if (!preparedResult.ok) {
+		killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
+		return textResult(`Failed to prepare named subagent spawn: ${preparedResult.error}`);
+	}
+
+	const spawnResult = state.manager.spawn(preparedResult.value.request);
+	if (!spawnResult.ok) {
+		killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
+		return textResult(`Failed to spawn subagent: ${spawnResult.error}`);
+	}
+
+	state.ownedTmuxRuntimes.set(agentId, {
+		sessionName: tmuxTarget.sessionName,
+		tmuxMode: tmuxTarget.tmuxMode,
+		tmuxTarget: tmuxTarget.tmuxTarget,
+	});
+
+	const focusResult = state.manager.getFocusTarget(agentId);
+	return textResult(
+		buildSpawnText(
+			spawnResult.value,
+			preparedResult.value.definition,
+			focusResult.ok ? focusResult.value : undefined,
+		),
+		{
+			action: "spawn",
+			agentId,
+			state: spawnResult.value.state,
+			subagentType: preparedResult.value.definition.name,
+			displayName: formatDisplayName(preparedResult.value.definition, spawnResult.value),
+			focusAvailability: focusResult.ok ? focusResult.value.availability : "unknown",
+		},
+	);
+}
+
+function requireAgentId(agentId: string | undefined, action: "send" | "interrupt" | "focus"): ValidationOutcome<string> {
+	if (!agentId || agentId.trim().length === 0) {
+		return fail(`action=${action} requires agent_id`);
+	}
+	return ok(agentId.trim());
+}
+
+function buildListToolResult(state: ParentSessionState): ToolResultLike<SubagentToolDetails> {
+	return textResult(formatListText(state), { action: "list" });
+}
+
+function buildFocusToolResult(
+	state: ParentSessionState,
+	agentId: string,
+): ToolResultLike<SubagentToolDetails> {
+	const recordResult = state.manager.getRecord(agentId);
+	if (!recordResult.ok) {
+		return textResult(`Unknown managed agent: ${agentId}`);
+	}
+
+	const focusResult = state.manager.getFocusTarget(agentId);
+	if (!focusResult.ok) {
+		return textResult(`Failed to build focus target for ${agentId}: ${focusResult.error}`);
+	}
+
+	const definition = resolveDefinitionForRecord(state, recordResult.value);
+	return textResult(
+		formatFocusText(recordResult.value, definition, focusResult.value),
+		{
+			action: "focus",
+			agentId,
+			state: recordResult.value.state,
+			displayName: formatDisplayName(definition, recordResult.value),
+			focusAvailability: focusResult.value.availability,
+		},
+	);
+}
+
+function buildSendToolResult(
+	state: ParentSessionState,
+	agentId: string,
+	message: string | undefined,
+): ToolResultLike<SubagentToolDetails> {
+	if (!message || message.trim().length === 0) {
+		return textResult("action=send requires message");
+	}
+
+	const sendResult = state.manager.sendFollowUp(agentId, message.trim());
+	if (!sendResult.ok) {
+		return textResult(`Failed to send follow-up to ${agentId}: ${sendResult.error}`);
+	}
+
+	return textResult(
+		`Queued follow-up for ${agentId}.\nMessage: ${message.trim()}`,
+		{
+			action: "send",
+			agentId,
+		},
+	);
+}
+
+function buildInterruptToolResult(
+	state: ParentSessionState,
+	agentId: string,
+): ToolResultLike<SubagentToolDetails> {
+	const interruptResult = state.manager.sendInterrupt(agentId);
+	if (!interruptResult.ok) {
+		return textResult(`Failed to interrupt ${agentId}: ${interruptResult.error}`);
+	}
+
+	return textResult(`Sent interrupt to ${agentId}.`, {
+		action: "interrupt",
+		agentId,
+	});
 }
 
 function formatListText(
@@ -645,16 +833,18 @@ export function installParentExtension(
 		activeState = undefined;
 	});
 
-	pi.registerTool<typeof AGENT_TOOL_PARAMETERS, SpawnToolDetails>({
-		name: "Agent",
-		label: "Agent",
-		description: "Spawn a named tmux-backed subagent through pi-nexus.",
-		promptSnippet: "Spawn a named tmux-backed subagent via pi-nexus.",
+	pi.registerTool<typeof SUBAGENT_TOOL_PARAMETERS, SubagentToolDetails>({
+		name: "Subagent",
+		label: "Subagent",
+		description: "Manage pi-nexus subagents: spawn, list, send follow-ups, interrupt, or inspect focus info.",
+		promptSnippet: "Manage live pi-nexus subagents with structured actions.",
 		promptGuidelines: [
-			"Use named types like general-purpose, Explore, or Plan.",
-			"After spawning, use /subagents list or /subagents focus <id> for live tmux targets.",
+			"Use action=spawn to start a named subagent.",
+			"Use action=send to continue a running child after a progress or final_result callback.",
+			"Use action=interrupt to stop current child work without using tmux.",
+			"Use action=list or action=focus to inspect current managed children.",
 		],
-		parameters: AGENT_TOOL_PARAMETERS,
+		parameters: SUBAGENT_TOOL_PARAMETERS,
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
 			if (!stateResult.ok) {
@@ -663,74 +853,42 @@ export function installParentExtension(
 			}
 			activeState = stateResult.value;
 			const state = activeState;
-			const registryResult = refreshRegistry(state);
-			if (!registryResult.ok) {
-				return textResult(`Failed to load agent definitions: ${registryResult.error}`);
+
+			switch (params.action) {
+				case "spawn":
+					if (!params.prompt || !params.description || !params.subagent_type) {
+						return textResult("action=spawn requires prompt, description, and subagent_type");
+					}
+					return spawnNamedSubagent(state, {
+						prompt: params.prompt,
+						description: params.description,
+						subagent_type: params.subagent_type,
+						tmux_mode: params.tmux_mode,
+					}, effectiveOptions);
+				case "list":
+					return buildListToolResult(state);
+				case "focus": {
+					const agentIdResult = requireAgentId(params.agent_id, "focus");
+					if (!agentIdResult.ok) {
+						return textResult(agentIdResult.error);
+					}
+					return buildFocusToolResult(state, agentIdResult.value);
+				}
+				case "send": {
+					const agentIdResult = requireAgentId(params.agent_id, "send");
+					if (!agentIdResult.ok) {
+						return textResult(agentIdResult.error);
+					}
+					return buildSendToolResult(state, agentIdResult.value, params.message);
+				}
+				case "interrupt": {
+					const agentIdResult = requireAgentId(params.agent_id, "interrupt");
+					if (!agentIdResult.ok) {
+						return textResult(agentIdResult.error);
+					}
+					return buildInterruptToolResult(state, agentIdResult.value);
+				}
 			}
-
-			state.nextAgentOrdinal += 1;
-			const agentId = `agt_${String(state.nextAgentOrdinal).padStart(3, "0")}_${Date.now().toString(36)}`;
-			const tmuxMode = params.tmux_mode ?? "window";
-			const tmuxTargetResult = allocateTmuxTarget(state, tmuxMode, effectiveOptions.now, effectiveOptions.runTmuxCommand);
-			if (!tmuxTargetResult.ok) {
-				return textResult(`Failed to provision tmux target: ${tmuxTargetResult.error}`);
-			}
-
-			const tmuxTarget = tmuxTargetResult.value;
-			const agentDir = path.join(state.sessionDir, agentId);
-			try {
-				ensureDirectory(agentDir);
-			} catch (error) {
-				killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
-				return textResult(`Failed to prepare agent runtime directory: ${normalizeError(error).message}`);
-			}
-
-			const preparedResult = prepareNamedSubagentSpawn({
-				registry: registryResult.value,
-				type: params.subagent_type,
-				description: params.description,
-				taskPrompt: params.prompt,
-				agentId,
-				sessionPath: path.join(agentDir, "session.jsonl"),
-				socketPath: path.join(agentDir, "sidecar.sock"),
-				tmuxMode: tmuxTarget.tmuxMode,
-				tmuxTarget: tmuxTarget.tmuxTarget,
-				bootstrapConfigPath: path.join(agentDir, "bootstrap.json"),
-				bootstrapExtensionPath: effectiveOptions.bootstrapExtensionPath,
-				cwd: state.cwd,
-			});
-			if (!preparedResult.ok) {
-				killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
-				return textResult(`Failed to prepare named subagent spawn: ${preparedResult.error}`);
-			}
-
-			const spawnResult = state.manager.spawn(preparedResult.value.request);
-			if (!spawnResult.ok) {
-				killTmuxSession(effectiveOptions.runTmuxCommand, tmuxTarget.sessionName);
-				return textResult(`Failed to spawn subagent: ${spawnResult.error}`);
-			}
-
-			state.ownedTmuxRuntimes.set(agentId, {
-				sessionName: tmuxTarget.sessionName,
-				tmuxMode: tmuxTarget.tmuxMode,
-				tmuxTarget: tmuxTarget.tmuxTarget,
-			});
-
-			const focusResult = state.manager.getFocusTarget(agentId);
-			return textResult(
-				buildSpawnText(
-					spawnResult.value,
-					preparedResult.value.definition,
-					focusResult.ok ? focusResult.value : undefined,
-				),
-				{
-					agentId,
-					state: spawnResult.value.state,
-					subagentType: preparedResult.value.definition.name,
-					displayName: formatDisplayName(preparedResult.value.definition, spawnResult.value),
-					focusAvailability: focusResult.ok ? focusResult.value.availability : "unknown",
-				},
-			);
 		},
 	});
 

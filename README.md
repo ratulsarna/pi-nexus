@@ -16,7 +16,8 @@ The idea is simple:
 
 Today, the real v1 user path is available:
 - load the parent extension into `pi`
-- ask the main agent to call the `Agent` tool with a named subagent type
+- ask the main agent to call the `Subagent` tool with `action: "spawn"` to start a named subagent
+- let the main agent continue interacting with live children through the `Subagent` tool
 - list live subagents with `/subagents list`
 - send structured follow-ups with `/subagents send <agentId> <message>`
 - print the exact tmux focus action with `/subagents focus <agentId>`
@@ -34,10 +35,11 @@ If you want to try the current implementation from this repo, the practical path
    `pi -e /absolute/path/to/pi-nexus/dist/parent-extension.js`
    or copy/link it into `~/.pi/agent/extensions/`
 4. Start `pi`
-5. Ask the main agent to use the `Agent` tool with a named type such as `general-purpose`, `Explore`, or `Plan`
-6. Run `/subagents list`
-7. Run `/subagents send <agentId> <message>` when you want to nudge a live child through the supported sidecar channel
-8. Run `/subagents focus <agentId>` and use the returned `focusCommand` to jump into the live tmux child
+5. Ask the main agent to use the `Subagent` tool with `action: "spawn"` and a named type such as `general-purpose`, `Explore`, or `Plan`
+6. Let the main agent use the `Subagent` tool with `action: "list"`, `"send"`, `"interrupt"`, or `"focus"` for structured parent-child control
+7. Run `/subagents list`
+8. Run `/subagents send <agentId> <message>` when you want to nudge a live child yourself through the supported sidecar channel
+9. Run `/subagents focus <agentId>` and use the returned `focusCommand` to jump into the live tmux child
 
 This is the real first-user path, not just a repo-internal harness.
 
@@ -46,7 +48,7 @@ Prerequisites:
 - `pi` must be available in your environment
 
 The extension adds these user-facing surfaces:
-- `Agent` tool
+- `Subagent` tool
 - `/subagents list`
 - `/subagents send <agentId> <message>`
 - `/subagents focus <agentId>`
@@ -98,5 +100,5 @@ For the acceptance scripts, these env vars can help force a particular `pi` bina
 
 - `src/agent-definitions.ts` - strict named-agent definition registry, custom loading, and named-type spawn preparation
 - `src/contracts.ts` - runtime contract types and validation helpers
-- `src/parent-extension.ts` - parent-side Pi extension entrypoint, Agent tool, and /subagents command surface
+- `src/parent-extension.ts` - parent-side Pi extension entrypoint, Subagent tool, and /subagents command surface
 - `test/contracts.test.ts` - contract tests that lock the v1 behavior
