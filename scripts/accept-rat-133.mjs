@@ -209,66 +209,29 @@ async function runFocusCommandBriefly(focusCommand) {
 	await new Promise((resolve) => child.once("exit", resolve));
 }
 
-function latestLineContaining(text, needle) {
-	const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
-	for (let index = lines.length - 1; index >= 0; index -= 1) {
-		if (lines[index].includes(needle)) {
-			return lines[index];
-		}
-	}
-	return undefined;
+function listTmuxSessions() {
+	const output = run("tmux", ["list-sessions", "-F", "#{session_name}"]);
+	return output.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
-function extractLatestSubagentListBlock(text) {
+function latestWidgetLineForAgent(text, agentId) {
 	const lines = text.split("\n");
 	for (let index = lines.length - 1; index >= 0; index -= 1) {
-		if (lines[index].trim() !== "Managed subagents:") {
-			continue;
+		const trimmed = lines[index].trim();
+		if (trimmed.startsWith(agentId) && trimmed.includes("state=")) {
+			return trimmed;
 		}
-
-		const blockLines = ["Managed subagents:"];
-		for (let rowIndex = index + 1; rowIndex < lines.length; rowIndex += 1) {
-			const trimmed = lines[rowIndex].trim();
-			if (trimmed.length === 0) {
-				continue;
-			}
-			if (!trimmed.startsWith("- ")) {
-				break;
-			}
-			blockLines.push(trimmed);
-		}
-
-		return {
-			text: blockLines.join("\n"),
-			agentLine: (agentId) => latestLineContaining(blockLines.join("\n"), agentId),
-		};
 	}
-
 	return undefined;
 }
 
-async function runSubagentsListAndWaitForAgentLine(target, agentId, predicate, timeoutMs, label) {
-	const previousBlock = extractLatestSubagentListBlock(capturePane(target))?.text;
-	sendLine(target, "/subagents list");
-
+async function waitForAgentWidgetLine(target, agentId, predicate, timeoutMs, label) {
 	return waitFor(() => {
-		const latestBlock = extractLatestSubagentListBlock(capturePane(target));
-		if (!latestBlock) {
+		const line = latestWidgetLineForAgent(capturePane(target), agentId);
+		if (!line || !predicate(line)) {
 			return false;
 		}
-		if (latestBlock.text === previousBlock) {
-			return false;
-		}
-
-		const agentLine = latestBlock.agentLine(agentId);
-		if (!agentLine || !predicate(agentLine)) {
-			return false;
-		}
-
-		return {
-			block: latestBlock.text,
-			agentLine,
-		};
+		return line;
 	}, timeoutMs, label);
 }
 
@@ -294,6 +257,7 @@ async function main() {
 			`${shQuote(piPath)} --no-extensions -e ${shQuote(parentExtensionPath)} --session ${shQuote(sessionPath)}`,
 		]);
 		log(`created main pi tmux target ${mainPaneTarget}`);
+		const sessionsBeforeSpawn = new Set(listTmuxSessions());
 
 		await sleep(3000);
 		const spawnPrompt = [
@@ -320,62 +284,66 @@ async function main() {
 		await waitForPaneText(mainPaneTarget, "RAT133 child finished", 180_000);
 		await waitForStablePane(mainPaneTarget, 1500, 60_000);
 
-		const listedAgent = await runSubagentsListAndWaitForAgentLine(
+		const liveWidgetLine = await waitForAgentWidgetLine(
 			mainPaneTarget,
 			agentId,
-			(line) => line.includes("focus=live"),
+			(line) => line.includes("state=running") && !line.includes("[stale]"),
 			30_000,
-			`fresh /subagents list row for ${agentId} with focus=live`,
+			`subagent widget line for ${agentId} in running state`,
 		);
-		if (!listedAgent.agentLine.includes("focus=live")) {
-			fail(`expected /subagents list to show live focus availability for ${agentId}`);
+		if (!liveWidgetLine.includes("state=running")) {
+			fail(`expected widget to show ${agentId} as running`);
 		}
-		log("verified /subagents list output");
+		log("verified live widget state");
 
-		sendLine(mainPaneTarget, `/subagents focus ${agentId}`);
-		const focusCapture = await waitForPaneText(mainPaneTarget, `Subagent focus target for ${agentId}`, 30_000);
-		const tmuxTargetLine = latestLineContaining(focusCapture, "Tmux target:");
-		const focusCommandLine = latestLineContaining(focusCapture, "Focus command:");
-		if (!tmuxTargetLine || !focusCommandLine) {
-			fail("expected /subagents focus output to include tmux target and focus command");
+		const sessionsAfterSpawn = new Set(listTmuxSessions());
+		childSessionName = Array.from(sessionsAfterSpawn).find(
+			(sessionName) => !sessionsBeforeSpawn.has(sessionName) && sessionName !== mainSessionName,
+		);
+		if (!childSessionName) {
+			fail("could not identify spawned child tmux session");
 		}
-		const childTarget = tmuxTargetLine.replace(/^Tmux target:\s*/, "");
-		const focusCommand = focusCommandLine.replace(/^Focus command:\s*/, "");
-		childSessionName = childTarget.slice(0, childTarget.indexOf(":"));
-		log(`focus target: ${childTarget}`);
-		log(`focus command: ${focusCommand}`);
+		const childTarget = `${childSessionName}:child`;
+		log(`identified child tmux target ${childTarget}`);
 
-		await runFocusCommandBriefly(focusCommand);
-		log("verified focus command can attach briefly in a PTY");
+		sendLine(
+			mainPaneTarget,
+			`Use the Subagent tool exactly once right now with action open, agent_id ${agentId}, and mode follow. Do not use any other tool. Stop after the tool call succeeds.`,
+		);
+		await waitForPaneText(mainPaneTarget, `Subagent ${agentId}`, 30_000);
+		await waitForPaneText(mainPaneTarget, "Mode: follow", 30_000);
+		log("verified native open overlay rendered");
+		run("tmux", ["send-keys", "-t", mainPaneTarget, "Escape"]);
+		await sleep(500);
 
 		sendLine(childTarget, "Direct tmux intervention. Do not call report_to_parent yet. Wait silently for another message.");
 		await waitForPaneText(mainPaneTarget, "assumptions are stale", 60_000);
 		log("verified stale-after-intervention status surfaced in parent");
 
-		const staleAgent = await runSubagentsListAndWaitForAgentLine(
+		const staleWidgetLine = await waitForAgentWidgetLine(
 			mainPaneTarget,
 			agentId,
-			(line) => line.includes("stale@"),
+			(line) => line.includes("[stale]"),
 			30_000,
-			`fresh /subagents list row for ${agentId} with stale marker`,
+			`subagent widget line for ${agentId} with stale marker`,
 		);
-		if (!staleAgent.agentLine.includes("stale@")) {
-			fail("expected /subagents list to show stale marker after direct child intervention");
+		if (!staleWidgetLine.includes("[stale]")) {
+			fail("expected widget to show stale marker after direct child intervention");
 		}
 
 		sendLine(childTarget, "Please call report_to_parent with kind progress and summary RAT133 child refreshed, then wait silently.");
 		await waitForPaneText(mainPaneTarget, "RAT133 child refreshed", 120_000);
 		await waitForStablePane(mainPaneTarget, 1500, 60_000);
 
-		const refreshedAgent = await runSubagentsListAndWaitForAgentLine(
+		const refreshedWidgetLine = await waitForAgentWidgetLine(
 			mainPaneTarget,
 			agentId,
-			(line) => line.includes("markers=none"),
+			(line) => line.includes("state=running") && !line.includes("[stale]"),
 			30_000,
-			`fresh /subagents list row for ${agentId} with cleared markers`,
+			`subagent widget line for ${agentId} with cleared stale marker`,
 		);
-		if (!refreshedAgent.agentLine.includes("markers=none")) {
-			fail("expected /subagents list to clear stale markers after a fresh child-authored report");
+		if (refreshedWidgetLine.includes("[stale]")) {
+			fail("expected widget to clear stale marker after a fresh child-authored report");
 		}
 		log("verified stale marker clears only after explicit child-authored report");
 

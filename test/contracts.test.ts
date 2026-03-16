@@ -21,8 +21,11 @@ import {
 	validateSidecarEventMessage,
 	validateSidecarHandshake,
 	validateMonotonicSeqAcceptance,
+	validateSubagentOpenMode,
 	validateSidecarProtocolEnvelope,
 	validateSubagentFocusTarget,
+	validateSubagentUiSnapshot,
+	validateSubagentUiStateSnapshot,
 	validateSubagentRecord,
 	type RuntimeBootstrapConfig,
 	type RuntimeState,
@@ -373,6 +376,183 @@ describe("validateSubagentFocusTarget", () => {
 		).toEqual({
 			ok: false,
 			error: "focusTarget.tmuxTarget must include a session and target segment",
+		});
+	});
+});
+
+describe("validateSubagentOpenMode", () => {
+	it.each(["peek", "follow", "take_over"] as const)("accepts %s", (mode) => {
+		expect(validateSubagentOpenMode(mode)).toEqual({
+			ok: true,
+			value: mode,
+		});
+	});
+
+	it("rejects malformed modes", () => {
+		expect(validateSubagentOpenMode("focus")).toEqual({
+			ok: false,
+			error: "open mode must be one of: peek, follow, take_over",
+		});
+	});
+});
+
+describe("validateSubagentUiSnapshot", () => {
+	it("accepts a live snapshot", () => {
+		expect(
+			validateSubagentUiSnapshot({
+				agentId: "agt_ui",
+				displayName: "Researcher",
+				type: "Researcher",
+				description: "Investigate the repo",
+				state: "running",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				latestSummary: "Working through the codebase",
+				isStale: false,
+				isDegraded: false,
+				isHistorical: false,
+				canOpenPeek: true,
+				canOpenFollow: true,
+				canOpenTakeOver: true,
+				canSend: true,
+				canInterrupt: true,
+			}),
+		).toEqual({
+			ok: true,
+			value: {
+				agentId: "agt_ui",
+				displayName: "Researcher",
+				type: "Researcher",
+				description: "Investigate the repo",
+				state: "running",
+				availability: "live",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				latestSummary: "Working through the codebase",
+				pendingInputQuestion: undefined,
+				finalSummary: undefined,
+				errorMessage: undefined,
+				note: undefined,
+				isStale: false,
+				isDegraded: false,
+				isHistorical: false,
+				canOpenPeek: true,
+				canOpenFollow: true,
+				canOpenTakeOver: true,
+				canSend: true,
+				canInterrupt: true,
+			},
+		});
+	});
+
+	it("rejects inconsistent historical snapshots", () => {
+		expect(
+			validateSubagentUiSnapshot({
+				agentId: "agt_ui",
+				displayName: "Researcher",
+				type: "Researcher",
+				description: "Investigate the repo",
+				state: "stopped",
+				availability: "history",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				isStale: false,
+				isDegraded: false,
+				isHistorical: true,
+				canOpenPeek: true,
+				canOpenFollow: true,
+				canOpenTakeOver: false,
+				canSend: false,
+				canInterrupt: false,
+			}),
+		).toEqual({
+			ok: false,
+			error: "history ui snapshots may only allow peek opens",
+		});
+	});
+});
+
+describe("validateSubagentUiStateSnapshot", () => {
+	it("accepts a persisted UI state snapshot", () => {
+		expect(
+			validateSubagentUiStateSnapshot({
+				version: 1,
+				updatedAt: "2026-03-10T10:00:00.000Z",
+				agents: [
+					{
+						agentId: "agt_ui",
+						displayName: "Researcher",
+						type: "Researcher",
+						description: "Investigate the repo",
+						state: "running",
+						availability: "live",
+						tmuxMode: "pane",
+						tmuxTarget: "main:2.1",
+						sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+						isStale: false,
+						isDegraded: false,
+						isHistorical: false,
+						canOpenPeek: true,
+						canOpenFollow: true,
+						canOpenTakeOver: true,
+						canSend: true,
+						canInterrupt: true,
+					},
+				],
+			}),
+		).toEqual({
+			ok: true,
+			value: {
+				version: 1,
+				updatedAt: "2026-03-10T10:00:00.000Z",
+				agents: [
+					{
+						agentId: "agt_ui",
+						displayName: "Researcher",
+						type: "Researcher",
+						description: "Investigate the repo",
+						state: "running",
+						availability: "live",
+						tmuxMode: "pane",
+						tmuxTarget: "main:2.1",
+						sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+						latestSummary: undefined,
+						pendingInputQuestion: undefined,
+						finalSummary: undefined,
+						errorMessage: undefined,
+						note: undefined,
+						isStale: false,
+						isDegraded: false,
+						isHistorical: false,
+						canOpenPeek: true,
+						canOpenFollow: true,
+						canOpenTakeOver: true,
+						canSend: true,
+						canInterrupt: true,
+					},
+				],
+			},
+		});
+	});
+
+	it("rejects malformed nested agent entries", () => {
+		expect(
+			validateSubagentUiStateSnapshot({
+				version: 1,
+				updatedAt: "2026-03-10T10:00:00.000Z",
+				agents: [
+					{
+						agentId: "agt_ui",
+					},
+				],
+			}),
+		).toEqual({
+			ok: false,
+			error: "ui state snapshot agents[0] uiSnapshot.displayName must be a non-empty string",
 		});
 	});
 });

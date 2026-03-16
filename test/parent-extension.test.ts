@@ -26,6 +26,14 @@ class FakeExtensionContext {
 	public hasUI = true;
 	public idle = true;
 	public readonly notifications: Array<{ message: string; type?: "info" | "warning" | "error" }> = [];
+	public readonly widgetUpdates: Array<{
+		key: string;
+		content: string[] | undefined;
+		options?: Record<string, unknown>;
+	}> = [];
+	public readonly customCalls: Array<{
+		options?: Record<string, unknown>;
+	}> = [];
 
 	public constructor(
 		public cwd: string,
@@ -34,11 +42,26 @@ class FakeExtensionContext {
 
 	public readonly sessionManager = {
 		getSessionFile: () => this.sessionFile,
+		getEntries: () => [],
 	};
 
 	public readonly ui = {
 		notify: (message: string, type?: "info" | "warning" | "error") => {
 			this.notifications.push({ message, type });
+		},
+		setWidget: (
+			key: string,
+			content: string[] | undefined,
+			options?: Record<string, unknown>,
+		) => {
+			this.widgetUpdates.push({ key, content, options });
+		},
+		custom: async (
+			_factory: unknown,
+			options?: Record<string, unknown>,
+		) => {
+			this.customCalls.push({ options });
+			return undefined;
 		},
 	};
 
@@ -53,6 +76,8 @@ class FakePiApi {
 	public readonly handlers = new Map<string, ExtensionHandler[]>();
 	public readonly tools: Array<Record<string, unknown>> = [];
 	public readonly commands = new Map<string, Record<string, unknown>>();
+	public readonly messageRenderers = new Map<string, unknown>();
+	public readonly appendedEntries: Array<{ customType: string; data?: unknown }> = [];
 	public readonly sentMessages: Array<{
 		message: Record<string, unknown>;
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" };
@@ -74,6 +99,14 @@ class FakePiApi {
 
 	public registerCommand(name: string, definition: Record<string, unknown>): void {
 		this.commands.set(name, definition);
+	}
+
+	public registerMessageRenderer(customType: string, renderer: unknown): void {
+		this.messageRenderers.set(customType, renderer);
+	}
+
+	public appendEntry(customType: string, data?: unknown): void {
+		this.appendedEntries.push({ customType, data });
 	}
 
 	public sendMessage(
@@ -308,7 +341,7 @@ beforeEach(() => {
 });
 
 describe("installParentExtension", () => {
-	it("spawns named subagents and exposes /subagents list and focus output", async () => {
+	it("spawns named subagents and exposes /subagents list and open output", async () => {
 		const sidecars = new FakeSidecarSessions();
 		const processes = new FakeProcesses();
 		const tmux = new FakeTmuxRuntime();
@@ -355,7 +388,7 @@ Research the codebase carefully and report findings.`,
 		const output = result.content[0]?.text ?? "";
 		expect(output).toContain("Spawned subagent agt_001_");
 		expect(output).toContain("Type: Researcher (Researcher)");
-		expect(output).toContain("Use /subagents list or /subagents focus");
+		expect(output).toContain("Use /subagents list or /subagents open");
 
 		const agentId = Array.from(processes.handles.keys())[0];
 		expect(agentId).toMatch(/^agt_001_/);
@@ -367,16 +400,14 @@ Research the codebase carefully and report findings.`,
 		await command.handler("list", ctx);
 		const listContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
 		expect(listContent).toContain(agentId);
-		expect(listContent).toContain("Researcher (Researcher)");
-		expect(listContent).toContain("posture=connecting");
+		expect(listContent).toContain("Researcher");
+		expect(listContent).toContain("state=connecting");
 
-		await command.handler(`focus ${agentId}`, ctx);
-		const focusContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
-		expect(focusContent).toContain(`Subagent focus target for ${agentId}`);
-		expect(focusContent).toContain("Run the focus command in your shell to attach.");
-		expect(focusContent).toContain("Focus command: if [ -n \"${TMUX:-}\" ]; then tmux switch-client");
-		expect(focusContent).toContain("else tmux attach-session");
-		expect(focusContent).toContain(launchSpec.tmuxTarget);
+		await command.handler(`open ${agentId} follow`, ctx);
+		expect(ctx.customCalls).toHaveLength(1);
+		expect(ctx.customCalls[0]?.options).toMatchObject({ overlay: true });
+		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in follow mode.`);
+		expect(pi.appendedEntries.at(-1)?.customType).toBe("pi-nexus-ui-state");
 
 		expect(sidecars.get(agentId).connect()).toEqual({ ok: true, value: expect.anything() });
 		expect(sidecars.get(agentId).message(
@@ -395,6 +426,63 @@ Research the codebase carefully and report findings.`,
 			type: "follow_up",
 			payload: { message: "keep going" },
 		});
+	});
+
+	it("accepts slash-command args that include the command name", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:02:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const customAgentDir = path.join(fakeRepoDir, ".pi", "agents");
+		fs.mkdirSync(customAgentDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(customAgentDir, "Researcher.md"),
+			`---
+description: Research specialist
+display_name: Researcher
+---
+
+Research the codebase carefully and report findings.`,
+			"utf8",
+		);
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "slash-command-shape.jsonl"));
+		await pi.emit("session_start", {}, ctx);
+
+		const tool = getRegisteredTool(pi, "Subagent");
+		const result = await tool.execute(
+			"tool-call-1",
+			{
+				action: "spawn",
+				prompt: "Report progress once and wait.",
+				description: "Slash command shape",
+				subagent_type: "Researcher",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		const agentId = Array.from(processes.handles.keys())[0];
+		expect(agentId).toMatch(/^agt_001_/);
+		expect(result.content[0]?.text ?? "").toContain(agentId);
+		const command = getRegisteredCommand(pi, "subagents");
+
+		await command.handler("subagents list", ctx);
+		expect(String(pi.sentMessages.at(-1)?.message.content ?? "")).toContain(agentId);
+
+		await command.handler(`subagents open ${agentId} follow`, ctx);
+		expect(ctx.customCalls).toHaveLength(1);
+		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in follow mode.`);
 	});
 
 	it("manages live children through the generic Subagent tool", async () => {
@@ -430,7 +518,7 @@ Research the codebase carefully and report findings.`,
 
 		const spawnText = spawnResult.content[0]?.text ?? "";
 		expect(spawnText).toContain("Spawned subagent agt_001_");
-		expect(spawnText).toContain("Use the Subagent tool with action=list, send, interrupt, or focus");
+		expect(spawnText).toContain("Use the Subagent tool with action=list, open, send, or interrupt");
 
 		const agentId = Array.from(processes.handles.keys())[0];
 		const launchSpec = processes.get(agentId).launchSpec;
@@ -452,14 +540,15 @@ Research the codebase carefully and report findings.`,
 		);
 		expect(listResult.content[0]?.text ?? "").toContain(agentId);
 
-		const focusResult = await tool.execute(
-			"tool-call-subagent-focus",
-			{ action: "focus", agent_id: agentId },
+		const openResult = await tool.execute(
+			"tool-call-subagent-open",
+			{ action: "open", agent_id: agentId, mode: "take_over" },
 			undefined,
 			undefined,
 			ctx,
 		);
-		expect(focusResult.content[0]?.text ?? "").toContain(`Subagent focus target for ${agentId}`);
+		expect(openResult.content[0]?.text ?? "").toContain(`Opened ${agentId} in take_over mode.`);
+		expect(ctx.customCalls).toHaveLength(1);
 
 		const sendResult = await tool.execute(
 			"tool-call-subagent-send",
@@ -486,6 +575,39 @@ Research the codebase carefully and report findings.`,
 			type: "interrupt",
 			payload: {},
 		});
+	});
+
+	it("fails legacy focus paths with a migration message", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:06:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "legacy-focus.jsonl"));
+		await pi.emit("session_start", {}, ctx);
+
+		const tool = getRegisteredTool(pi, "Subagent");
+		const toolResult = await tool.execute(
+			"tool-call-subagent-focus-legacy",
+			{ action: "focus", agent_id: "agt_legacy" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(toolResult.content[0]?.text ?? "").toContain("action=focus has been removed");
+		expect(toolResult.content[0]?.text ?? "").toContain("action=open");
+
+		const command = getRegisteredCommand(pi, "subagents");
+		await command.handler("focus agt_legacy", ctx);
+		expect(String(pi.sentMessages.at(-1)?.message.content ?? "")).toContain("/subagents open");
 	});
 
 	it("bridges accepted child progress and final_result back into the parent session", async () => {
@@ -631,7 +753,7 @@ Research the codebase carefully and report findings.`,
 		const listCommand = getRegisteredCommand(pi, "subagents");
 		await listCommand.handler("list", ctx);
 		const staleListContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
-		expect(staleListContent).toContain("stale@2026-03-13T12:20:03.000Z");
+		expect(staleListContent).toContain("markers=stale");
 		expect(pi.sentUserMessages).toHaveLength(sentUserMessageCountBeforeIntervention);
 		expect(String(pi.sentMessages.at(-2)?.message.content ?? "")).toContain("assumptions are stale");
 

@@ -18,20 +18,56 @@ import type {
 	SidecarEventMessage,
 	SubagentRecord,
 	SubagentFocusTarget,
+	SubagentOpenMode,
+	SubagentUiSnapshot,
+	SubagentUiStateSnapshot,
 	TmuxMode,
 	ValidationError,
 	ValidationOutcome,
 	ValidationResult,
+} from "./contracts.js";
+import {
+	validateSubagentOpenMode,
+	validateSubagentUiSnapshot,
+	validateSubagentUiStateSnapshot,
 } from "./contracts.js";
 import { NodeSidecarSessionAdapter, TmuxSubagentProcessAdapter } from "./node-runtime-adapters.js";
 import { SubagentManager, type SidecarSessionAdapter, type SubagentProcessAdapter } from "./subagent-manager.js";
 
 interface ReadonlySessionManagerLike {
 	getSessionFile(): string;
+	getEntries(): Array<{
+		type: string;
+		customType?: string;
+		data?: unknown;
+	}>;
 }
 
 interface ExtensionUiLike {
 	notify(message: string, type?: "info" | "warning" | "error"): void;
+	setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+	custom?<T>(
+		factory: (
+			tui: { requestRender(): void },
+			theme: unknown,
+			keybindings: unknown,
+			done: (result: T) => void,
+		) => {
+			render(width: number): string[];
+			handleInput?(data: string): void;
+			invalidate(): void;
+			dispose?(): void;
+			focused?: boolean;
+		},
+		options?: {
+			overlay?: boolean;
+			overlayOptions?: {
+				width?: number | `${number}%`;
+				maxHeight?: number | `${number}%`;
+				anchor?: string;
+			};
+		},
+	): Promise<T>;
 }
 
 interface ExtensionContextLike {
@@ -107,6 +143,7 @@ interface ExtensionApiLike {
 		content: string | Array<{ type: "text"; text: string }>,
 		options?: { deliverAs?: "steer" | "followUp" },
 	): void;
+	appendEntry<T = unknown>(customType: string, data?: T): void;
 }
 
 interface OwnedTmuxRuntime {
@@ -125,6 +162,8 @@ interface ParentSessionState<TData = unknown> {
 	busy: boolean;
 	nextAgentOrdinal: number;
 	ownedTmuxRuntimes: Map<string, OwnedTmuxRuntime>;
+	uiState: SubagentUiStateSnapshot;
+	lastUiContext?: ExtensionContextLike;
 }
 
 export interface ParentExtensionOptions<TData = unknown> {
@@ -145,13 +184,22 @@ interface TmuxSpawnTarget {
 type EffectiveParentExtensionOptions = Required<ParentExtensionOptions>;
 
 interface SubagentToolDetails {
-	action: "spawn" | "list" | "send" | "interrupt" | "focus";
+	action: "spawn" | "list" | "send" | "interrupt" | "open" | "focus";
 	agentId?: string;
 	state?: string;
 	subagentType?: string;
 	displayName?: string;
-	focusAvailability?: string;
+	openAvailability?: string;
+	mode?: SubagentOpenMode;
 }
+
+const UI_STATE_CUSTOM_TYPE = "pi-nexus-ui-state";
+const UI_WIDGET_KEY = "pi-nexus-subagents";
+const LEGACY_FOCUS_MESSAGE = [
+	"action=focus has been removed.",
+	"Use action=open with mode=peek, follow, or take_over.",
+	"Use /subagents open <agentId> [peek|follow|take_over] from the TUI.",
+].join(" ");
 
 const AGENT_TOOL_PARAMETERS = Type.Object({
 	prompt: Type.String({
@@ -176,13 +224,19 @@ const SUBAGENT_TOOL_PARAMETERS = Type.Object({
 		Type.Literal("list"),
 		Type.Literal("send"),
 		Type.Literal("interrupt"),
+		Type.Literal("open"),
 		Type.Literal("focus"),
 	], {
 		description: "Subagent action to perform.",
 	}),
 	agent_id: Type.Optional(Type.String({
-		description: "Managed subagent id for send, interrupt, or focus actions.",
+		description: "Managed subagent id for send, interrupt, or open actions.",
 	})),
+	mode: Type.Optional(
+		Type.Union([Type.Literal("peek"), Type.Literal("follow"), Type.Literal("take_over")], {
+			description: "Open mode for the open action. Defaults to peek.",
+		}),
+	),
 	message: Type.Optional(Type.String({
 		description: "Follow-up message for the send action.",
 	})),
@@ -305,6 +359,393 @@ function formatSubagentLabel(definition: ResolvedAgentDefinition | undefined, re
 	return `${displayName} (${record.type}) [${record.id}]`;
 }
 
+function normalizeSummary(value: unknown): string | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function deriveUiAvailability(record: SubagentRecord): "live" | "degraded" | "history" {
+	if (record.state === "failed" || record.state === "stopped") {
+		return "history";
+	}
+	if (record.degradedAt) {
+		return "degraded";
+	}
+	return "live";
+}
+
+function deriveUiNote(record: SubagentRecord): string | undefined {
+	if (record.state === "failed") {
+		return "Child session failed. Historical detail is still available.";
+	}
+	if (record.state === "stopped") {
+		return "Child session stopped. Historical detail is still available.";
+	}
+	if (record.degradedAt) {
+		return "Sidecar trust is degraded. Observation and direct takeover are still available while tmux stays live.";
+	}
+	return undefined;
+}
+
+function buildSubagentUiSnapshot(
+	record: SubagentRecord,
+	definition: ResolvedAgentDefinition | undefined,
+): ValidationOutcome<SubagentUiSnapshot> {
+	const availability = deriveUiAvailability(record);
+	return validateSubagentUiSnapshot({
+		agentId: record.id,
+		displayName: formatDisplayName(definition, record),
+		type: record.type,
+		description: record.description,
+		state: record.state,
+		availability,
+		tmuxMode: record.tmuxMode,
+		tmuxTarget: record.tmuxTarget,
+		sessionPath: record.sessionPath,
+		latestSummary: normalizeSummary(record.lastProgressReport?.summary),
+		pendingInputQuestion: normalizeSummary(record.pendingInputRequest?.summary),
+		finalSummary: normalizeSummary(record.finalResult?.summary),
+		errorMessage: normalizeSummary(record.error?.message),
+		note: deriveUiNote(record),
+		isStale: record.assumptionsStaleAt !== undefined,
+		isDegraded: record.degradedAt !== undefined,
+		isHistorical: availability === "history",
+		canOpenPeek: true,
+		canOpenFollow: availability !== "history",
+		canOpenTakeOver: availability !== "history",
+		canSend: availability !== "history" && record.degradedAt === undefined,
+		canInterrupt: availability !== "history" && record.degradedAt === undefined,
+	});
+}
+
+function createEmptyUiState(updatedAt: string): SubagentUiStateSnapshot {
+	return {
+		version: 1,
+		updatedAt,
+		agents: [],
+	};
+}
+
+function restoreUiStateFromEntries(
+	entries: ReadonlyArray<{ type: string; customType?: string; data?: unknown }>,
+	now: () => string,
+): SubagentUiStateSnapshot {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.type !== "custom" || entry.customType !== UI_STATE_CUSTOM_TYPE) {
+			continue;
+		}
+		const snapshotResult = validateSubagentUiStateSnapshot(entry.data);
+		if (snapshotResult.ok) {
+			return snapshotResult.value;
+		}
+	}
+
+	return createEmptyUiState(now());
+}
+
+function sortUiSnapshots(snapshots: ReadonlyArray<SubagentUiSnapshot>): SubagentUiSnapshot[] {
+	return [...snapshots].sort((left, right) => {
+		if (left.isHistorical !== right.isHistorical) {
+			return left.isHistorical ? 1 : -1;
+		}
+		if (left.displayName !== right.displayName) {
+			return left.displayName.localeCompare(right.displayName);
+		}
+		return left.agentId.localeCompare(right.agentId);
+	});
+}
+
+function formatWidgetLines(uiState: SubagentUiStateSnapshot): string[] {
+	const live = uiState.agents.filter((snapshot) => !snapshot.isHistorical);
+	const history = uiState.agents.filter((snapshot) => snapshot.isHistorical);
+	const lines = ["Subagents"];
+
+	if (live.length === 0 && history.length === 0) {
+		lines.push("  none");
+		lines.push("  use /subagents open <agentId> [peek|follow|take_over]");
+		return lines;
+	}
+
+	if (live.length > 0) {
+		lines.push("  Live");
+		for (const snapshot of live) {
+			const badges = [
+				snapshot.isStale ? "stale" : undefined,
+				snapshot.isDegraded ? "degraded" : undefined,
+			].filter((value): value is string => value !== undefined);
+			lines.push(
+				`  ${snapshot.agentId} ${snapshot.displayName} state=${snapshot.state}${badges.length > 0 ? ` [${badges.join(", ")}]` : ""}`,
+			);
+		}
+	}
+
+	if (history.length > 0) {
+		lines.push("  History");
+		for (const snapshot of history) {
+			lines.push(`  ${snapshot.agentId} ${snapshot.displayName} state=${snapshot.state}`);
+		}
+	}
+
+	lines.push("  /subagents open <agentId> [peek|follow|take_over]");
+	return lines;
+}
+
+function renderWidget(
+	ctx: ExtensionContextLike | undefined,
+	uiState: SubagentUiStateSnapshot,
+): void {
+	if (!ctx?.hasUI || !ctx.ui.setWidget) {
+		return;
+	}
+
+	ctx.ui.setWidget(UI_WIDGET_KEY, formatWidgetLines(uiState), { placement: "aboveEditor" });
+}
+
+function findSnapshot(
+	state: ParentSessionState,
+	agentId: string,
+): SubagentUiSnapshot | undefined {
+	return state.uiState.agents.find((snapshot) => snapshot.agentId === agentId);
+}
+
+function syncUiState(
+	pi: ExtensionApiLike,
+	state: ParentSessionState,
+	updatedAt: string,
+): void {
+	const currentSnapshots = new Map<string, SubagentUiSnapshot>();
+	for (const record of state.manager.listRecords()) {
+		const definition = resolveDefinitionForRecord(state, record);
+		const snapshotResult = buildSubagentUiSnapshot(record, definition);
+		if (snapshotResult.ok) {
+			currentSnapshots.set(record.id, snapshotResult.value);
+		}
+	}
+
+	for (const snapshot of state.uiState.agents) {
+		if (!currentSnapshots.has(snapshot.agentId)) {
+			currentSnapshots.set(snapshot.agentId, snapshot);
+		}
+	}
+
+	const nextStateResult = validateSubagentUiStateSnapshot({
+		version: 1,
+		updatedAt,
+		agents: sortUiSnapshots(Array.from(currentSnapshots.values())),
+	});
+	if (!nextStateResult.ok) {
+		return;
+	}
+
+	state.uiState = nextStateResult.value;
+	pi.appendEntry(UI_STATE_CUSTOM_TYPE, state.uiState);
+	renderWidget(state.lastUiContext, state.uiState);
+}
+
+function fitLine(value: string, width: number): string {
+	if (width <= 0) {
+		return "";
+	}
+	if (value.length <= width) {
+		return value;
+	}
+	if (width === 1) {
+		return value.slice(0, 1);
+	}
+	return `${value.slice(0, width - 1)}…`;
+}
+
+function captureTmuxViewport(
+	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+	tmuxTarget: string,
+	lines: number,
+): ValidationOutcome<string[]> {
+	const captureResult = runTmuxCommand([
+		"capture-pane",
+		"-p",
+		"-t",
+		tmuxTarget,
+		"-S",
+		`-${Math.max(lines, 1)}`,
+	]);
+	if (!captureResult.ok) {
+		return captureResult;
+	}
+
+	return ok(
+		captureResult.value
+			.split("\n")
+			.map((line) => line.replace(/\r/g, ""))
+			.filter((line, index, values) => !(index === values.length - 1 && line.length === 0)),
+	);
+}
+
+function sendTmuxInput(
+	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+	tmuxTarget: string,
+	message: string,
+): ValidationOutcome<undefined> {
+	const literalResult = runTmuxCommand(["send-keys", "-t", tmuxTarget, "-l", message]);
+	if (!literalResult.ok) {
+		return literalResult as ValidationOutcome<undefined>;
+	}
+	const enterResult = runTmuxCommand(["send-keys", "-t", tmuxTarget, "Enter"]);
+	if (!enterResult.ok) {
+		return enterResult as ValidationOutcome<undefined>;
+	}
+	return ok(undefined);
+}
+
+class SubagentOverlayComponent {
+	public focused = false;
+	private paneLines: string[] = [];
+	private statusMessage: string | undefined;
+	private input = "";
+	private readonly refreshInterval: ReturnType<typeof setInterval> | undefined;
+
+	public constructor(
+		private readonly snapshot: SubagentUiSnapshot,
+		private readonly mode: SubagentOpenMode,
+		private readonly runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+		private readonly requestRender: () => void,
+		private readonly close: () => void,
+	) {
+		this.refreshViewport();
+		if (!snapshot.isHistorical) {
+			this.refreshInterval = setInterval(() => {
+				this.refreshViewport();
+				this.requestRender();
+			}, mode === "peek" ? 1_500 : 500);
+			this.refreshInterval.unref?.();
+		}
+	}
+
+	public invalidate(): void {}
+
+	public dispose(): void {
+		if (this.refreshInterval !== undefined) {
+			clearInterval(this.refreshInterval);
+		}
+	}
+
+	public handleInput(data: string): void {
+		if (data === "\u001b") {
+			this.close();
+			return;
+		}
+		if (this.mode !== "take_over" || this.snapshot.isHistorical) {
+			return;
+		}
+
+		if (data === "\r" || data === "\n") {
+			const message = this.input.trim();
+			if (message.length === 0) {
+				return;
+			}
+			const sendResult = sendTmuxInput(this.runTmuxCommand, this.snapshot.tmuxTarget, message);
+			this.input = "";
+			this.statusMessage = sendResult.ok
+				? "Sent direct input to child. Parent assumptions may go stale until the next explicit child report."
+				: `Failed to send direct input: ${sendResult.error}`;
+			this.refreshViewport();
+			this.requestRender();
+			return;
+		}
+
+		if (data === "\u007f" || data === "\b") {
+			this.input = this.input.slice(0, -1);
+			this.requestRender();
+			return;
+		}
+
+		if (/^[\t\x20-\x7E]$/.test(data)) {
+			this.input += data;
+			this.requestRender();
+		}
+	}
+
+	public render(width: number): string[] {
+		const contentWidth = Math.max(20, width);
+		const lines = [
+			fitLine(`Subagent ${this.snapshot.agentId} · ${this.snapshot.displayName}`, contentWidth),
+			fitLine(`Mode: ${this.snapshot.isHistorical ? "history" : this.mode} · state=${this.snapshot.state} · availability=${this.snapshot.availability}`, contentWidth),
+			fitLine(
+				`Badges: ${[
+					this.snapshot.isStale ? "stale" : undefined,
+					this.snapshot.isDegraded ? "degraded" : undefined,
+				].filter((value): value is string => value !== undefined).join(", ") || "none"}`,
+				contentWidth,
+			),
+			"",
+		];
+
+		if (this.snapshot.latestSummary) {
+			lines.push(fitLine(`Latest: ${this.snapshot.latestSummary}`, contentWidth));
+		}
+		if (this.snapshot.pendingInputQuestion) {
+			lines.push(fitLine(`Needs input: ${this.snapshot.pendingInputQuestion}`, contentWidth));
+		}
+		if (this.snapshot.finalSummary) {
+			lines.push(fitLine(`Final: ${this.snapshot.finalSummary}`, contentWidth));
+		}
+		if (this.snapshot.errorMessage) {
+			lines.push(fitLine(`Error: ${this.snapshot.errorMessage}`, contentWidth));
+		}
+		if (this.snapshot.note) {
+			lines.push(fitLine(`Note: ${this.snapshot.note}`, contentWidth));
+		}
+
+		if (!this.snapshot.isHistorical) {
+			lines.push("");
+			lines.push("Child viewport");
+			for (const line of this.paneLines.slice(-(this.mode === "peek" ? 12 : 24))) {
+				lines.push(fitLine(line, contentWidth));
+			}
+			if (this.paneLines.length === 0) {
+				lines.push(fitLine("(no child terminal output yet)", contentWidth));
+			}
+		}
+
+		if (this.statusMessage) {
+			lines.push("");
+			lines.push(fitLine(this.statusMessage, contentWidth));
+		}
+
+		lines.push("");
+		if (this.mode === "take_over" && !this.snapshot.isHistorical) {
+			lines.push(fitLine("Take Over: type and press Enter to talk directly to the child. Esc closes.", contentWidth));
+			lines.push(fitLine(`> ${this.input}`, contentWidth));
+		} else {
+			lines.push(fitLine("Esc closes.", contentWidth));
+		}
+
+		return lines;
+	}
+
+	private refreshViewport(): void {
+		if (this.snapshot.isHistorical) {
+			this.paneLines = [];
+			return;
+		}
+
+		const captureResult = captureTmuxViewport(this.runTmuxCommand, this.snapshot.tmuxTarget, this.mode === "peek" ? 16 : 40);
+		if (!captureResult.ok) {
+			this.statusMessage = `Child terminal unavailable: ${captureResult.error}`;
+			this.paneLines = [];
+			return;
+		}
+
+		this.paneLines = captureResult.value;
+		if (this.statusMessage?.startsWith("Child terminal unavailable:")) {
+			this.statusMessage = undefined;
+		}
+	}
+}
+
 function sendSessionMessage(
 	pi: ExtensionApiLike,
 	customType: string,
@@ -386,7 +827,7 @@ function bridgeAcceptedEvent(
 					state: record.state,
 				},
 			);
-			return;
+			break;
 		case "final_result":
 			deliverChildFollowUp(
 				pi,
@@ -397,21 +838,21 @@ function bridgeAcceptedEvent(
 					renderDataBlock(event.payload.data),
 				].join("\n").trim(),
 			);
-			return;
+			break;
 		case "needs_input":
 			deliverChildFollowUp(
 				pi,
 				state,
 				`Subagent needs_input from ${label}.\nQuestion: ${event.payload.question}`,
 			);
-			return;
+			break;
 		case "error":
 			deliverChildFollowUp(
 				pi,
 				state,
 				`Subagent error from ${label}.\nFatal: ${event.payload.fatal ? "yes" : "no"}\nMessage: ${event.payload.message}`,
 			);
-			return;
+			break;
 		case "user_intervened":
 			sendSessionMessage(
 				pi,
@@ -422,18 +863,21 @@ function bridgeAcceptedEvent(
 					assumptionsStaleAt: record.assumptionsStaleAt,
 				},
 			);
-			return;
+			break;
 		case "ready":
 		case "state":
 		case "pong":
-			return;
+			break;
 	}
+
+	syncUiState(pi, state, event.time);
 }
 
 function createParentSessionState(
 	pi: ExtensionApiLike,
 	sessionFile: string,
 	cwd: string,
+	sessionEntries: ReadonlyArray<{ type: string; customType?: string; data?: unknown }>,
 	options: Required<Pick<ParentExtensionOptions, "homeDir" | "now" | "runTmuxCommand">> & {
 		sidecarSessions: SidecarSessionAdapter;
 		runtimeProcesses: SubagentProcessAdapter;
@@ -456,6 +900,7 @@ function createParentSessionState(
 		busy: false,
 		nextAgentOrdinal: 0,
 		ownedTmuxRuntimes: new Map<string, OwnedTmuxRuntime>(),
+		uiState: restoreUiStateFromEntries(sessionEntries, options.now),
 	};
 
 	state.manager = new SubagentManager({
@@ -483,10 +928,12 @@ function ensureCurrentState(
 	if (currentState && currentState.sessionFile === sessionFile) {
 		currentState.cwd = ctx.cwd;
 		currentState.busy = !ctx.isIdle();
+		currentState.lastUiContext = ctx;
+		renderWidget(currentState.lastUiContext, currentState.uiState);
 		return ok(currentState);
 	}
 
-	return createParentSessionState(pi, sessionFile, ctx.cwd, options);
+	return createParentSessionState(pi, sessionFile, ctx.cwd, ctx.sessionManager.getEntries(), options);
 }
 
 function allocateTmuxTarget(
@@ -551,13 +998,14 @@ function buildSpawnText(
 		`Spawned subagent ${record.id}.`,
 		`Type: ${displayName} (${record.type})`,
 		`State: ${record.state}`,
-		`Focus availability: ${focusTarget?.availability ?? "unknown"}`,
-		`Use the Subagent tool with action=list, send, interrupt, or focus to keep interacting from the parent session.`,
-		`Use /subagents list or /subagents focus ${record.id} for the live tmux target.`,
+		`Open availability: ${focusTarget?.availability === "stopped" ? "history" : focusTarget?.availability ?? "unknown"}`,
+		"Use the Subagent tool with action=list, open, send, or interrupt to keep interacting from the parent session.",
+		`Use /subagents list or /subagents open ${record.id} [peek|follow|take_over] in the TUI.`,
 	].join("\n");
 }
 
 function spawnNamedSubagent(
+	pi: ExtensionApiLike,
 	state: ParentSessionState,
 	params: Static<typeof AGENT_TOOL_PARAMETERS>,
 	effectiveOptions: EffectiveParentExtensionOptions,
@@ -616,6 +1064,7 @@ function spawnNamedSubagent(
 	});
 
 	const focusResult = state.manager.getFocusTarget(agentId);
+	syncUiState(pi, state, effectiveOptions.now());
 	return textResult(
 		buildSpawnText(
 			spawnResult.value,
@@ -628,12 +1077,12 @@ function spawnNamedSubagent(
 			state: spawnResult.value.state,
 			subagentType: preparedResult.value.definition.name,
 			displayName: formatDisplayName(preparedResult.value.definition, spawnResult.value),
-			focusAvailability: focusResult.ok ? focusResult.value.availability : "unknown",
+			openAvailability: focusResult.ok ? focusResult.value.availability : "unknown",
 		},
 	);
 }
 
-function requireAgentId(agentId: string | undefined, action: "send" | "interrupt" | "focus"): ValidationOutcome<string> {
+function requireAgentId(agentId: string | undefined, action: "send" | "interrupt" | "open" | "focus"): ValidationOutcome<string> {
 	if (!agentId || agentId.trim().length === 0) {
 		return fail(`action=${action} requires agent_id`);
 	}
@@ -642,33 +1091,6 @@ function requireAgentId(agentId: string | undefined, action: "send" | "interrupt
 
 function buildListToolResult(state: ParentSessionState): ToolResultLike<SubagentToolDetails> {
 	return textResult(formatListText(state), { action: "list" });
-}
-
-function buildFocusToolResult(
-	state: ParentSessionState,
-	agentId: string,
-): ToolResultLike<SubagentToolDetails> {
-	const recordResult = state.manager.getRecord(agentId);
-	if (!recordResult.ok) {
-		return textResult(`Unknown managed agent: ${agentId}`);
-	}
-
-	const focusResult = state.manager.getFocusTarget(agentId);
-	if (!focusResult.ok) {
-		return textResult(`Failed to build focus target for ${agentId}: ${focusResult.error}`);
-	}
-
-	const definition = resolveDefinitionForRecord(state, recordResult.value);
-	return textResult(
-		formatFocusText(recordResult.value, definition, focusResult.value),
-		{
-			action: "focus",
-			agentId,
-			state: recordResult.value.state,
-			displayName: formatDisplayName(definition, recordResult.value),
-			focusAvailability: focusResult.value.availability,
-		},
-	);
 }
 
 function buildSendToolResult(
@@ -709,53 +1131,116 @@ function buildInterruptToolResult(
 	});
 }
 
-function formatListText(
-	state: ParentSessionState,
-): string {
-	const records = state.manager.listRecords();
-	if (records.length === 0) {
+function formatListText(state: ParentSessionState): string {
+	if (state.uiState.agents.length === 0) {
 		return "No subagents are currently managed in this Pi session.";
 	}
 
-	const lines = records.map((record) => {
-		const definition = resolveDefinitionForRecord(state, record);
-		const displayName = formatDisplayName(definition, record);
-		const focusResult = state.manager.getFocusTarget(record.id);
-		const focusAvailability = focusResult.ok ? focusResult.value.availability : "unknown";
+	const lines = state.uiState.agents.map((snapshot) => {
 		const markers = [
-			record.assumptionsStaleAt ? `stale@${record.assumptionsStaleAt}` : undefined,
-			record.degradedAt ? `degraded@${record.degradedAt}` : undefined,
-			record.error ? "error" : undefined,
+			snapshot.isStale ? "stale" : undefined,
+			snapshot.isDegraded ? "degraded" : undefined,
+			snapshot.errorMessage ? "error" : undefined,
 		].filter((entry): entry is string => entry !== undefined);
 
-		return `- ${record.id} | ${displayName} (${record.type}) | posture=${record.state} | focus=${focusAvailability} | markers=${markers.join(", ") || "none"}`;
+		return `- ${snapshot.agentId} | ${snapshot.displayName} | state=${snapshot.state} | availability=${snapshot.availability} | markers=${markers.join(", ") || "none"}`;
 	});
 
 	return ["Managed subagents:", ...lines].join("\n");
 }
 
-function formatFocusText(
-	record: SubagentRecord,
-	definition: ResolvedAgentDefinition | undefined,
-	focusTarget: SubagentFocusTarget,
-): string {
-	const displayName = formatDisplayName(definition, record);
-	return [
-		`Subagent focus target for ${record.id}`,
-		`Type: ${displayName} (${record.type})`,
-		`State: ${record.state}`,
-		`Availability: ${focusTarget.availability}`,
-		`Tmux mode: ${focusTarget.tmuxMode}`,
-		`Tmux target: ${focusTarget.tmuxTarget}`,
-		`Session path: ${focusTarget.sessionPath}`,
-		"Run the focus command in your shell to attach. /subagents focus only prints the action; it does not switch this Pi terminal.",
-		`Focus command: ${focusTarget.focusCommand}`,
-		focusTarget.note ? `Note: ${focusTarget.note}` : undefined,
-	].filter((entry): entry is string => entry !== undefined).join("\n");
+function normalizeSubagentsCommandArgs(args: string): string {
+	const trimmed = args.trim();
+	if (!trimmed.startsWith("subagents")) {
+		return trimmed;
+	}
+
+	const remainder = trimmed.slice("subagents".length);
+	if (remainder.length === 0) {
+		return "";
+	}
+
+	return remainder.startsWith(" ") ? remainder.trimStart() : trimmed;
+}
+
+function openSubagentView(
+	ctx: ExtensionContextLike,
+	snapshot: SubagentUiSnapshot,
+	mode: SubagentOpenMode,
+	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+): ValidationOutcome<string> {
+	if (!ctx.hasUI || !ctx.ui.custom) {
+		return fail("Native subagent open requires the interactive TUI.");
+	}
+
+	const effectiveMode = snapshot.isHistorical ? "peek" : mode;
+	void ctx.ui.custom<void>(
+		(tui, _theme, _keybindings, done) =>
+			new SubagentOverlayComponent(
+				snapshot,
+				effectiveMode,
+				runTmuxCommand,
+				() => tui.requestRender(),
+				() => done(undefined),
+			),
+		{
+			overlay: true,
+			overlayOptions: {
+				width: "80%",
+				maxHeight: "80%",
+				anchor: "center",
+			},
+		},
+	).catch((error) => {
+		ctx.ui.notify(`Failed to open subagent view: ${normalizeError(error).message}`, "error");
+	});
+
+	return ok(
+		snapshot.isHistorical
+			? `Opened ${snapshot.agentId} historical detail view.`
+			: `Opened ${snapshot.agentId} in ${effectiveMode} mode.`,
+	);
+}
+
+function buildOpenToolResult(
+	state: ParentSessionState,
+	agentId: string,
+	mode: SubagentOpenMode,
+	ctx: ExtensionContextLike,
+	effectiveOptions: EffectiveParentExtensionOptions,
+): ToolResultLike<SubagentToolDetails> {
+	const snapshot = findSnapshot(state, agentId);
+	if (!snapshot) {
+		return textResult(`Unknown subagent: ${agentId}`);
+	}
+
+	const openResult = openSubagentView(ctx, snapshot, mode, effectiveOptions.runTmuxCommand);
+	if (!openResult.ok) {
+		return textResult(openResult.error, {
+			action: "open",
+			agentId,
+			mode,
+			state: snapshot.state,
+			displayName: snapshot.displayName,
+			openAvailability: snapshot.availability,
+		});
+	}
+
+	ctx.ui.notify(openResult.value, "info");
+	return textResult(openResult.value, {
+		action: "open",
+		agentId,
+		mode,
+		state: snapshot.state,
+		displayName: snapshot.displayName,
+		openAvailability: snapshot.availability,
+	});
 }
 
 function shutdownParentSession(
+	pi: ExtensionApiLike,
 	state: ParentSessionState | undefined,
+	now: () => string,
 	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
 ): void {
 	if (!state) {
@@ -767,6 +1252,7 @@ function shutdownParentSession(
 		killTmuxSession(runTmuxCommand, runtime.sessionName);
 	}
 	state.ownedTmuxRuntimes.clear();
+	syncUiState(pi, state, now());
 }
 
 function notifyRuntimePreparationFailure(ctx: ExtensionContextLike, error: string): void {
@@ -790,7 +1276,7 @@ export function installParentExtension(
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (activeState && activeState.sessionFile !== ctx.sessionManager.getSessionFile()) {
-			shutdownParentSession(activeState, effectiveOptions.runTmuxCommand);
+			shutdownParentSession(pi, activeState, effectiveOptions.now, effectiveOptions.runTmuxCommand);
 		}
 		const stateResult = ensureCurrentState(pi, activeState, ctx, effectiveOptions);
 		if (!stateResult.ok) {
@@ -799,6 +1285,8 @@ export function installParentExtension(
 			return;
 		}
 		activeState = stateResult.value;
+		activeState.lastUiContext = ctx;
+		renderWidget(ctx, activeState.uiState);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -809,6 +1297,7 @@ export function installParentExtension(
 			return;
 		}
 		activeState = stateResult.value;
+		activeState.lastUiContext = ctx;
 		activeState.busy = true;
 	});
 
@@ -820,6 +1309,7 @@ export function installParentExtension(
 			return;
 		}
 		activeState = stateResult.value;
+		activeState.lastUiContext = ctx;
 		activeState.busy = false;
 	});
 
@@ -829,20 +1319,21 @@ export function installParentExtension(
 			return;
 		}
 
-		shutdownParentSession(activeState, effectiveOptions.runTmuxCommand);
+		shutdownParentSession(pi, activeState, effectiveOptions.now, effectiveOptions.runTmuxCommand);
 		activeState = undefined;
 	});
 
 	pi.registerTool<typeof SUBAGENT_TOOL_PARAMETERS, SubagentToolDetails>({
 		name: "Subagent",
 		label: "Subagent",
-		description: "Manage pi-nexus subagents: spawn, list, send follow-ups, interrupt, or inspect focus info.",
+		description: "Manage pi-nexus subagents: spawn, list, open native views, send follow-ups, or interrupt.",
 		promptSnippet: "Manage live pi-nexus subagents with structured actions.",
 		promptGuidelines: [
 			"Use action=spawn to start a named subagent.",
+			"Use action=open to inspect or take over a child from the native TUI with mode=peek, follow, or take_over.",
 			"Use action=send to continue a running child after a progress or final_result callback.",
 			"Use action=interrupt to stop current child work without using tmux.",
-			"Use action=list or action=focus to inspect current managed children.",
+			"Use action=list to inspect current managed and historical children.",
 		],
 		parameters: SUBAGENT_TOOL_PARAMETERS,
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
@@ -859,7 +1350,7 @@ export function installParentExtension(
 					if (!params.prompt || !params.description || !params.subagent_type) {
 						return textResult("action=spawn requires prompt, description, and subagent_type");
 					}
-					return spawnNamedSubagent(state, {
+					return spawnNamedSubagent(pi, state, {
 						prompt: params.prompt,
 						description: params.description,
 						subagent_type: params.subagent_type,
@@ -867,12 +1358,21 @@ export function installParentExtension(
 					}, effectiveOptions);
 				case "list":
 					return buildListToolResult(state);
-				case "focus": {
-					const agentIdResult = requireAgentId(params.agent_id, "focus");
+				case "open": {
+					const agentIdResult = requireAgentId(params.agent_id, "open");
 					if (!agentIdResult.ok) {
 						return textResult(agentIdResult.error);
 					}
-					return buildFocusToolResult(state, agentIdResult.value);
+					const modeResult = validateSubagentOpenMode(params.mode ?? "peek");
+					if (!modeResult.ok) {
+						return textResult(modeResult.error);
+					}
+					return buildOpenToolResult(state, agentIdResult.value, modeResult.value, ctx, effectiveOptions);
+				}
+				case "focus": {
+					return textResult(LEGACY_FOCUS_MESSAGE, {
+						action: "focus",
+					});
 				}
 				case "send": {
 					const agentIdResult = requireAgentId(params.agent_id, "send");
@@ -893,15 +1393,37 @@ export function installParentExtension(
 	});
 
 	pi.registerCommand("subagents", {
-		description: "List subagents, send follow-ups, or print the exact tmux focus command for one.",
+		description: "List subagents, open native child views, or send follow-ups.",
 		getArgumentCompletions: (argumentPrefix) => {
 			const trimmed = argumentPrefix.trimStart();
 			if (trimmed.length === 0) {
 				return [
 					{ value: "list", label: "list" },
-					{ value: "focus ", label: "focus <agentId>" },
+					{ value: "open ", label: "open <agentId> [mode]" },
 					{ value: "send ", label: "send <agentId> <message>" },
 				];
+			}
+
+			if (trimmed.startsWith("open ")) {
+				const openPrefix = trimmed.slice("open ".length);
+				if (!openPrefix.includes(" ")) {
+					const items = activeState?.uiState.agents ?? [];
+					return items
+						.filter((record) => record.agentId.startsWith(openPrefix))
+						.map((record) => ({
+							value: `open ${record.agentId} `,
+							label: record.agentId,
+						}));
+				}
+				const [agentId, modePrefix] = openPrefix.split(/\s+/, 2);
+				if (agentId) {
+					return ["peek", "follow", "take_over"]
+						.filter((mode) => mode.startsWith(modePrefix ?? ""))
+						.map((mode) => ({
+							value: `open ${agentId} ${mode}`,
+							label: mode,
+						}));
+				}
 			}
 
 			if (trimmed.startsWith("focus ")) {
@@ -928,7 +1450,7 @@ export function installParentExtension(
 				}
 			}
 
-			const commands = ["list", "focus", "send"];
+			const commands = ["list", "open", "send", "focus"];
 			return commands
 				.filter((entry) => entry.startsWith(trimmed))
 				.map((entry) => ({ value: entry, label: entry }));
@@ -947,7 +1469,7 @@ export function installParentExtension(
 			}
 			activeState = stateResult.value;
 			const state = activeState;
-			const trimmed = args.trim();
+			const trimmed = normalizeSubagentsCommandArgs(args);
 			const [command, ...rest] = trimmed.split(/\s+/).filter((entry) => entry.length > 0);
 
 			if (!command || command === "list") {
@@ -957,47 +1479,51 @@ export function installParentExtension(
 				return;
 			}
 
-			if (command === "focus") {
-				const agentId = rest.join(" ").trim();
+			if (command === "open") {
+				const agentId = rest.shift()?.trim() ?? "";
+				const modeResult = validateSubagentOpenMode(rest.shift() ?? "peek");
 				if (!agentId) {
+					sendSessionMessage(pi, "pi-nexus-subagents-output", "Usage: /subagents open <agentId> [peek|follow|take_over]", {
+						command: "open",
+					});
+					return;
+				}
+				if (!modeResult.ok) {
 					sendSessionMessage(
 						pi,
 						"pi-nexus-subagents-output",
-						"Usage: /subagents focus <agentId>",
-						{ command: "focus" },
+						modeResult.error,
+						{ command: "open", agentId },
 					);
 					return;
 				}
 
-				const recordResult = state.manager.getRecord(agentId);
-				if (!recordResult.ok) {
+				const snapshot = findSnapshot(state, agentId);
+				if (!snapshot) {
 					sendSessionMessage(
 						pi,
 						"pi-nexus-subagents-output",
-						`Unknown managed agent: ${agentId}`,
-						{ command: "focus", agentId },
+						`Unknown subagent: ${agentId}`,
+						{ command: "open", agentId },
 					);
 					return;
 				}
 
-				const focusResult = state.manager.getFocusTarget(agentId);
-				if (!focusResult.ok) {
-					sendSessionMessage(
-						pi,
-						"pi-nexus-subagents-output",
-						`Failed to build focus target for ${agentId}: ${focusResult.error}`,
-						{ command: "focus", agentId },
-					);
+				const openResult = openSubagentView(ctx, snapshot, modeResult.value, effectiveOptions.runTmuxCommand);
+				if (!openResult.ok) {
+					sendSessionMessage(pi, "pi-nexus-subagents-output", openResult.error, {
+						command: "open",
+						agentId,
+					});
 					return;
 				}
 
-				const definition = resolveDefinitionForRecord(state, recordResult.value);
-				sendSessionMessage(
-					pi,
-					"pi-nexus-subagents-output",
-					formatFocusText(recordResult.value, definition, focusResult.value),
-					{ command: "focus", agentId },
-				);
+				ctx.ui.notify(openResult.value, "info");
+				return;
+			}
+
+			if (command === "focus") {
+				sendSessionMessage(pi, "pi-nexus-subagents-output", LEGACY_FOCUS_MESSAGE, { command: "focus" });
 				return;
 			}
 
@@ -1037,7 +1563,7 @@ export function installParentExtension(
 			sendSessionMessage(
 				pi,
 				"pi-nexus-subagents-output",
-				"Usage:\n/subagents list\n/subagents focus <agentId>\n/subagents send <agentId> <message>",
+				"Usage:\n/subagents list\n/subagents open <agentId> [peek|follow|take_over]\n/subagents send <agentId> <message>",
 				{ command: "usage" },
 			);
 		},

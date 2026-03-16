@@ -74,6 +74,8 @@ export interface RuntimeFailure {
 }
 
 export type SubagentFocusAvailability = "live" | "degraded" | "stopped";
+export type SubagentOpenMode = "peek" | "follow" | "take_over";
+export type SubagentUiAvailability = "live" | "degraded" | "history";
 
 export interface SubagentFocusTarget {
 	agentId: string;
@@ -83,6 +85,37 @@ export interface SubagentFocusTarget {
 	sessionPath: string;
 	focusCommand: string;
 	note?: string;
+}
+
+export interface SubagentUiSnapshot {
+	agentId: string;
+	displayName: string;
+	type: string;
+	description: string;
+	state: RuntimeState;
+	availability: SubagentUiAvailability;
+	tmuxMode: TmuxMode;
+	tmuxTarget: string;
+	sessionPath: string;
+	latestSummary?: string;
+	pendingInputQuestion?: string;
+	finalSummary?: string;
+	errorMessage?: string;
+	note?: string;
+	isStale: boolean;
+	isDegraded: boolean;
+	isHistorical: boolean;
+	canOpenPeek: boolean;
+	canOpenFollow: boolean;
+	canOpenTakeOver: boolean;
+	canSend: boolean;
+	canInterrupt: boolean;
+}
+
+export interface SubagentUiStateSnapshot {
+	version: 1;
+	updatedAt: string;
+	agents: SubagentUiSnapshot[];
 }
 
 export interface SubagentRecord<TData = unknown> {
@@ -300,6 +333,8 @@ const SIDECAR_STATE_STATUSES = new Set<SidecarStateStatus>([
 ]);
 const SIDECAR_EMPTY_PAYLOAD_TYPES = new Set<SidecarMessageKind>(["interrupt", "ping", "pong"]);
 const SUBAGENT_FOCUS_AVAILABILITIES = new Set<SubagentFocusAvailability>(["live", "degraded", "stopped"]);
+const SUBAGENT_OPEN_MODES = new Set<SubagentOpenMode>(["peek", "follow", "take_over"]);
+const SUBAGENT_UI_AVAILABILITIES = new Set<SubagentUiAvailability>(["live", "degraded", "history"]);
 const STATES_REQUIRING_CONNECTED_AT = new Set<RuntimeState>([
 	"ready",
 	"running",
@@ -1560,6 +1595,160 @@ export function validateSubagentFocusTarget(input: unknown): ValidationOutcome<S
 		sessionPath: input.sessionPath as string,
 		focusCommand: (input.focusCommand as string).trim(),
 		note: hasOwnField(input, "note") && input.note !== undefined ? (input.note as string).trim() : undefined,
+	});
+}
+
+export function validateSubagentOpenMode(input: unknown): ValidationOutcome<SubagentOpenMode> {
+	if (typeof input !== "string" || !SUBAGENT_OPEN_MODES.has(input as SubagentOpenMode)) {
+		return fail('open mode must be one of: peek, follow, take_over');
+	}
+
+	return ok(input as SubagentOpenMode);
+}
+
+export function validateSubagentUiSnapshot(input: unknown): ValidationOutcome<SubagentUiSnapshot> {
+	if (!isRecord(input)) {
+		return fail("ui snapshot must be an object");
+	}
+
+	const agentIdError = validateRequiredText("uiSnapshot.agentId", input.agentId);
+	if (agentIdError) return agentIdError;
+	const displayNameError = validateRequiredText("uiSnapshot.displayName", input.displayName);
+	if (displayNameError) return displayNameError;
+	const typeError = validateRequiredText("uiSnapshot.type", input.type);
+	if (typeError) return typeError;
+	const descriptionError = validateRequiredText("uiSnapshot.description", input.description);
+	if (descriptionError) return descriptionError;
+	if (typeof input.state !== "string" || !isRuntimeState(input.state)) {
+		return fail("uiSnapshot.state must be one of: starting, connecting, ready, running, waiting, needs_input, failed, stopped");
+	}
+	if (
+		typeof input.availability !== "string"
+		|| !SUBAGENT_UI_AVAILABILITIES.has(input.availability as SubagentUiAvailability)
+	) {
+		return fail("uiSnapshot.availability must be one of: live, degraded, history");
+	}
+	if (input.tmuxMode !== "pane" && input.tmuxMode !== "window") {
+		return fail('uiSnapshot.tmuxMode must be either "pane" or "window"');
+	}
+	const tmuxTargetError = validateRequiredText("uiSnapshot.tmuxTarget", input.tmuxTarget);
+	if (tmuxTargetError) return tmuxTargetError;
+	const tmuxTargetShapeError = validateParsedTmuxTarget(
+		"uiSnapshot.tmuxTarget",
+		input.tmuxMode,
+		input.tmuxTarget as string,
+	);
+	if (tmuxTargetShapeError) return tmuxTargetShapeError;
+	const sessionPathError = validateRequiredPath("uiSnapshot.sessionPath", input.sessionPath);
+	if (sessionPathError) return sessionPathError;
+
+	for (const [field, value] of [
+		["latestSummary", input.latestSummary],
+		["pendingInputQuestion", input.pendingInputQuestion],
+		["finalSummary", input.finalSummary],
+		["errorMessage", input.errorMessage],
+		["note", input.note],
+	] as const) {
+		if (hasOwnField(input, field) && value !== undefined) {
+			const nestedError = validateRequiredText(`uiSnapshot.${field}`, value);
+			if (nestedError) return nestedError;
+		}
+	}
+
+	for (const [field, value] of [
+		["isStale", input.isStale],
+		["isDegraded", input.isDegraded],
+		["isHistorical", input.isHistorical],
+		["canOpenPeek", input.canOpenPeek],
+		["canOpenFollow", input.canOpenFollow],
+		["canOpenTakeOver", input.canOpenTakeOver],
+		["canSend", input.canSend],
+		["canInterrupt", input.canInterrupt],
+	] as const) {
+		if (typeof value !== "boolean") {
+			return fail(`uiSnapshot.${field} must be a boolean`);
+		}
+	}
+
+	if (input.availability === "history") {
+		if (!input.isHistorical) {
+			return fail("history ui snapshots must set isHistorical");
+		}
+		if (input.canOpenFollow || input.canOpenTakeOver || input.canSend || input.canInterrupt) {
+			return fail("history ui snapshots may only allow peek opens");
+		}
+	}
+	if (input.isHistorical && input.availability !== "history") {
+		return fail("isHistorical requires availability=history");
+	}
+	if (input.isDegraded && input.availability === "live") {
+		return fail("isDegraded requires availability=degraded or history");
+	}
+	if (input.isStale && input.isHistorical) {
+		return fail("historical ui snapshots cannot be stale");
+	}
+
+	return ok({
+		agentId: (input.agentId as string).trim(),
+		displayName: (input.displayName as string).trim(),
+		type: (input.type as string).trim(),
+		description: (input.description as string).trim(),
+		state: input.state,
+		availability: input.availability as SubagentUiAvailability,
+		tmuxMode: input.tmuxMode,
+		tmuxTarget: (input.tmuxTarget as string).trim(),
+		sessionPath: input.sessionPath as string,
+		latestSummary: hasOwnField(input, "latestSummary") && input.latestSummary !== undefined
+			? (input.latestSummary as string).trim()
+			: undefined,
+		pendingInputQuestion: hasOwnField(input, "pendingInputQuestion") && input.pendingInputQuestion !== undefined
+			? (input.pendingInputQuestion as string).trim()
+			: undefined,
+		finalSummary: hasOwnField(input, "finalSummary") && input.finalSummary !== undefined
+			? (input.finalSummary as string).trim()
+			: undefined,
+		errorMessage: hasOwnField(input, "errorMessage") && input.errorMessage !== undefined
+			? (input.errorMessage as string).trim()
+			: undefined,
+		note: hasOwnField(input, "note") && input.note !== undefined ? (input.note as string).trim() : undefined,
+		isStale: input.isStale as boolean,
+		isDegraded: input.isDegraded as boolean,
+		isHistorical: input.isHistorical as boolean,
+		canOpenPeek: input.canOpenPeek as boolean,
+		canOpenFollow: input.canOpenFollow as boolean,
+		canOpenTakeOver: input.canOpenTakeOver as boolean,
+		canSend: input.canSend as boolean,
+		canInterrupt: input.canInterrupt as boolean,
+	});
+}
+
+export function validateSubagentUiStateSnapshot(input: unknown): ValidationOutcome<SubagentUiStateSnapshot> {
+	if (!isRecord(input)) {
+		return fail("ui state snapshot must be an object");
+	}
+	if (input.version !== 1) {
+		return fail("ui state snapshot version must be 1");
+	}
+	if (typeof input.updatedAt !== "string" || !isIsoTimestamp(input.updatedAt)) {
+		return fail("ui state snapshot updatedAt must be an ISO timestamp");
+	}
+	if (!Array.isArray(input.agents)) {
+		return fail("ui state snapshot agents must be an array");
+	}
+
+	const agents: SubagentUiSnapshot[] = [];
+	for (let index = 0; index < input.agents.length; index += 1) {
+		const agentResult = validateSubagentUiSnapshot(input.agents[index]);
+		if (!agentResult.ok) {
+			return fail(`ui state snapshot agents[${index}] ${agentResult.error}`);
+		}
+		agents.push(agentResult.value);
+	}
+
+	return ok({
+		version: 1,
+		updatedAt: input.updatedAt,
+		agents,
 	});
 }
 

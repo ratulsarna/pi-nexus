@@ -8,8 +8,9 @@ This repo now contains the first real user-facing tmux sub-agent path for `pi`.
 
 The idea is simple:
 - sub-agents are real `pi` processes running in tmux
-- tmux is the human surface
+- `pi` is the human surface
 - a structured sidecar channel is the machine/orchestration surface
+- tmux stays backend transport and recovery plumbing
 - if you jump into a live sub-agent and chat directly, the parent treats that as intervention metadata rather than scraping terminal text
 
 ## What you can do today
@@ -19,8 +20,8 @@ Today, the real v1 user path is available:
 - ask the main agent to call the `Subagent` tool with `action: "spawn"` to start a named subagent
 - let the main agent continue interacting with live children through the `Subagent` tool
 - list live subagents with `/subagents list`
+- open native child views with `/subagents open <agentId> [peek|follow|take_over]`
 - send structured follow-ups with `/subagents send <agentId> <message>`
-- print the exact tmux focus action with `/subagents focus <agentId>`
 - define named agent types through embedded or custom definitions
 
 ## Trying it right now
@@ -36,10 +37,10 @@ If you want to try the current implementation from this repo, the practical path
    or copy/link it into `~/.pi/agent/extensions/`
 4. Start `pi`
 5. Ask the main agent to use the `Subagent` tool with `action: "spawn"` and a named type such as `general-purpose`, `Explore`, or `Plan`
-6. Let the main agent use the `Subagent` tool with `action: "list"`, `"send"`, `"interrupt"`, or `"focus"` for structured parent-child control
+6. Let the main agent use the `Subagent` tool with `action: "list"`, `"open"`, `"send"`, or `"interrupt"` for structured parent-child control
 7. Run `/subagents list`
 8. Run `/subagents send <agentId> <message>` when you want to nudge a live child yourself through the supported sidecar channel
-9. Run `/subagents focus <agentId>` and use the returned `focusCommand` to jump into the live tmux child
+9. Run `/subagents open <agentId>` to peek at the child, `/subagents open <agentId> follow` to keep watching it live, or `/subagents open <agentId> take_over` to chat directly with it from the TUI
 
 This is the real first-user path, not just a repo-internal harness.
 
@@ -50,8 +51,8 @@ Prerequisites:
 The extension adds these user-facing surfaces:
 - `Subagent` tool
 - `/subagents list`
+- `/subagents open <agentId> [peek|follow|take_over]`
 - `/subagents send <agentId> <message>`
-- `/subagents focus <agentId>`
 
 The default named agents are:
 - `general-purpose`
@@ -71,8 +72,6 @@ Supported frontmatter keys used by this loader are:
 - `enabled`
 
 Unknown frontmatter keys are ignored.
-
-Focus intentionally does not take over the current `pi` terminal. `/subagents focus <agentId>` prints the exact tmux action so you can jump into the live child yourself, including nested-tmux-safe behavior when `pi` is already running inside tmux.
 
 If you want to send the child another message from the parent session, prefer `/subagents send <agentId> <message>` over typing directly into tmux. Direct tmux input is treated as user intervention and marks the child assumptions as stale until it emits a fresh explicit report.
 
