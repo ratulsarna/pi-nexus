@@ -302,6 +302,25 @@ function getRegisteredCommand(pi: FakePiApi, name: string): {
 	};
 }
 
+function getMessageRenderer(
+	pi: FakePiApi,
+	customType: string,
+): (
+	message: { customType: string; content: string; details?: unknown },
+	options: { expanded?: boolean },
+	theme: unknown,
+) => { render(width: number): string[] } | undefined {
+	const renderer = pi.messageRenderers.get(customType);
+	if (!renderer) {
+		throw new Error(`missing renderer ${customType}`);
+	}
+	return renderer as (
+		message: { customType: string; content: string; details?: unknown },
+		options: { expanded?: boolean },
+		theme: unknown,
+	) => { render(width: number): string[] } | undefined;
+}
+
 function makeUiSnapshot(overrides: Partial<SubagentUiSnapshot> = {}): SubagentUiSnapshot {
 	return {
 		agentId: "agt_test",
@@ -435,6 +454,7 @@ Research the codebase carefully and report findings.`,
 		const command = getRegisteredCommand(pi, "subagents");
 		await command.handler("list", ctx);
 		const listContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
+		expect(listContent).toContain("Subagents · live=1 · history=0");
 		expect(listContent).toContain(agentId);
 		expect(listContent).toContain("Researcher");
 		expect(listContent).toContain("state=connecting");
@@ -459,7 +479,9 @@ Research the codebase carefully and report findings.`,
 		await command.handler(`send ${agentId} keep going`, ctx);
 		const sendContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
 		expect(sendContent).toContain(`Queued follow-up for ${agentId}.`);
-		expect(sendContent).toContain("Message: keep going");
+		expect(sendContent).toContain("Researcher");
+		expect(sendContent).toContain("Message");
+		expect(sendContent).toContain("keep going");
 		expect(sidecars.get(agentId).sent.at(-1)).toMatchObject({
 			type: "follow_up",
 			payload: { message: "keep going" },
@@ -521,6 +543,8 @@ Research the codebase carefully and report findings.`,
 		await command.handler(`subagents open ${agentId} follow`, ctx);
 		expect(ctx.customCalls).toHaveLength(1);
 		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in Follow.`);
+		expect(pi.sentMessages.at(-1)?.message.customType).toBe("pi-nexus-subagent-open");
+		expect(String(pi.sentMessages.at(-1)?.message.content ?? "")).toContain("Mode: follow");
 	});
 
 	it("manages live children through the generic Subagent tool", async () => {
@@ -576,6 +600,7 @@ Research the codebase carefully and report findings.`,
 			undefined,
 			ctx,
 		);
+		expect(listResult.content[0]?.text ?? "").toContain("Subagents · live=1 · history=0");
 		expect(listResult.content[0]?.text ?? "").toContain(agentId);
 
 		const openResult = await tool.execute(
@@ -596,8 +621,9 @@ Research the codebase carefully and report findings.`,
 			ctx,
 		);
 		expect(followOpenResult.content[0]?.text ?? "").toContain(`Opened ${agentId} in Follow.`);
-		expect(followOpenResult.content[0]?.text ?? "").toContain(`Subagent ${agentId}`);
 		expect(followOpenResult.content[0]?.text ?? "").toContain("Mode: follow");
+		expect(followOpenResult.content[0]?.text ?? "").toContain("Agent");
+		expect(followOpenResult.content[0]?.text ?? "").toContain("availability=live");
 
 		const sendResult = await tool.execute(
 			"tool-call-subagent-send",
@@ -607,6 +633,9 @@ Research the codebase carefully and report findings.`,
 			ctx,
 		);
 		expect(sendResult.content[0]?.text ?? "").toContain(`Queued follow-up for ${agentId}.`);
+		expect(sendResult.content[0]?.text ?? "").toContain("Agent");
+		expect(sendResult.content[0]?.text ?? "").toContain("Message");
+		expect(sendResult.content[0]?.text ?? "").toContain("send joke 2");
 		expect(sidecars.get(agentId).sent.at(-1)).toMatchObject({
 			type: "follow_up",
 			payload: { message: "send joke 2" },
@@ -620,6 +649,7 @@ Research the codebase carefully and report findings.`,
 			ctx,
 		);
 		expect(interruptResult.content[0]?.text ?? "").toContain(`Sent interrupt to ${agentId}.`);
+		expect(interruptResult.content[0]?.text ?? "").toContain("The parent requested the child to stop current work.");
 		expect(sidecars.get(agentId).sent.at(-1)).toMatchObject({
 			type: "interrupt",
 			payload: {},
@@ -717,11 +747,159 @@ Research the codebase carefully and report findings.`,
 
 		const progressMessage = pi.sentMessages.find((entry) => entry.message.customType === "pi-nexus-subagent-progress");
 		expect(progressMessage?.message.content).toContain("Working on the task");
+		expect(progressMessage?.message.details).toMatchObject({
+			agentId,
+			state: "running",
+		});
 		expect(pi.sentUserMessages.at(-1)).toEqual({
 			content: expect.stringContaining("Subagent final_result"),
 			options: { deliverAs: "followUp" },
 		});
 		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Completed the task");
+	});
+
+	it("registers and renders custom subagent message types", () => {
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+		});
+
+		expect(Array.from(pi.messageRenderers.keys()).sort()).toEqual([
+			"pi-nexus-subagent-open",
+			"pi-nexus-subagent-progress",
+			"pi-nexus-subagent-status",
+			"pi-nexus-subagents-output",
+		]);
+
+		const progressRenderer = getMessageRenderer(pi, "pi-nexus-subagent-progress");
+		const renderedProgress = progressRenderer(
+			{
+				customType: "pi-nexus-subagent-progress",
+				content: "Summary line\nMore detail",
+				details: { agentId: "agt_render", state: "running" },
+			},
+			{},
+			{},
+		);
+		expect(renderedProgress?.render(80)).toEqual([
+			"Subagent progress · agt_render · running",
+			"Summary line",
+			"More detail",
+		]);
+
+		const statusRenderer = getMessageRenderer(pi, "pi-nexus-subagent-status");
+		const renderedStatus = statusRenderer(
+			{
+				customType: "pi-nexus-subagent-status",
+				content: "Subagent assumptions are stale for agt_render after direct tmux intervention.",
+				details: { agentId: "agt_render" },
+			},
+			{},
+			{},
+		);
+		expect(renderedStatus?.render(80)).toEqual([
+			"Subagent status · agt_render",
+			"Subagent assumptions are stale for agt_render after direct tmux intervention.",
+		]);
+
+		const openRenderer = getMessageRenderer(pi, "pi-nexus-subagent-open");
+		const renderedOpen = openRenderer(
+			{
+				customType: "pi-nexus-subagent-open",
+				content: "Opened agt_render in Follow.\nAgent · agt_render\nstate=running · availability=live\n\nMode: follow",
+				details: { agentId: "agt_render", mode: "follow" },
+			},
+			{},
+			{},
+		);
+		expect(renderedOpen?.render(26)).toEqual(expect.arrayContaining([
+			expect.stringContaining("Subagent open"),
+			"Agent · agt_render",
+			"state=running ·",
+			"availability=live",
+			"",
+			"Mode: follow",
+		]));
+
+		const outputRenderer = getMessageRenderer(pi, "pi-nexus-subagents-output");
+		const renderedOutput = outputRenderer(
+			{
+				customType: "pi-nexus-subagents-output",
+				content: "Queued follow-up for agt_render.\nMessage\nkeep going",
+				details: { command: "send" },
+			},
+			{},
+			{},
+		);
+		expect(renderedOutput?.render(80)).toEqual([
+			"Subagents · send",
+			"Queued follow-up for agt_render.",
+			"Message",
+			"keep going",
+		]);
+	});
+
+	it("bridges needs_input and error events with structured follow-up copy", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:11:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "bridge-needs-input.jsonl"));
+		await pi.emit("session_start", {}, ctx);
+
+		const tool = getRegisteredTool(pi, "Subagent");
+		await tool.execute(
+			"tool-call-bridge-needs-input",
+			{
+				action: "spawn",
+				prompt: "Ask for help if blocked.",
+				description: "Needs input test",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		const agentId = Array.from(processes.handles.keys())[0];
+		const sidecar = sidecars.get(agentId);
+		expect(sidecar.connect()).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecar.message(
+			makeEnvelope(agentId, "ready", 0, "2026-03-13T12:11:01.000Z", {
+				pid: 102,
+				sessionPath: processes.get(agentId).launchSpec.sessionPath,
+				tmuxTarget: processes.get(agentId).launchSpec.tmuxTarget,
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecar.message(
+			makeEnvelope(agentId, "needs_input", 1, "2026-03-13T12:11:02.000Z", {
+				question: "Which API should I call?",
+				kind: "decision",
+				data: null,
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Subagent needs_input");
+		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Question: Which API should I call?");
+
+		expect(sidecar.message(
+			makeEnvelope(agentId, "error", 2, "2026-03-13T12:11:03.000Z", {
+				fatal: false,
+				message: "Lost connection to helper",
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Subagent error");
+		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Message: Lost connection to helper");
+		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Fatal: no");
 	});
 
 	it("refreshes live widget elapsed time between child events", async () => {
@@ -1002,7 +1180,7 @@ Research the codebase carefully and report findings.`,
 		const listCommand = getRegisteredCommand(pi, "subagents");
 		await listCommand.handler("list", ctx);
 		const staleListContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
-		expect(staleListContent).toContain("markers=stale");
+		expect(staleListContent).toContain("badges=stale");
 		expect(pi.sentUserMessages).toHaveLength(sentUserMessageCountBeforeIntervention);
 		expect(String(pi.sentMessages.at(-2)?.message.content ?? "")).toContain("assumptions are stale");
 
@@ -1015,7 +1193,7 @@ Research the codebase carefully and report findings.`,
 
 		await listCommand.handler("list", ctx);
 		const refreshedListContent = String(pi.sentMessages.at(-1)?.message.content ?? "");
-		expect(refreshedListContent).toContain("markers=none");
+		expect(refreshedListContent).not.toContain("badges=stale");
 	});
 
 	it("kills the allocated tmux session when agent runtime directory setup fails", async () => {

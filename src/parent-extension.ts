@@ -102,6 +102,16 @@ interface CustomMessageLike<T = unknown> {
 	details?: T;
 }
 
+interface MessageRendererLike {
+	render(width: number): string[];
+}
+
+type MessageRendererFactoryLike = (
+	message: CustomMessageLike,
+	options: { expanded?: boolean },
+	theme: unknown,
+) => MessageRendererLike | undefined;
+
 interface ToolTextContent {
 	type: "text";
 	text: string;
@@ -137,6 +147,7 @@ interface ExtensionApiLike {
 		tool: ToolDefinitionLike<TParams, TDetails>,
 	): void;
 	registerCommand(name: string, options: RegisteredCommandLike): void;
+	registerMessageRenderer(customType: string, renderer: MessageRendererFactoryLike): void;
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessageLike<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
@@ -1115,6 +1126,200 @@ function sendSessionMessage(
 	);
 }
 
+function wrapText(value: string, width: number): string[] {
+	if (width <= 0) {
+		return [value];
+	}
+
+	const normalized = value.replace(/\r/g, "");
+	const wrapped: string[] = [];
+	for (const rawLine of normalized.split("\n")) {
+		if (rawLine.length === 0) {
+			wrapped.push("");
+			continue;
+		}
+
+		let remaining = rawLine;
+		while (remaining.length > width) {
+			const slice = remaining.slice(0, width + 1);
+			const breakIndex = slice.lastIndexOf(" ");
+			const cut = breakIndex > Math.floor(width / 2) ? breakIndex : width;
+			wrapped.push(remaining.slice(0, cut).trimEnd());
+			remaining = remaining.slice(cut).trimStart();
+		}
+		wrapped.push(remaining);
+	}
+
+	return wrapped;
+}
+
+function renderMessageBlock(title: string, bodyLines: ReadonlyArray<string>, width: number): string[] {
+	const contentWidth = Math.max(24, width);
+	const lines = [fitLine(title, contentWidth)];
+	for (const line of bodyLines) {
+		lines.push(...wrapText(line, contentWidth));
+	}
+	return lines;
+}
+
+function renderCustomMessage(title: string, bodyLines: ReadonlyArray<string>): MessageRendererLike {
+	return {
+		render(width: number): string[] {
+			return renderMessageBlock(title, bodyLines, width);
+		},
+	};
+}
+
+function trimRedundantRendererHeading(content: string, predicate: (line: string) => boolean): string[] {
+	const lines = content.split("\n");
+	if (lines.length > 0 && predicate(lines[0])) {
+		return lines.slice(1);
+	}
+	return lines;
+}
+
+function registerMessageRenderers(pi: ExtensionApiLike): void {
+	pi.registerMessageRenderer("pi-nexus-subagent-progress", (message) => {
+		const details = message.details as { agentId?: string; state?: string } | undefined;
+		const title = details?.agentId
+			? `Subagent progress · ${details.agentId}${details.state ? ` · ${details.state}` : ""}`
+			: "Subagent progress";
+		return renderCustomMessage(title, typeof message.content === "string" ? message.content.split("\n") : []);
+	});
+
+	pi.registerMessageRenderer("pi-nexus-subagent-status", (message) => {
+		const details = message.details as { agentId?: string } | undefined;
+		const title = details?.agentId ? `Subagent status · ${details.agentId}` : "Subagent status";
+		return renderCustomMessage(title, typeof message.content === "string" ? message.content.split("\n") : []);
+	});
+
+	pi.registerMessageRenderer("pi-nexus-subagent-open", (message) => {
+		const details = message.details as { agentId?: string; mode?: string } | undefined;
+		const title = details?.agentId
+			? `Subagent open · ${details.agentId}${details.mode ? ` · ${details.mode}` : ""}`
+			: "Subagent open";
+		const bodyLines = typeof message.content === "string"
+			? trimRedundantRendererHeading(message.content, (line) => line.startsWith("Opened "))
+			: [];
+		return renderCustomMessage(title, bodyLines);
+	});
+
+	pi.registerMessageRenderer("pi-nexus-subagents-output", (message) => {
+		const details = message.details as { command?: string } | undefined;
+		const title = details?.command ? `Subagents · ${details.command}` : "Subagents";
+		return renderCustomMessage(title, typeof message.content === "string" ? message.content.split("\n") : []);
+	});
+}
+
+function formatSnapshotStatusLine(snapshot: SubagentUiSnapshot, referenceTime: string): string {
+	const badges = formatSnapshotBadges(snapshot);
+	const elapsed = formatElapsedTime(snapshot.startedAt, snapshot.endedAt, referenceTime);
+	return [
+		`state=${snapshot.state}`,
+		`availability=${snapshot.availability}`,
+		badges !== "none" ? `badges=${badges}` : undefined,
+		elapsed ? `elapsed=${elapsed}` : undefined,
+	].filter((value): value is string => value !== undefined).join(" · ");
+}
+
+function formatSnapshotSummaryPreview(snapshot: SubagentUiSnapshot): string | undefined {
+	if (snapshot.errorMessage) {
+		return `Error: ${snapshot.errorMessage}`;
+	}
+	if (snapshot.pendingInputQuestion) {
+		return `Needs input: ${snapshot.pendingInputQuestion}`;
+	}
+	if (snapshot.finalSummary) {
+		return `Final: ${snapshot.finalSummary}`;
+	}
+	if (snapshot.latestSummary) {
+		return `Latest: ${snapshot.latestSummary}`;
+	}
+	if (snapshot.note) {
+		return `Note: ${snapshot.note}`;
+	}
+	return undefined;
+}
+
+function formatListText(state: ParentSessionState, referenceTime: string): string {
+	if (state.uiState.agents.length === 0) {
+		return "Subagents · live=0 · history=0\n\nNo subagents are currently managed in this Pi session.";
+	}
+
+	const live = state.uiState.agents.filter((snapshot) => !snapshot.isHistorical);
+	const history = state.uiState.agents.filter((snapshot) => snapshot.isHistorical);
+	const lines = [`Subagents · live=${live.length} · history=${history.length}`, ""];
+
+	const appendGroup = (title: string, snapshots: ReadonlyArray<SubagentUiSnapshot>) => {
+		if (snapshots.length === 0) {
+			return;
+		}
+		lines.push(title);
+		for (const snapshot of snapshots) {
+			lines.push(`- ${snapshot.displayName} · ${snapshot.agentId}`);
+			lines.push(`  ${formatSnapshotStatusLine(snapshot, referenceTime)}`);
+			const preview = formatSnapshotSummaryPreview(snapshot);
+			if (preview) {
+				lines.push(`  ${preview}`);
+			}
+		}
+		lines.push("");
+	};
+
+	appendGroup("Live", live);
+	appendGroup("History", history);
+	if (lines.at(-1) === "") {
+		lines.pop();
+	}
+	return lines.join("\n");
+}
+
+function buildAgentActionText(
+	heading: string,
+	snapshot: SubagentUiSnapshot,
+	referenceTime: string,
+	extraLines: ReadonlyArray<string> = [],
+): string {
+	const lines = [
+		heading,
+		`${snapshot.displayName} · ${snapshot.agentId}`,
+		formatSnapshotStatusLine(snapshot, referenceTime),
+	];
+	const preview = formatSnapshotSummaryPreview(snapshot);
+	if (preview) {
+		lines.push(preview);
+	}
+	if (extraLines.length > 0) {
+		lines.push("", ...extraLines);
+	}
+	return lines.join("\n");
+}
+
+function buildOpenPresentationText(
+	snapshot: SubagentUiSnapshot,
+	openMessage: string,
+	mode: string,
+	referenceTime: string,
+): string {
+	return buildAgentActionText(openMessage, snapshot, referenceTime, [`Mode: ${mode}`]);
+}
+
+function formatChildEventText(
+	kind: "final_result" | "needs_input" | "error",
+	label: string,
+	primaryLine: string,
+	dataLine?: string,
+): string {
+	const heading = kind === "final_result"
+		? `Subagent final_result from ${label}.`
+		: kind === "needs_input"
+			? `Subagent needs_input from ${label}.`
+			: `Subagent error from ${label}.`;
+	return [heading, primaryLine, dataLine]
+		.filter((line): line is string => typeof line === "string" && line.length > 0)
+		.join("\n");
+}
+
 function deliverChildFollowUp(
 	pi: ExtensionApiLike,
 	state: ParentSessionState,
@@ -1184,25 +1389,35 @@ function bridgeAcceptedEvent(
 			deliverChildFollowUp(
 				pi,
 				state,
-				[
-					`Subagent final_result from ${label}.`,
+				formatChildEventText(
+					"final_result",
+					label,
 					`Summary: ${event.payload.summary}`,
 					renderDataBlock(event.payload.data),
-				].join("\n").trim(),
+				),
 			);
 			break;
 		case "needs_input":
 			deliverChildFollowUp(
 				pi,
 				state,
-				`Subagent needs_input from ${label}.\nQuestion: ${event.payload.question}`,
+				formatChildEventText(
+					"needs_input",
+					label,
+					`Question: ${event.payload.question}`,
+				),
 			);
 			break;
 		case "error":
 			deliverChildFollowUp(
 				pi,
 				state,
-				`Subagent error from ${label}.\nFatal: ${event.payload.fatal ? "yes" : "no"}\nMessage: ${event.payload.message}`,
+				formatChildEventText(
+					"error",
+					label,
+					`Message: ${event.payload.message}`,
+					`Fatal: ${event.payload.fatal ? "yes" : "no"}`,
+				),
 			);
 			break;
 		case "user_intervened":
@@ -1445,7 +1660,7 @@ function requireAgentId(agentId: string | undefined, action: "send" | "interrupt
 }
 
 function buildListToolResult(state: ParentSessionState): ToolResultLike<SubagentToolDetails> {
-	return textResult(formatListText(state), { action: "list" });
+	return textResult(formatListText(state, state.now()), { action: "list" });
 }
 
 function buildSendToolResult(
@@ -1462,13 +1677,26 @@ function buildSendToolResult(
 		return textResult(`Failed to send follow-up to ${agentId}: ${sendResult.error}`);
 	}
 
-	return textResult(
-		`Queued follow-up for ${agentId}.\nMessage: ${message.trim()}`,
-		{
+	const snapshot = findSnapshot(state, agentId);
+	if (!snapshot) {
+		return textResult(`Queued follow-up for ${agentId}.\nMessage: ${message.trim()}`, {
 			action: "send",
 			agentId,
-		},
-	);
+		});
+	}
+
+	return textResult(buildAgentActionText(
+		`Queued follow-up for ${agentId}.`,
+		snapshot,
+		state.now(),
+		["Message", message.trim()],
+	), {
+		action: "send",
+		agentId,
+		state: snapshot.state,
+		displayName: snapshot.displayName,
+		openAvailability: snapshot.availability,
+	});
 }
 
 function buildInterruptToolResult(
@@ -1480,28 +1708,26 @@ function buildInterruptToolResult(
 		return textResult(`Failed to interrupt ${agentId}: ${interruptResult.error}`);
 	}
 
-	return textResult(`Sent interrupt to ${agentId}.`, {
-		action: "interrupt",
-		agentId,
-	});
-}
-
-function formatListText(state: ParentSessionState): string {
-	if (state.uiState.agents.length === 0) {
-		return "No subagents are currently managed in this Pi session.";
+	const snapshot = findSnapshot(state, agentId);
+	if (!snapshot) {
+		return textResult(`Sent interrupt to ${agentId}.`, {
+			action: "interrupt",
+			agentId,
+		});
 	}
 
-	const lines = state.uiState.agents.map((snapshot) => {
-		const markers = [
-			snapshot.isStale ? "stale" : undefined,
-			snapshot.isDegraded ? "degraded" : undefined,
-			snapshot.errorMessage ? "error" : undefined,
-		].filter((entry): entry is string => entry !== undefined);
-
-		return `- ${snapshot.agentId} | ${snapshot.displayName} | state=${snapshot.state} | availability=${snapshot.availability} | markers=${markers.join(", ") || "none"}`;
+	return textResult(buildAgentActionText(
+		`Sent interrupt to ${agentId}.`,
+		snapshot,
+		state.now(),
+		["The parent requested the child to stop current work."],
+	), {
+		action: "interrupt",
+		agentId,
+		state: snapshot.state,
+		displayName: snapshot.displayName,
+		openAvailability: snapshot.availability,
 	});
-
-	return ["Managed subagents:", ...lines].join("\n");
 }
 
 function normalizeSubagentsCommandArgs(args: string): string {
@@ -1689,13 +1915,7 @@ function buildOpenToolResult(
 
 	ctx.ui.notify(openResult.value, "info");
 	const effectiveMode = snapshot.isHistorical ? "history" : mode;
-	const openText = [
-		openResult.value,
-		`Subagent ${snapshot.agentId}`,
-		`Mode: ${effectiveMode}`,
-		`State: ${snapshot.state}`,
-		`Availability: ${snapshot.availability}`,
-	].join("\n");
+	const openText = buildOpenPresentationText(snapshot, openResult.value, effectiveMode, effectiveOptions.now());
 	sendSessionMessage(
 		pi,
 		"pi-nexus-subagent-open",
@@ -1705,15 +1925,6 @@ function buildOpenToolResult(
 			mode: effectiveMode,
 			state: snapshot.state,
 			availability: snapshot.availability,
-		},
-	);
-	sendSessionMessage(
-		pi,
-		"pi-nexus-subagent-open-mode",
-		`Mode: ${effectiveMode}`,
-		{
-			agentId,
-			mode: effectiveMode,
 		},
 	);
 	return textResult(openText, {
@@ -1758,6 +1969,8 @@ export function installParentExtension(
 	pi: ExtensionApiLike,
 	options: ParentExtensionOptions = {},
 ): void {
+	registerMessageRenderers(pi);
+
 	const effectiveOptions = {
 		bootstrapExtensionPath: options.bootstrapExtensionPath ?? resolveDefaultBootstrapExtensionPath(),
 		homeDir: options.homeDir ?? os.homedir(),
@@ -1980,7 +2193,7 @@ export function installParentExtension(
 			}
 
 			if (command === "list") {
-				sendSessionMessage(pi, "pi-nexus-subagents-output", formatListText(state), {
+				sendSessionMessage(pi, "pi-nexus-subagents-output", formatListText(state, effectiveOptions.now()), {
 					command: "list",
 				});
 				return;
@@ -2026,6 +2239,22 @@ export function installParentExtension(
 				}
 
 				ctx.ui.notify(openResult.value, "info");
+				sendSessionMessage(
+					pi,
+					"pi-nexus-subagent-open",
+					buildOpenPresentationText(
+						snapshot,
+						openResult.value,
+						snapshot.isHistorical ? "history" : modeResult.value,
+						effectiveOptions.now(),
+					),
+					{
+						agentId,
+						mode: snapshot.isHistorical ? "history" : modeResult.value,
+						state: snapshot.state,
+						availability: snapshot.availability,
+					},
+				);
 				return;
 			}
 
@@ -2058,10 +2287,18 @@ export function installParentExtension(
 					return;
 				}
 
+				const snapshot = findSnapshot(state, agentId);
 				sendSessionMessage(
 					pi,
 					"pi-nexus-subagents-output",
-					`Queued follow-up for ${agentId}.\nMessage: ${message}`,
+					snapshot
+						? buildAgentActionText(
+							`Queued follow-up for ${agentId}.`,
+							snapshot,
+							effectiveOptions.now(),
+							["Message", message],
+						)
+						: `Queued follow-up for ${agentId}.\nMessage: ${message}`,
 					{ command: "send", agentId },
 				);
 				return;
