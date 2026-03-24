@@ -115,6 +115,15 @@ SubagentRecord
 - finalResultHistory?
 - userIntervenedHistory?
 - error?
+
+Derived persisted UI snapshot fields may also carry accepted chronology needed for presentation:
+
+- `startedAt?`
+  - copied from the validated runtime record
+  - used for live elapsed-time display
+- `endedAt?`
+  - only for historical UI snapshots
+  - derived from accepted terminal chronology rather than wall-clock guesswork
 ```
 
 Conversational posture values:

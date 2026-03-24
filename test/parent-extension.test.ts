@@ -389,7 +389,11 @@ Research the codebase carefully and report findings.`,
 		expect(output).toContain("Spawned subagent agt_001_");
 		expect(output).toContain("Type: Researcher (Researcher)");
 		expect(output).toContain("Use /subagents or Alt+A to open the subagent browser");
-		expect(ctx.widgetUpdates.at(-1)?.options).toMatchObject({ placement: "sidebar" });
+		expect(ctx.widgetUpdates.at(-1)?.options).toMatchObject({ placement: "aboveEditor" });
+		expect(ctx.widgetUpdates.at(-1)?.content).toEqual(expect.arrayContaining([
+			"Subagents  live=1 history=0",
+			expect.stringMatching(/^  agt_001_.*state=connecting elapsed=0s$/),
+		]));
 
 		const agentId = Array.from(processes.handles.keys())[0];
 		expect(agentId).toMatch(/^agt_001_/);
@@ -551,6 +555,17 @@ Research the codebase carefully and report findings.`,
 		expect(openResult.content[0]?.text ?? "").toContain(`Entered Take Over for ${agentId}.`);
 		expect(ctx.customCalls).toHaveLength(1);
 
+		const followOpenResult = await tool.execute(
+			"tool-call-subagent-open-follow",
+			{ action: "open", agent_id: agentId, mode: "follow" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		expect(followOpenResult.content[0]?.text ?? "").toContain(`Opened ${agentId} in Follow.`);
+		expect(followOpenResult.content[0]?.text ?? "").toContain(`Subagent ${agentId}`);
+		expect(followOpenResult.content[0]?.text ?? "").toContain("Mode: follow");
+
 		const sendResult = await tool.execute(
 			"tool-call-subagent-send",
 			{ action: "send", agent_id: agentId, message: "send joke 2" },
@@ -674,6 +689,117 @@ Research the codebase carefully and report findings.`,
 			options: { deliverAs: "followUp" },
 		});
 		expect(String(pi.sentUserMessages.at(-1)?.content)).toContain("Completed the task");
+	});
+
+	it("refreshes live widget elapsed time between child events", async () => {
+		vi.useFakeTimers();
+		try {
+			let currentTimeMs = Date.parse("2026-03-13T12:15:00.000Z");
+			const sidecars = new FakeSidecarSessions();
+			const processes = new FakeProcesses();
+			const tmux = new FakeTmuxRuntime();
+			const pi = new FakePiApi();
+			installParentExtension(pi, {
+				bootstrapExtensionPath: fakeBootstrapExtensionPath,
+				homeDir: fakeHomeDir,
+				now: () => new Date(currentTimeMs).toISOString(),
+				runTmuxCommand: (args) => tmux.run(args),
+				sidecarSessions: sidecars,
+				runtimeProcesses: processes,
+			});
+
+			const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "elapsed.jsonl"));
+			await pi.emit("session_start", {}, ctx);
+
+			const tool = getRegisteredTool(pi, "Subagent");
+			await tool.execute(
+				"tool-call-elapsed",
+				{
+					action: "spawn",
+					prompt: "Keep working.",
+					description: "Elapsed widget",
+					subagent_type: "general-purpose",
+				},
+				undefined,
+				undefined,
+				ctx,
+			);
+
+			expect(ctx.widgetUpdates.at(-1)?.content).toEqual(expect.arrayContaining([
+				expect.stringMatching(/^  agt_001_.*elapsed=0s$/),
+			]));
+
+			currentTimeMs += 6_000;
+			await vi.advanceTimersByTimeAsync(6_000);
+
+			expect(ctx.widgetUpdates.at(-1)?.content).toEqual(expect.arrayContaining([
+				expect.stringMatching(/^  agt_001_.*elapsed=5s$/),
+			]));
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("prioritizes widget error summaries over older progress text", async () => {
+		const sidecars = new FakeSidecarSessions();
+		const processes = new FakeProcesses();
+		const tmux = new FakeTmuxRuntime();
+		const pi = new FakePiApi();
+		installParentExtension(pi, {
+			bootstrapExtensionPath: fakeBootstrapExtensionPath,
+			homeDir: fakeHomeDir,
+			now: () => "2026-03-13T12:18:00.000Z",
+			runTmuxCommand: (args) => tmux.run(args),
+			sidecarSessions: sidecars,
+			runtimeProcesses: processes,
+		});
+
+		const ctx = new FakeExtensionContext(fakeRepoDir, path.join(fakeRepoDir, ".sessions", "widget-error.jsonl"));
+		await pi.emit("session_start", {}, ctx);
+
+		const tool = getRegisteredTool(pi, "Subagent");
+		await tool.execute(
+			"tool-call-widget-error",
+			{
+				action: "spawn",
+				prompt: "Do the work.",
+				description: "Widget error",
+				subagent_type: "general-purpose",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+
+		const agentId = Array.from(processes.handles.keys())[0];
+		const sidecar = sidecars.get(agentId);
+		expect(sidecar.connect()).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecar.message(
+			makeEnvelope(agentId, "ready", 0, "2026-03-13T12:18:01.000Z", {
+				pid: 505,
+				sessionPath: processes.get(agentId).launchSpec.sessionPath,
+				tmuxTarget: processes.get(agentId).launchSpec.tmuxTarget,
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecar.message(
+			makeEnvelope(agentId, "progress", 1, "2026-03-13T12:18:02.000Z", {
+				summary: "Almost there",
+				data: null,
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+		expect(sidecar.message(
+			makeEnvelope(agentId, "error", 2, "2026-03-13T12:18:03.000Z", {
+				fatal: true,
+				message: "Lost the child process",
+			}),
+		)).toEqual({ ok: true, value: expect.anything() });
+
+		expect(ctx.widgetUpdates.at(-1)?.content).toEqual(expect.arrayContaining([
+			"    error: Lost the child process",
+		]));
+		expect(ctx.widgetUpdates.at(-1)?.content).not.toEqual(expect.arrayContaining([
+			"    latest: Almost there",
+		]));
 	});
 
 	it("fails cleanly when tmux cannot execute and spawnSync omits stdout and stderr", async () => {

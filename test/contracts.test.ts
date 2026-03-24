@@ -409,6 +409,7 @@ describe("validateSubagentUiSnapshot", () => {
 				tmuxMode: "pane",
 				tmuxTarget: "main:2.1",
 				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				startedAt: "2026-03-10T10:00:00.000Z",
 				latestSummary: "Working through the codebase",
 				isStale: false,
 				isDegraded: false,
@@ -431,7 +432,9 @@ describe("validateSubagentUiSnapshot", () => {
 				tmuxMode: "pane",
 				tmuxTarget: "main:2.1",
 				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				startedAt: "2026-03-10T10:00:00.000Z",
 				latestSummary: "Working through the codebase",
+				endedAt: undefined,
 				pendingInputQuestion: undefined,
 				finalSummary: undefined,
 				errorMessage: undefined,
@@ -448,6 +451,34 @@ describe("validateSubagentUiSnapshot", () => {
 		});
 	});
 
+	it("rejects endedAt without startedAt", () => {
+		expect(
+			validateSubagentUiSnapshot({
+				agentId: "agt_ui",
+				displayName: "Researcher",
+				type: "Researcher",
+				description: "Investigate the repo",
+				state: "stopped",
+				availability: "history",
+				tmuxMode: "pane",
+				tmuxTarget: "main:2.1",
+				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				endedAt: "2026-03-10T10:05:00.000Z",
+				isStale: false,
+				isDegraded: false,
+				isHistorical: true,
+				canOpenPeek: true,
+				canOpenFollow: false,
+				canOpenTakeOver: false,
+				canSend: false,
+				canInterrupt: false,
+			}),
+		).toEqual({
+			ok: false,
+			error: "uiSnapshot.endedAt requires startedAt",
+		});
+	});
+
 	it("rejects inconsistent historical snapshots", () => {
 		expect(
 			validateSubagentUiSnapshot({
@@ -460,6 +491,8 @@ describe("validateSubagentUiSnapshot", () => {
 				tmuxMode: "pane",
 				tmuxTarget: "main:2.1",
 				sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+				startedAt: "2026-03-10T10:00:00.000Z",
+				endedAt: "2026-03-10T10:05:00.000Z",
 				isStale: false,
 				isDegraded: false,
 				isHistorical: true,
@@ -493,6 +526,7 @@ describe("validateSubagentUiStateSnapshot", () => {
 						tmuxMode: "pane",
 						tmuxTarget: "main:2.1",
 						sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+						startedAt: "2026-03-10T10:00:00.000Z",
 						isStale: false,
 						isDegraded: false,
 						isHistorical: false,
@@ -520,6 +554,8 @@ describe("validateSubagentUiStateSnapshot", () => {
 						tmuxMode: "pane",
 						tmuxTarget: "main:2.1",
 						sessionPath: path.join(fakeRuntimeDir, "ui.session.jsonl"),
+						startedAt: "2026-03-10T10:00:00.000Z",
+						endedAt: undefined,
 						latestSummary: undefined,
 						pendingInputQuestion: undefined,
 						finalSummary: undefined,

@@ -217,6 +217,16 @@ The parent-side record is the source of truth for:
 - degraded trust marker
 - `assumptionsStaleAt`
 
+The persisted parent UI snapshot is a derived contract, not a second source of truth.
+When it stores chronology for presentation, it only stores accepted record-backed timestamps:
+
+- `startedAt`
+  - copied from the accepted runtime record
+  - used for dashboard elapsed-time presentation
+- `endedAt`
+  - optional historical timestamp derived from accepted terminal chronology such as `stoppedAt` or `error.recordedAt`
+  - only valid for historical UI snapshots
+
 The parent-side focus surface is also the supported source of truth for:
 
 - structured tmux focus metadata

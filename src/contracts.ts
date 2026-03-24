@@ -97,6 +97,8 @@ export interface SubagentUiSnapshot {
 	tmuxMode: TmuxMode;
 	tmuxTarget: string;
 	sessionPath: string;
+	startedAt?: string;
+	endedAt?: string;
 	latestSummary?: string;
 	pendingInputQuestion?: string;
 	finalSummary?: string;
@@ -1643,6 +1645,17 @@ export function validateSubagentUiSnapshot(input: unknown): ValidationOutcome<Su
 	if (sessionPathError) return sessionPathError;
 
 	for (const [field, value] of [
+		["startedAt", input.startedAt],
+		["endedAt", input.endedAt],
+	] as const) {
+		if (hasOwnField(input, field) && value !== undefined) {
+			if (typeof value !== "string" || !isIsoTimestamp(value)) {
+				return fail(`uiSnapshot.${field} must be an ISO timestamp`);
+			}
+		}
+	}
+
+	for (const [field, value] of [
 		["latestSummary", input.latestSummary],
 		["pendingInputQuestion", input.pendingInputQuestion],
 		["finalSummary", input.finalSummary],
@@ -1687,6 +1700,19 @@ export function validateSubagentUiSnapshot(input: unknown): ValidationOutcome<Su
 	if (input.isStale && input.isHistorical) {
 		return fail("historical ui snapshots cannot be stale");
 	}
+	if (hasOwnField(input, "endedAt") && input.endedAt !== undefined && input.startedAt === undefined) {
+		return fail("uiSnapshot.endedAt requires startedAt");
+	}
+	if (
+		typeof input.startedAt === "string"
+		&& typeof input.endedAt === "string"
+		&& !isTimestampOnOrBefore(input.startedAt, input.endedAt)
+	) {
+		return fail("uiSnapshot.endedAt must be on or after startedAt");
+	}
+	if (!input.isHistorical && input.endedAt !== undefined) {
+		return fail("only historical ui snapshots may set endedAt");
+	}
 
 	return ok({
 		agentId: (input.agentId as string).trim(),
@@ -1698,6 +1724,12 @@ export function validateSubagentUiSnapshot(input: unknown): ValidationOutcome<Su
 		tmuxMode: input.tmuxMode,
 		tmuxTarget: (input.tmuxTarget as string).trim(),
 		sessionPath: input.sessionPath as string,
+		startedAt: hasOwnField(input, "startedAt") && input.startedAt !== undefined
+			? input.startedAt as string
+			: undefined,
+		endedAt: hasOwnField(input, "endedAt") && input.endedAt !== undefined
+			? input.endedAt as string
+			: undefined,
 		latestSummary: hasOwnField(input, "latestSummary") && input.latestSummary !== undefined
 			? (input.latestSummary as string).trim()
 			: undefined,

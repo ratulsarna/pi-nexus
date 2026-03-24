@@ -46,7 +46,7 @@ interface ReadonlySessionManagerLike {
 interface ExtensionUiLike {
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 	onTerminalInput?(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
-	setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" | "sidebar" }): void;
+	setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
 	custom?<T>(
 		factory: (
 			tui: { requestRender(full?: boolean): void; stop?(): void; start?(): void },
@@ -159,6 +159,7 @@ interface ParentSessionState<TData = unknown> {
 	cwd: string;
 	homeDir: string;
 	sessionDir: string;
+	now: () => string;
 	manager: SubagentManager<TData>;
 	registry?: AgentDefinitionRegistry;
 	busy: boolean;
@@ -167,6 +168,7 @@ interface ParentSessionState<TData = unknown> {
 	uiState: SubagentUiStateSnapshot;
 	lastUiContext?: ExtensionContextLike;
 	terminalInputUnsubscribe?: () => void;
+	widgetRefreshInterval?: ReturnType<typeof setInterval>;
 }
 
 export interface ParentExtensionOptions<TData = unknown> {
@@ -398,6 +400,11 @@ function buildSubagentUiSnapshot(
 	definition: ResolvedAgentDefinition | undefined,
 ): ValidationOutcome<SubagentUiSnapshot> {
 	const availability = deriveUiAvailability(record);
+	const endedAt = record.state === "failed"
+		? record.error?.recordedAt ?? record.stoppedAt
+		: record.state === "stopped"
+			? record.stoppedAt ?? record.error?.recordedAt
+			: undefined;
 	return validateSubagentUiSnapshot({
 		agentId: record.id,
 		displayName: formatDisplayName(definition, record),
@@ -408,6 +415,8 @@ function buildSubagentUiSnapshot(
 		tmuxMode: record.tmuxMode,
 		tmuxTarget: record.tmuxTarget,
 		sessionPath: record.sessionPath,
+		startedAt: record.startedAt,
+		endedAt,
 		latestSummary: normalizeSummary(record.lastProgressReport?.summary),
 		pendingInputQuestion: normalizeSummary(record.pendingInputRequest?.summary),
 		finalSummary: normalizeSummary(record.finalResult?.summary),
@@ -465,7 +474,10 @@ function sortUiSnapshots(snapshots: ReadonlyArray<SubagentUiSnapshot>): Subagent
 function formatWidgetLines(uiState: SubagentUiStateSnapshot): string[] {
 	const live = uiState.agents.filter((snapshot) => !snapshot.isHistorical);
 	const history = uiState.agents.filter((snapshot) => snapshot.isHistorical);
-	const lines = ["Subagents", "  /subagents or Alt+A"];
+	const lines = [
+		`Subagents  live=${live.length} history=${history.length}`,
+		"  Open /subagents or Alt+A",
+	];
 
 	if (live.length === 0 && history.length === 0) {
 		lines.push("  none");
@@ -475,20 +487,22 @@ function formatWidgetLines(uiState: SubagentUiStateSnapshot): string[] {
 	if (live.length > 0) {
 		lines.push("  Live");
 		for (const snapshot of live) {
-			const badges = [
-				snapshot.isStale ? "stale" : undefined,
-				snapshot.isDegraded ? "degraded" : undefined,
-			].filter((value): value is string => value !== undefined);
-			lines.push(
-				`  ${snapshot.agentId} ${snapshot.displayName} state=${snapshot.state}${badges.length > 0 ? ` [${badges.join(", ")}]` : ""}`,
-			);
+			lines.push(`  ${formatWidgetRow(snapshot, uiState.updatedAt)}`);
+			const summary = summarizeWidgetSnapshot(snapshot);
+			if (summary) {
+				lines.push(`    ${summary}`);
+			}
 		}
 	}
 
 	if (history.length > 0) {
 		lines.push("  History");
 		for (const snapshot of history) {
-			lines.push(`  ${snapshot.agentId} ${snapshot.displayName} state=${snapshot.state}`);
+			lines.push(`  ${formatWidgetRow(snapshot, uiState.updatedAt)}`);
+			const summary = summarizeWidgetSnapshot(snapshot);
+			if (summary) {
+				lines.push(`    ${summary}`);
+			}
 		}
 	}
 	return lines;
@@ -497,12 +511,77 @@ function formatWidgetLines(uiState: SubagentUiStateSnapshot): string[] {
 function renderWidget(
 	ctx: ExtensionContextLike | undefined,
 	uiState: SubagentUiStateSnapshot,
+	referenceTime = uiState.updatedAt,
 ): void {
 	if (!ctx?.hasUI || !ctx.ui.setWidget) {
 		return;
 	}
 
-	ctx.ui.setWidget(UI_WIDGET_KEY, formatWidgetLines(uiState), { placement: "sidebar" });
+	ctx.ui.setWidget(UI_WIDGET_KEY, formatWidgetLines({
+		...uiState,
+		updatedAt: referenceTime,
+	}), { placement: "aboveEditor" });
+}
+
+function formatElapsedTime(startedAt: string | undefined, endedAt: string | undefined, referenceTime: string): string | undefined {
+	if (!startedAt) {
+		return undefined;
+	}
+
+	const startMs = Date.parse(startedAt);
+	const endMs = Date.parse(endedAt ?? referenceTime);
+	if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+		return undefined;
+	}
+
+	const elapsedMs = Math.max(0, endMs - startMs);
+	const totalSeconds = Math.floor(elapsedMs / 1000);
+	const coarseSeconds = totalSeconds < 60 ? Math.floor(totalSeconds / 5) * 5 : totalSeconds;
+	if (coarseSeconds < 60) {
+		return `${coarseSeconds}s`;
+	}
+
+	const totalMinutes = Math.floor(coarseSeconds / 60);
+	const seconds = coarseSeconds % 60;
+	if (totalMinutes < 60) {
+		return seconds === 0 ? `${totalMinutes}m` : `${totalMinutes}m ${seconds}s`;
+	}
+
+	const totalHours = Math.floor(totalMinutes / 60);
+	const minutes = totalMinutes % 60;
+	return minutes === 0 ? `${totalHours}h` : `${totalHours}h ${minutes}m`;
+}
+
+function summarizeWidgetSnapshot(snapshot: SubagentUiSnapshot): string | undefined {
+	if (snapshot.errorMessage) {
+		return `error: ${snapshot.errorMessage}`;
+	}
+	if (snapshot.pendingInputQuestion) {
+		return `needs input: ${snapshot.pendingInputQuestion}`;
+	}
+	if (snapshot.latestSummary) {
+		return `latest: ${snapshot.latestSummary}`;
+	}
+	if (snapshot.finalSummary) {
+		return `final: ${snapshot.finalSummary}`;
+	}
+	return undefined;
+}
+
+function formatWidgetRow(snapshot: SubagentUiSnapshot, referenceTime: string): string {
+	const badges = [
+		snapshot.isStale ? "stale" : undefined,
+		snapshot.isDegraded ? "degraded" : undefined,
+	].filter((value): value is string => value !== undefined);
+	const elapsed = formatElapsedTime(snapshot.startedAt, snapshot.endedAt, referenceTime);
+	const segments = [
+		snapshot.agentId,
+		snapshot.displayName,
+		`state=${snapshot.state}`,
+		elapsed ? `elapsed=${elapsed}` : undefined,
+	];
+
+	return `${segments.filter((value): value is string => value !== undefined).join(" ")}${badges.length > 0 ? ` [${badges.join(", ")}]` : ""}`;
 }
 
 function ensureBrowserShortcut(
@@ -538,6 +617,7 @@ function syncUiState(
 	pi: ExtensionApiLike,
 	state: ParentSessionState,
 	updatedAt: string,
+	now: () => string,
 ): void {
 	const currentSnapshots = new Map<string, SubagentUiSnapshot>();
 	for (const record of state.manager.listRecords()) {
@@ -565,7 +645,33 @@ function syncUiState(
 
 	state.uiState = nextStateResult.value;
 	pi.appendEntry(UI_STATE_CUSTOM_TYPE, state.uiState);
-	renderWidget(state.lastUiContext, state.uiState);
+	renderWidget(state.lastUiContext, state.uiState, now());
+	syncWidgetRefresh(state, now);
+}
+
+function syncWidgetRefresh(
+	state: ParentSessionState,
+	now: () => string,
+): void {
+	const shouldRefresh = state.lastUiContext?.hasUI
+		&& state.lastUiContext.ui.setWidget
+		&& state.uiState.agents.some((snapshot) => !snapshot.isHistorical && snapshot.startedAt !== undefined);
+	if (!shouldRefresh) {
+		if (state.widgetRefreshInterval) {
+			clearInterval(state.widgetRefreshInterval);
+			state.widgetRefreshInterval = undefined;
+		}
+		return;
+	}
+
+	if (state.widgetRefreshInterval) {
+		return;
+	}
+
+	state.widgetRefreshInterval = setInterval(() => {
+		renderWidget(state.lastUiContext, state.uiState, now());
+	}, 5_000);
+	state.widgetRefreshInterval.unref?.();
 }
 
 function fitLine(value: string, width: number): string {
@@ -1056,7 +1162,7 @@ function bridgeAcceptedEvent(
 			break;
 	}
 
-	syncUiState(pi, state, event.time);
+	syncUiState(pi, state, event.time, state.now);
 }
 
 function createParentSessionState(
@@ -1082,6 +1188,7 @@ function createParentSessionState(
 		cwd,
 		homeDir: options.homeDir,
 		sessionDir,
+		now: options.now,
 		manager: undefined as unknown as SubagentManager,
 		busy: false,
 		nextAgentOrdinal: 0,
@@ -1116,7 +1223,8 @@ function ensureCurrentState(
 		currentState.busy = !ctx.isIdle();
 		currentState.lastUiContext = ctx;
 		ensureBrowserShortcut(ctx, currentState, options.runTmuxCommand);
-		renderWidget(currentState.lastUiContext, currentState.uiState);
+		renderWidget(currentState.lastUiContext, currentState.uiState, options.now());
+		syncWidgetRefresh(currentState, options.now);
 		return ok(currentState);
 	}
 
@@ -1251,7 +1359,7 @@ function spawnNamedSubagent(
 	});
 
 	const focusResult = state.manager.getFocusTarget(agentId);
-	syncUiState(pi, state, effectiveOptions.now());
+	syncUiState(pi, state, effectiveOptions.now(), effectiveOptions.now);
 	return textResult(
 		buildSpawnText(
 			spawnResult.value,
@@ -1493,6 +1601,7 @@ function openSubagentBrowser(
 }
 
 function buildOpenToolResult(
+	pi: ExtensionApiLike,
 	state: ParentSessionState,
 	agentId: string,
 	mode: SubagentOpenMode,
@@ -1517,7 +1626,35 @@ function buildOpenToolResult(
 	}
 
 	ctx.ui.notify(openResult.value, "info");
-	return textResult(openResult.value, {
+	const effectiveMode = snapshot.isHistorical ? "history" : mode;
+	const openText = [
+		openResult.value,
+		`Subagent ${snapshot.agentId}`,
+		`Mode: ${effectiveMode}`,
+		`State: ${snapshot.state}`,
+		`Availability: ${snapshot.availability}`,
+	].join("\n");
+	sendSessionMessage(
+		pi,
+		"pi-nexus-subagent-open",
+		openText,
+		{
+			agentId,
+			mode: effectiveMode,
+			state: snapshot.state,
+			availability: snapshot.availability,
+		},
+	);
+	sendSessionMessage(
+		pi,
+		"pi-nexus-subagent-open-mode",
+		`Mode: ${effectiveMode}`,
+		{
+			agentId,
+			mode: effectiveMode,
+		},
+	);
+	return textResult(openText, {
 		action: "open",
 		agentId,
 		mode,
@@ -1544,7 +1681,11 @@ function shutdownParentSession(
 	state.ownedTmuxRuntimes.clear();
 	state.terminalInputUnsubscribe?.();
 	state.terminalInputUnsubscribe = undefined;
-	syncUiState(pi, state, now());
+	if (state.widgetRefreshInterval) {
+		clearInterval(state.widgetRefreshInterval);
+		state.widgetRefreshInterval = undefined;
+	}
+	syncUiState(pi, state, now(), now);
 }
 
 function notifyRuntimePreparationFailure(ctx: ExtensionContextLike, error: string): void {
@@ -1579,7 +1720,8 @@ export function installParentExtension(
 		activeState = stateResult.value;
 		activeState.lastUiContext = ctx;
 		ensureBrowserShortcut(ctx, activeState, effectiveOptions.runTmuxCommand);
-		renderWidget(ctx, activeState.uiState);
+		renderWidget(ctx, activeState.uiState, effectiveOptions.now());
+		syncWidgetRefresh(activeState, effectiveOptions.now);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -1660,7 +1802,7 @@ export function installParentExtension(
 					if (!modeResult.ok) {
 						return textResult(modeResult.error);
 					}
-					return buildOpenToolResult(state, agentIdResult.value, modeResult.value, ctx, effectiveOptions);
+					return buildOpenToolResult(pi, state, agentIdResult.value, modeResult.value, ctx, effectiveOptions);
 				}
 				case "focus": {
 					return textResult(LEGACY_FOCUS_MESSAGE, {
