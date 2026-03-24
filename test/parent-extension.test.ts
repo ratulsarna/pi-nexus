@@ -388,7 +388,8 @@ Research the codebase carefully and report findings.`,
 		const output = result.content[0]?.text ?? "";
 		expect(output).toContain("Spawned subagent agt_001_");
 		expect(output).toContain("Type: Researcher (Researcher)");
-		expect(output).toContain("Use /subagents list or /subagents open");
+		expect(output).toContain("Use /subagents or Alt+A to open the subagent browser");
+		expect(ctx.widgetUpdates.at(-1)?.options).toMatchObject({ placement: "sidebar" });
 
 		const agentId = Array.from(processes.handles.keys())[0];
 		expect(agentId).toMatch(/^agt_001_/);
@@ -405,8 +406,8 @@ Research the codebase carefully and report findings.`,
 
 		await command.handler(`open ${agentId} follow`, ctx);
 		expect(ctx.customCalls).toHaveLength(1);
-		expect(ctx.customCalls[0]?.options).toMatchObject({ overlay: true });
-		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in follow mode.`);
+		expect(ctx.customCalls[0]?.options).toMatchObject({ screen: true });
+		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in Follow.`);
 		expect(pi.appendedEntries.at(-1)?.customType).toBe("pi-nexus-ui-state");
 
 		expect(sidecars.get(agentId).connect()).toEqual({ ok: true, value: expect.anything() });
@@ -482,7 +483,7 @@ Research the codebase carefully and report findings.`,
 
 		await command.handler(`subagents open ${agentId} follow`, ctx);
 		expect(ctx.customCalls).toHaveLength(1);
-		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in follow mode.`);
+		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in Follow.`);
 	});
 
 	it("manages live children through the generic Subagent tool", async () => {
@@ -518,7 +519,7 @@ Research the codebase carefully and report findings.`,
 
 		const spawnText = spawnResult.content[0]?.text ?? "";
 		expect(spawnText).toContain("Spawned subagent agt_001_");
-		expect(spawnText).toContain("Use the Subagent tool with action=list, open, send, or interrupt");
+		expect(spawnText).toContain("Use the Subagent tool with action=open, send, or interrupt");
 
 		const agentId = Array.from(processes.handles.keys())[0];
 		const launchSpec = processes.get(agentId).launchSpec;
@@ -547,7 +548,7 @@ Research the codebase carefully and report findings.`,
 			undefined,
 			ctx,
 		);
-		expect(openResult.content[0]?.text ?? "").toContain(`Opened ${agentId} in take_over mode.`);
+		expect(openResult.content[0]?.text ?? "").toContain(`Entered Take Over for ${agentId}.`);
 		expect(ctx.customCalls).toHaveLength(1);
 
 		const sendResult = await tool.execute(

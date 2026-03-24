@@ -1,0 +1,40 @@
+{
+  "scripts": [
+    {
+      "name": "accept:rat-131",
+      "command": "npm run accept:rat-131",
+      "mode": "command",
+      "category": "other"
+    },
+    {
+      "name": "accept:rat-133",
+      "command": "npm run accept:rat-133",
+      "mode": "command",
+      "category": "other"
+    },
+    {
+      "name": "accept:rat-134",
+      "command": "npm run accept:rat-134",
+      "mode": "command",
+      "category": "other"
+    },
+    {
+      "name": "accept:rat-135",
+      "command": "npm run accept:rat-135",
+      "mode": "command",
+      "category": "other"
+    },
+    {
+      "name": "build",
+      "command": "npm run build",
+      "mode": "command",
+      "category": "build"
+    },
+    {
+      "name": "test",
+      "command": "npm run test",
+      "mode": "command",
+      "category": "test"
+    }
+  ]
+}

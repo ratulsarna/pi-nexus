@@ -45,10 +45,11 @@ interface ReadonlySessionManagerLike {
 
 interface ExtensionUiLike {
 	notify(message: string, type?: "info" | "warning" | "error"): void;
-	setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+	onTerminalInput?(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
+	setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" | "sidebar" }): void;
 	custom?<T>(
 		factory: (
-			tui: { requestRender(): void },
+			tui: { requestRender(full?: boolean): void; stop?(): void; start?(): void },
 			theme: unknown,
 			keybindings: unknown,
 			done: (result: T) => void,
@@ -61,6 +62,7 @@ interface ExtensionUiLike {
 		},
 		options?: {
 			overlay?: boolean;
+			screen?: boolean;
 			overlayOptions?: {
 				width?: number | `${number}%`;
 				maxHeight?: number | `${number}%`;
@@ -164,6 +166,7 @@ interface ParentSessionState<TData = unknown> {
 	ownedTmuxRuntimes: Map<string, OwnedTmuxRuntime>;
 	uiState: SubagentUiStateSnapshot;
 	lastUiContext?: ExtensionContextLike;
+	terminalInputUnsubscribe?: () => void;
 }
 
 export interface ParentExtensionOptions<TData = unknown> {
@@ -462,11 +465,10 @@ function sortUiSnapshots(snapshots: ReadonlyArray<SubagentUiSnapshot>): Subagent
 function formatWidgetLines(uiState: SubagentUiStateSnapshot): string[] {
 	const live = uiState.agents.filter((snapshot) => !snapshot.isHistorical);
 	const history = uiState.agents.filter((snapshot) => snapshot.isHistorical);
-	const lines = ["Subagents"];
+	const lines = ["Subagents", "  /subagents or Alt+A"];
 
 	if (live.length === 0 && history.length === 0) {
 		lines.push("  none");
-		lines.push("  use /subagents open <agentId> [peek|follow|take_over]");
 		return lines;
 	}
 
@@ -489,8 +491,6 @@ function formatWidgetLines(uiState: SubagentUiStateSnapshot): string[] {
 			lines.push(`  ${snapshot.agentId} ${snapshot.displayName} state=${snapshot.state}`);
 		}
 	}
-
-	lines.push("  /subagents open <agentId> [peek|follow|take_over]");
 	return lines;
 }
 
@@ -502,7 +502,29 @@ function renderWidget(
 		return;
 	}
 
-	ctx.ui.setWidget(UI_WIDGET_KEY, formatWidgetLines(uiState), { placement: "aboveEditor" });
+	ctx.ui.setWidget(UI_WIDGET_KEY, formatWidgetLines(uiState), { placement: "sidebar" });
+}
+
+function ensureBrowserShortcut(
+	ctx: ExtensionContextLike,
+	state: ParentSessionState,
+	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+): void {
+	if (!ctx.hasUI || !ctx.ui.onTerminalInput || state.terminalInputUnsubscribe) {
+		return;
+	}
+
+	state.terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => {
+		if (data !== "\u001ba") {
+			return undefined;
+		}
+
+		const result = openSubagentBrowser(ctx, state, runTmuxCommand);
+		if (!result.ok) {
+			ctx.ui.notify(result.error, "error");
+		}
+		return { consume: true, data: "" };
+	});
 }
 
 function findSnapshot(
@@ -600,26 +622,104 @@ function sendTmuxInput(
 	return ok(undefined);
 }
 
-class SubagentOverlayComponent {
-	public focused = false;
+function formatSnapshotBadges(snapshot: SubagentUiSnapshot): string {
+	return [
+		snapshot.isStale ? "stale" : undefined,
+		snapshot.isDegraded ? "degraded" : undefined,
+		snapshot.errorMessage ? "error" : undefined,
+	].filter((value): value is string => value !== undefined).join(", ") || "none";
+}
+
+function padLine(value: string, width: number): string {
+	const clipped = fitLine(value, width);
+	return clipped + " ".repeat(Math.max(0, width - clipped.length));
+}
+
+function composeColumns(leftLines: string[], rightLines: string[], width: number, rightWidth = 30, gap = 3): string[] {
+	if (width < rightWidth + gap + 40) {
+		return [...leftLines, "", ...rightLines];
+	}
+
+	const resolvedRightWidth = Math.min(rightWidth, Math.max(20, width - 45));
+	const resolvedLeftWidth = Math.max(20, width - resolvedRightWidth - gap);
+	const rowCount = Math.max(leftLines.length, rightLines.length);
+	const lines: string[] = [];
+
+	for (let index = 0; index < rowCount; index += 1) {
+		lines.push(
+			`${padLine(leftLines[index] ?? "", resolvedLeftWidth)}${" ".repeat(gap)}${padLine(rightLines[index] ?? "", resolvedRightWidth)}`,
+		);
+	}
+
+	return lines;
+}
+
+function buildSnapshotSummaryLines(snapshot: SubagentUiSnapshot, width: number): string[] {
+	const lines = [
+		fitLine(`${snapshot.displayName} · ${snapshot.agentId}`, width),
+		fitLine(`state=${snapshot.state} · availability=${snapshot.availability} · badges=${formatSnapshotBadges(snapshot)}`, width),
+	];
+
+	if (snapshot.latestSummary) {
+		lines.push("");
+		lines.push("Latest");
+		lines.push(fitLine(snapshot.latestSummary, width));
+	}
+	if (snapshot.pendingInputQuestion) {
+		lines.push("");
+		lines.push("Needs input");
+		lines.push(fitLine(snapshot.pendingInputQuestion, width));
+	}
+	if (snapshot.finalSummary) {
+		lines.push("");
+		lines.push("Final");
+		lines.push(fitLine(snapshot.finalSummary, width));
+	}
+	if (snapshot.errorMessage) {
+		lines.push("");
+		lines.push("Error");
+		lines.push(fitLine(snapshot.errorMessage, width));
+	}
+	if (snapshot.note) {
+		lines.push("");
+		lines.push("Note");
+		lines.push(fitLine(snapshot.note, width));
+	}
+
+	return lines;
+}
+
+function extractTmuxSessionName(tmuxTarget: string): string {
+	const separatorIndex = tmuxTarget.indexOf(":");
+	return separatorIndex === -1 ? tmuxTarget : tmuxTarget.slice(0, separatorIndex);
+}
+
+interface WorkspaceActions {
+	open(agentId: string, mode: SubagentOpenMode): void;
+}
+
+class SubagentWorkspaceComponent {
+	public focused = true;
 	private paneLines: string[] = [];
 	private statusMessage: string | undefined;
-	private input = "";
+	private scrollOffset = 0;
 	private readonly refreshInterval: ReturnType<typeof setInterval> | undefined;
 
 	public constructor(
-		private readonly snapshot: SubagentUiSnapshot,
-		private readonly mode: SubagentOpenMode,
+		private readonly loadSnapshot: () => SubagentUiSnapshot | undefined,
+		private readonly initialSnapshot: SubagentUiSnapshot,
+		private readonly mode: Exclude<SubagentOpenMode, "take_over">,
 		private readonly runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
 		private readonly requestRender: () => void,
 		private readonly close: () => void,
+		private readonly actions: WorkspaceActions,
 	) {
 		this.refreshViewport();
-		if (!snapshot.isHistorical) {
+		if (!initialSnapshot.isHistorical && mode === "follow") {
 			this.refreshInterval = setInterval(() => {
 				this.refreshViewport();
 				this.requestRender();
-			}, mode === "peek" ? 1_500 : 500);
+			}, 500);
 			this.refreshInterval.unref?.();
 		}
 	}
@@ -627,112 +727,108 @@ class SubagentOverlayComponent {
 	public invalidate(): void {}
 
 	public dispose(): void {
-		if (this.refreshInterval !== undefined) {
+		if (this.refreshInterval) {
 			clearInterval(this.refreshInterval);
 		}
 	}
 
 	public handleInput(data: string): void {
+		const snapshot = this.loadSnapshot() ?? this.initialSnapshot;
 		if (data === "\u001b") {
 			this.close();
 			return;
 		}
-		if (this.mode !== "take_over" || this.snapshot.isHistorical) {
+
+		if (!snapshot.isHistorical && data.toLowerCase() === "t") {
+			this.close();
+			queueMicrotask(() => this.actions.open(snapshot.agentId, "take_over"));
 			return;
 		}
 
-		if (data === "\r" || data === "\n") {
-			const message = this.input.trim();
-			if (message.length === 0) {
-				return;
-			}
-			const sendResult = sendTmuxInput(this.runTmuxCommand, this.snapshot.tmuxTarget, message);
-			this.input = "";
-			this.statusMessage = sendResult.ok
-				? "Sent direct input to child. Parent assumptions may go stale until the next explicit child report."
-				: `Failed to send direct input: ${sendResult.error}`;
-			this.refreshViewport();
+		if (!snapshot.isHistorical && this.mode !== "follow" && data.toLowerCase() === "f") {
+			this.close();
+			queueMicrotask(() => this.actions.open(snapshot.agentId, "follow"));
+			return;
+		}
+
+		if (this.mode !== "follow") {
+			return;
+		}
+
+		if (data === "\u001b[A") {
+			this.scrollOffset = Math.min(this.scrollOffset + 1, Math.max(0, this.paneLines.length - 1));
 			this.requestRender();
 			return;
 		}
-
-		if (data === "\u007f" || data === "\b") {
-			this.input = this.input.slice(0, -1);
+		if (data === "\u001b[B") {
+			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
 			this.requestRender();
 			return;
 		}
-
-		if (/^[\t\x20-\x7E]$/.test(data)) {
-			this.input += data;
+		if (data === "\u001b[5~") {
+			this.scrollOffset = Math.min(this.scrollOffset + 8, Math.max(0, this.paneLines.length - 1));
+			this.requestRender();
+			return;
+		}
+		if (data === "\u001b[6~") {
+			this.scrollOffset = Math.max(0, this.scrollOffset - 8);
 			this.requestRender();
 		}
 	}
 
 	public render(width: number): string[] {
-		const contentWidth = Math.max(20, width);
-		const lines = [
-			fitLine(`Subagent ${this.snapshot.agentId} · ${this.snapshot.displayName}`, contentWidth),
-			fitLine(`Mode: ${this.snapshot.isHistorical ? "history" : this.mode} · state=${this.snapshot.state} · availability=${this.snapshot.availability}`, contentWidth),
-			fitLine(
-				`Badges: ${[
-					this.snapshot.isStale ? "stale" : undefined,
-					this.snapshot.isDegraded ? "degraded" : undefined,
-				].filter((value): value is string => value !== undefined).join(", ") || "none"}`,
-				contentWidth,
-			),
+		const snapshot = this.loadSnapshot() ?? this.initialSnapshot;
+		const contentWidth = Math.max(40, width);
+		const header = [
+			fitLine(`Subagent ${snapshot.agentId} · ${snapshot.displayName}`, contentWidth),
+			fitLine(`Mode: ${snapshot.isHistorical ? "history" : this.mode} · state=${snapshot.state} · availability=${snapshot.availability}`, contentWidth),
+			fitLine(`Badges: ${formatSnapshotBadges(snapshot)}`, contentWidth),
 			"",
 		];
 
-		if (this.snapshot.latestSummary) {
-			lines.push(fitLine(`Latest: ${this.snapshot.latestSummary}`, contentWidth));
-		}
-		if (this.snapshot.pendingInputQuestion) {
-			lines.push(fitLine(`Needs input: ${this.snapshot.pendingInputQuestion}`, contentWidth));
-		}
-		if (this.snapshot.finalSummary) {
-			lines.push(fitLine(`Final: ${this.snapshot.finalSummary}`, contentWidth));
-		}
-		if (this.snapshot.errorMessage) {
-			lines.push(fitLine(`Error: ${this.snapshot.errorMessage}`, contentWidth));
-		}
-		if (this.snapshot.note) {
-			lines.push(fitLine(`Note: ${this.snapshot.note}`, contentWidth));
+		if (snapshot.isHistorical || this.mode === "peek") {
+			return [
+				...header,
+				...buildSnapshotSummaryLines(snapshot, contentWidth),
+				"",
+				fitLine(snapshot.isHistorical ? "Esc closes." : "F opens Follow. T starts full Take Over. Esc closes.", contentWidth),
+			];
 		}
 
-		if (!this.snapshot.isHistorical) {
-			lines.push("");
-			lines.push("Child viewport");
-			for (const line of this.paneLines.slice(-(this.mode === "peek" ? 12 : 24))) {
-				lines.push(fitLine(line, contentWidth));
-			}
-			if (this.paneLines.length === 0) {
-				lines.push(fitLine("(no child terminal output yet)", contentWidth));
-			}
-		}
+		const viewportWindow = 28;
+		const maxStart = Math.max(0, this.paneLines.length - viewportWindow);
+		const start = Math.max(0, maxStart - this.scrollOffset);
+		const visiblePaneLines = this.paneLines.slice(start, start + viewportWindow);
+		const leftLines = [
+			"Child terminal",
+			`Showing ${start + 1}-${Math.min(this.paneLines.length, start + viewportWindow)} of ${this.paneLines.length}`,
+			"",
+			...(visiblePaneLines.length > 0 ? visiblePaneLines : ["(no child terminal output yet)"]),
+			"",
+			this.statusMessage ?? "Follow is read-only in phase 1.",
+		].map((line) => fitLine(line, Math.max(20, contentWidth - 33)));
 
-		if (this.statusMessage) {
-			lines.push("");
-			lines.push(fitLine(this.statusMessage, contentWidth));
-		}
+		const rightLines = [
+			...buildSnapshotSummaryLines(snapshot, 30),
+			"",
+			"Keys",
+			"Up/Down scroll",
+			"PgUp/PgDn jump",
+			"T Take Over",
+			"Esc back",
+		];
 
-		lines.push("");
-		if (this.mode === "take_over" && !this.snapshot.isHistorical) {
-			lines.push(fitLine("Take Over: type and press Enter to talk directly to the child. Esc closes.", contentWidth));
-			lines.push(fitLine(`> ${this.input}`, contentWidth));
-		} else {
-			lines.push(fitLine("Esc closes.", contentWidth));
-		}
-
-		return lines;
+		return [...header, ...composeColumns(leftLines, rightLines, contentWidth, 30, 3)];
 	}
 
 	private refreshViewport(): void {
-		if (this.snapshot.isHistorical) {
+		const snapshot = this.loadSnapshot() ?? this.initialSnapshot;
+		if (snapshot.isHistorical || this.mode !== "follow") {
 			this.paneLines = [];
 			return;
 		}
 
-		const captureResult = captureTmuxViewport(this.runTmuxCommand, this.snapshot.tmuxTarget, this.mode === "peek" ? 16 : 40);
+		const captureResult = captureTmuxViewport(this.runTmuxCommand, snapshot.tmuxTarget, 160);
 		if (!captureResult.ok) {
 			this.statusMessage = `Child terminal unavailable: ${captureResult.error}`;
 			this.paneLines = [];
@@ -743,6 +839,96 @@ class SubagentOverlayComponent {
 		if (this.statusMessage?.startsWith("Child terminal unavailable:")) {
 			this.statusMessage = undefined;
 		}
+	}
+}
+
+class SubagentBrowserComponent {
+	public focused = true;
+	private selectedIndex = 0;
+
+	public constructor(
+		private readonly snapshots: ReadonlyArray<SubagentUiSnapshot>,
+		private readonly actions: WorkspaceActions,
+		private readonly requestRender: () => void,
+		private readonly close: () => void,
+	) {}
+
+	public invalidate(): void {}
+	public dispose(): void {}
+
+	public handleInput(data: string): void {
+		if (data === "\u001b") {
+			this.close();
+			return;
+		}
+		if (data === "\u001b[A") {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.requestRender();
+			return;
+		}
+		if (data === "\u001b[B") {
+			this.selectedIndex = Math.min(this.snapshots.length - 1, this.selectedIndex + 1);
+			this.requestRender();
+			return;
+		}
+
+		const selected = this.snapshots[this.selectedIndex];
+		if (!selected) {
+			return;
+		}
+
+		if (data === "\r" || data === "\n") {
+			this.close();
+			queueMicrotask(() => this.actions.open(selected.agentId, "peek"));
+			return;
+		}
+		if (!selected.isHistorical && data.toLowerCase() === "f") {
+			this.close();
+			queueMicrotask(() => this.actions.open(selected.agentId, "follow"));
+			return;
+		}
+		if (!selected.isHistorical && data.toLowerCase() === "t") {
+			this.close();
+			queueMicrotask(() => this.actions.open(selected.agentId, "take_over"));
+		}
+	}
+
+	public render(width: number): string[] {
+		const lines = [
+			fitLine("Subagent Browser", width),
+			fitLine("Enter Peek · F Follow · T Take Over · Esc close", width),
+			"",
+		];
+
+		if (this.snapshots.length === 0) {
+			lines.push("No subagents in this session.");
+			return lines;
+		}
+
+		const live = this.snapshots.filter((snapshot) => !snapshot.isHistorical);
+		const history = this.snapshots.filter((snapshot) => snapshot.isHistorical);
+		let rowIndex = 0;
+
+		if (live.length > 0) {
+			lines.push("Live");
+			for (const snapshot of live) {
+				const prefix = rowIndex === this.selectedIndex ? ">" : " ";
+				lines.push(fitLine(`${prefix} ${snapshot.displayName} · ${snapshot.agentId} · ${snapshot.state} · ${formatSnapshotBadges(snapshot)}`, width));
+				rowIndex += 1;
+			}
+			lines.push("");
+		}
+
+		if (history.length > 0) {
+			lines.push("History");
+			for (const snapshot of history) {
+				const prefix = rowIndex === this.selectedIndex ? ">" : " ";
+				lines.push(fitLine(`${prefix} ${snapshot.displayName} · ${snapshot.agentId} · ${snapshot.state}`, width));
+				rowIndex += 1;
+			}
+		}
+
+		return lines;
 	}
 }
 
@@ -929,6 +1115,7 @@ function ensureCurrentState(
 		currentState.cwd = ctx.cwd;
 		currentState.busy = !ctx.isIdle();
 		currentState.lastUiContext = ctx;
+		ensureBrowserShortcut(ctx, currentState, options.runTmuxCommand);
 		renderWidget(currentState.lastUiContext, currentState.uiState);
 		return ok(currentState);
 	}
@@ -999,8 +1186,8 @@ function buildSpawnText(
 		`Type: ${displayName} (${record.type})`,
 		`State: ${record.state}`,
 		`Open availability: ${focusTarget?.availability === "stopped" ? "history" : focusTarget?.availability ?? "unknown"}`,
-		"Use the Subagent tool with action=list, open, send, or interrupt to keep interacting from the parent session.",
-		`Use /subagents list or /subagents open ${record.id} [peek|follow|take_over] in the TUI.`,
+		"Use the Subagent tool with action=open, send, or interrupt to keep interacting from the parent session.",
+		"Use /subagents or Alt+A to open the subagent browser in the TUI.",
 	].join("\n");
 }
 
@@ -1163,9 +1350,65 @@ function normalizeSubagentsCommandArgs(args: string): string {
 	return remainder.startsWith(" ") ? remainder.trimStart() : trimmed;
 }
 
-function openSubagentView(
+function openSubagentTakeOver(
 	ctx: ExtensionContextLike,
 	snapshot: SubagentUiSnapshot,
+): ValidationOutcome<string> {
+	if (!ctx.hasUI || !ctx.ui.custom) {
+		return fail("Native subagent open requires the interactive TUI.");
+	}
+	if (snapshot.isHistorical) {
+		return fail("Take Over is only available for live children.");
+	}
+
+	void ctx.ui.custom<void>(
+		(tui, _theme, _keybindings, done) => {
+			const sessionName = extractTmuxSessionName(snapshot.tmuxTarget);
+			const configPath = path.join(os.tmpdir(), `pi-nexus-takeover-${process.pid}-${Date.now()}.tmux.conf`);
+			fs.writeFileSync(
+				configPath,
+				[
+					"set-option -g status off",
+					"set-option -g prefix None",
+					"unbind-key C-b",
+					"bind-key -n C-] detach-client",
+				].join("\n"),
+				"utf8",
+			);
+
+			tui.stop?.();
+			process.stdout.write("\x1b[2J\x1b[H");
+			try {
+				childProcess.spawnSync("tmux", ["-f", configPath, "attach-session", "-t", sessionName], {
+					stdio: "inherit",
+					env: process.env,
+				});
+			} finally {
+				fs.rmSync(configPath, { force: true });
+				tui.start?.();
+				tui.requestRender(true);
+				done(undefined);
+			}
+
+			return {
+				render: () => [],
+				invalidate() {},
+			};
+		},
+		{
+			screen: true,
+		},
+	).catch((error) => {
+		ctx.ui.notify(`Failed to start Take Over: ${normalizeError(error).message}`, "error");
+	});
+
+	return ok(`Entered Take Over for ${snapshot.agentId}. Press Ctrl+] to return to pi.`);
+}
+
+function openSubagentView(
+	ctx: ExtensionContextLike,
+	state: ParentSessionState,
+	agentId: string,
 	mode: SubagentOpenMode,
 	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
 ): ValidationOutcome<string> {
@@ -1173,23 +1416,41 @@ function openSubagentView(
 		return fail("Native subagent open requires the interactive TUI.");
 	}
 
+	const loadSnapshot = () => findSnapshot(state, agentId);
+	const snapshot = loadSnapshot();
+	if (!snapshot) {
+		return fail(`Unknown subagent: ${agentId}`);
+	}
+	if (mode === "take_over") {
+		return openSubagentTakeOver(ctx, snapshot);
+	}
+
 	const effectiveMode = snapshot.isHistorical ? "peek" : mode;
 	void ctx.ui.custom<void>(
 		(tui, _theme, _keybindings, done) =>
-			new SubagentOverlayComponent(
+			new SubagentWorkspaceComponent(
+				loadSnapshot,
 				snapshot,
 				effectiveMode,
 				runTmuxCommand,
 				() => tui.requestRender(),
 				() => done(undefined),
+				{
+					open: (nextAgentId, nextMode) => {
+						const nextSnapshot = findSnapshot(state, nextAgentId);
+						if (!nextSnapshot) {
+							ctx.ui.notify(`Unknown subagent: ${nextAgentId}`, "error");
+							return;
+						}
+						const result = openSubagentView(ctx, state, nextAgentId, nextMode, runTmuxCommand);
+						if (!result.ok) {
+							ctx.ui.notify(result.error, "error");
+						}
+					},
+				},
 			),
 		{
-			overlay: true,
-			overlayOptions: {
-				width: "80%",
-				maxHeight: "80%",
-				anchor: "center",
-			},
+			screen: true,
 		},
 	).catch((error) => {
 		ctx.ui.notify(`Failed to open subagent view: ${normalizeError(error).message}`, "error");
@@ -1197,9 +1458,38 @@ function openSubagentView(
 
 	return ok(
 		snapshot.isHistorical
-			? `Opened ${snapshot.agentId} historical detail view.`
-			: `Opened ${snapshot.agentId} in ${effectiveMode} mode.`,
+			? `Opened ${snapshot.agentId} history detail.`
+			: mode === "follow"
+				? `Opened ${snapshot.agentId} in Follow.`
+				: `Opened ${snapshot.agentId} in Peek.`,
 	);
+}
+
+function openSubagentBrowser(
+	ctx: ExtensionContextLike,
+	state: ParentSessionState,
+	runTmuxCommand: (args: string[]) => ValidationOutcome<string>,
+): ValidationOutcome<string> {
+	if (!ctx.hasUI || !ctx.ui.custom) {
+		return fail("Subagent browser requires the interactive TUI.");
+	}
+
+	void ctx.ui.custom<void>(
+		(tui, _theme, _keybindings, done) =>
+			new SubagentBrowserComponent(state.uiState.agents, {
+				open: (agentId, mode) => {
+					const result = openSubagentView(ctx, state, agentId, mode, runTmuxCommand);
+					if (!result.ok) {
+						ctx.ui.notify(result.error, "error");
+					}
+				},
+			}, () => tui.requestRender(), () => done(undefined)),
+		{ screen: true },
+	).catch((error) => {
+		ctx.ui.notify(`Failed to open subagent browser: ${normalizeError(error).message}`, "error");
+	});
+
+	return ok("Opened subagent browser.");
 }
 
 function buildOpenToolResult(
@@ -1214,7 +1504,7 @@ function buildOpenToolResult(
 		return textResult(`Unknown subagent: ${agentId}`);
 	}
 
-	const openResult = openSubagentView(ctx, snapshot, mode, effectiveOptions.runTmuxCommand);
+	const openResult = openSubagentView(ctx, state, agentId, mode, effectiveOptions.runTmuxCommand);
 	if (!openResult.ok) {
 		return textResult(openResult.error, {
 			action: "open",
@@ -1252,6 +1542,8 @@ function shutdownParentSession(
 		killTmuxSession(runTmuxCommand, runtime.sessionName);
 	}
 	state.ownedTmuxRuntimes.clear();
+	state.terminalInputUnsubscribe?.();
+	state.terminalInputUnsubscribe = undefined;
 	syncUiState(pi, state, now());
 }
 
@@ -1286,6 +1578,7 @@ export function installParentExtension(
 		}
 		activeState = stateResult.value;
 		activeState.lastUiContext = ctx;
+		ensureBrowserShortcut(ctx, activeState, effectiveOptions.runTmuxCommand);
 		renderWidget(ctx, activeState.uiState);
 	});
 
@@ -1393,7 +1686,7 @@ export function installParentExtension(
 	});
 
 	pi.registerCommand("subagents", {
-		description: "List subagents, open native child views, or send follow-ups.",
+		description: "Open the subagent browser, inspect child views, or send follow-ups.",
 		getArgumentCompletions: (argumentPrefix) => {
 			const trimmed = argumentPrefix.trimStart();
 			if (trimmed.length === 0) {
@@ -1472,7 +1765,17 @@ export function installParentExtension(
 			const trimmed = normalizeSubagentsCommandArgs(args);
 			const [command, ...rest] = trimmed.split(/\s+/).filter((entry) => entry.length > 0);
 
-			if (!command || command === "list") {
+			if (!command) {
+				const browserResult = openSubagentBrowser(ctx, state, effectiveOptions.runTmuxCommand);
+				if (!browserResult.ok) {
+					sendSessionMessage(pi, "pi-nexus-subagents-output", browserResult.error, {
+						command: "browse",
+					});
+				}
+				return;
+			}
+
+			if (command === "list") {
 				sendSessionMessage(pi, "pi-nexus-subagents-output", formatListText(state), {
 					command: "list",
 				});
@@ -1509,7 +1812,7 @@ export function installParentExtension(
 					return;
 				}
 
-				const openResult = openSubagentView(ctx, snapshot, modeResult.value, effectiveOptions.runTmuxCommand);
+				const openResult = openSubagentView(ctx, state, agentId, modeResult.value, effectiveOptions.runTmuxCommand);
 				if (!openResult.ok) {
 					sendSessionMessage(pi, "pi-nexus-subagents-output", openResult.error, {
 						command: "open",
@@ -1563,7 +1866,7 @@ export function installParentExtension(
 			sendSessionMessage(
 				pi,
 				"pi-nexus-subagents-output",
-				"Usage:\n/subagents list\n/subagents open <agentId> [peek|follow|take_over]\n/subagents send <agentId> <message>",
+				"Usage:\n/subagents\n/subagents list\n/subagents open <agentId> [peek|follow|take_over]\n/subagents send <agentId> <message>",
 				{ command: "usage" },
 			);
 		},

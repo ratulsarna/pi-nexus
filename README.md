@@ -19,6 +19,7 @@ Today, the real v1 user path is available:
 - load the parent extension into `pi`
 - ask the main agent to call the `Subagent` tool with `action: "spawn"` to start a named subagent
 - let the main agent continue interacting with live children through the `Subagent` tool
+- open the native subagent browser with `/subagents` or `Alt+A`
 - list live subagents with `/subagents list`
 - open native child views with `/subagents open <agentId> [peek|follow|take_over]`
 - send structured follow-ups with `/subagents send <agentId> <message>`
@@ -37,10 +38,11 @@ If you want to try the current implementation from this repo, the practical path
    or copy/link it into `~/.pi/agent/extensions/`
 4. Start `pi`
 5. Ask the main agent to use the `Subagent` tool with `action: "spawn"` and a named type such as `general-purpose`, `Explore`, or `Plan`
-6. Let the main agent use the `Subagent` tool with `action: "list"`, `"open"`, `"send"`, or `"interrupt"` for structured parent-child control
-7. Run `/subagents list`
-8. Run `/subagents send <agentId> <message>` when you want to nudge a live child yourself through the supported sidecar channel
-9. Run `/subagents open <agentId>` to peek at the child, `/subagents open <agentId> follow` to keep watching it live, or `/subagents open <agentId> take_over` to chat directly with it from the TUI
+6. Let the main agent use the `Subagent` tool with `action: "open"`, `"send"`, or `"interrupt"` for structured parent-child control
+7. Open the native browser with `/subagents` or `Alt+A`
+8. Use `Enter` for `Peek`, `f` for `Follow`, and `t` for `Take Over`
+9. Run `/subagents send <agentId> <message>` when you want to nudge a live child yourself through the supported sidecar channel
+10. Use `/subagents open <agentId> [peek|follow|take_over]` only as a compatibility path; the browser is the primary UX
 
 This is the real first-user path, not just a repo-internal harness.
 
@@ -50,6 +52,7 @@ Prerequisites:
 
 The extension adds these user-facing surfaces:
 - `Subagent` tool
+- `/subagents` browser
 - `/subagents list`
 - `/subagents open <agentId> [peek|follow|take_over]`
 - `/subagents send <agentId> <message>`

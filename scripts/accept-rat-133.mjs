@@ -312,7 +312,7 @@ async function main() {
 		);
 		await waitForPaneText(mainPaneTarget, `Subagent ${agentId}`, 30_000);
 		await waitForPaneText(mainPaneTarget, "Mode: follow", 30_000);
-		log("verified native open overlay rendered");
+		log("verified native Follow screen rendered");
 		run("tmux", ["send-keys", "-t", mainPaneTarget, "Escape"]);
 		await sleep(500);
 
