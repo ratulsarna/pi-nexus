@@ -5,10 +5,11 @@ import path from "node:path";
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createTmuxCommandRunner, installParentExtension } from "../src/parent-extension.js";
+import { __testing, createTmuxCommandRunner, installParentExtension } from "../src/parent-extension.js";
 import type {
 	RuntimeLaunchSpec,
 	SidecarControlMessage,
+	SubagentUiSnapshot,
 	ValidationOutcome,
 } from "../src/contracts.js";
 import type {
@@ -301,6 +302,36 @@ function getRegisteredCommand(pi: FakePiApi, name: string): {
 	};
 }
 
+function makeUiSnapshot(overrides: Partial<SubagentUiSnapshot> = {}): SubagentUiSnapshot {
+	return {
+		agentId: "agt_test",
+		displayName: "Researcher",
+		type: "Researcher",
+		description: "Review the current repo state",
+		state: "running",
+		availability: "live",
+		tmuxMode: "window",
+		tmuxTarget: "pnx_test:child",
+		sessionPath: "/tmp/agt_test/session.jsonl",
+		startedAt: "2026-03-13T12:00:00.000Z",
+		endedAt: undefined,
+		latestSummary: undefined,
+		pendingInputQuestion: undefined,
+		finalSummary: undefined,
+		errorMessage: undefined,
+		note: undefined,
+		isStale: false,
+		isDegraded: false,
+		isHistorical: false,
+		canOpenPeek: true,
+		canOpenFollow: true,
+		canOpenTakeOver: true,
+		canSend: true,
+		canInterrupt: true,
+		...overrides,
+	};
+}
+
 let originalPath: string | undefined;
 let fakeBinDir = os.tmpdir();
 let fakeHomeDir = os.tmpdir();
@@ -410,7 +441,9 @@ Research the codebase carefully and report findings.`,
 
 		await command.handler(`open ${agentId} follow`, ctx);
 		expect(ctx.customCalls).toHaveLength(1);
-		expect(ctx.customCalls[0]?.options).toMatchObject({ screen: true });
+		expect(ctx.customCalls[0]?.options).toMatchObject({
+			screen: true,
+		});
 		expect(ctx.notifications.at(-1)?.message).toContain(`Opened ${agentId} in Follow.`);
 		expect(pi.appendedEntries.at(-1)?.customType).toBe("pi-nexus-ui-state");
 
@@ -799,6 +832,95 @@ Research the codebase carefully and report findings.`,
 		]));
 		expect(ctx.widgetUpdates.at(-1)?.content).not.toEqual(expect.arrayContaining([
 			"    latest: Almost there",
+		]));
+	});
+
+	it("renders historical browser rows with history and degraded badges", () => {
+		const lines = __testing.renderBrowserLines([
+			makeUiSnapshot({
+				agentId: "agt_live",
+				displayName: "Live child",
+				latestSummary: "Streaming output",
+			}),
+			makeUiSnapshot({
+				agentId: "agt_hist",
+				displayName: "Historical child",
+				state: "failed",
+				availability: "history",
+				isHistorical: true,
+				isDegraded: true,
+				errorMessage: "socket closed before completion",
+				endedAt: "2026-03-13T12:01:30.000Z",
+				canOpenFollow: false,
+				canOpenTakeOver: false,
+				canSend: false,
+				canInterrupt: false,
+			}),
+		], 1, 120, "2026-03-13T12:02:00.000Z");
+
+		expect(lines).toEqual(expect.arrayContaining([
+			"History (1)",
+			expect.stringContaining("> Historical child · agt_hist"),
+			expect.stringContaining("state=failed · history, degraded, error · 1m 30s"),
+			expect.stringContaining("socket closed before completion"),
+		]));
+	});
+
+	it("renders workspace summary lines with description, elapsed time, and error priority", () => {
+		const lines = __testing.buildSnapshotSummaryLines(
+			makeUiSnapshot({
+				displayName: "Planner",
+				agentId: "agt_summary",
+				availability: "history",
+				errorMessage: "Lost tmux pane",
+				latestSummary: "Still working",
+				finalSummary: "Would have been done",
+				isHistorical: true,
+				endedAt: "2026-03-13T12:01:15.000Z",
+				canOpenFollow: false,
+				canOpenTakeOver: false,
+				canSend: false,
+				canInterrupt: false,
+			}),
+			80,
+		);
+
+		expect(lines).toEqual(expect.arrayContaining([
+			"Planner · agt_summary",
+			expect.stringContaining("badges=history, error"),
+			expect.stringContaining("Description: Review the current repo state"),
+			expect.stringContaining("Elapsed: 1m 15s"),
+			"Error",
+			expect.stringContaining("Lost tmux pane"),
+			"Latest",
+			expect.stringContaining("Still working"),
+			"Final",
+			expect.stringContaining("Would have been done"),
+		]));
+		expect(lines.indexOf("Error")).toBeLessThan(lines.indexOf("Latest"));
+	});
+
+	it("renders workspace follow output with the acceptance header and live terminal framing", () => {
+		const lines = __testing.renderWorkspaceLines(
+			makeUiSnapshot({
+				agentId: "agt_follow",
+				displayName: "General",
+				latestSummary: "RAT133 child started",
+			}),
+			"follow",
+			["child line 1", "child line 2"],
+			0,
+			undefined,
+			100,
+			"2026-03-13T12:00:30.000Z",
+		);
+
+		expect(lines).toEqual(expect.arrayContaining([
+			expect.stringContaining("Subagent agt_follow"),
+			expect.stringContaining("Mode: follow"),
+			expect.stringContaining("Live child terminal"),
+			expect.stringContaining("Follow is read-only in phase 1."),
+			expect.stringContaining("RAT133 child started"),
 		]));
 	});
 
