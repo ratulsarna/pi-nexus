@@ -729,11 +729,16 @@ function sendTmuxInput(
 }
 
 function formatSnapshotBadges(snapshot: SubagentUiSnapshot): string {
+	return listSnapshotBadges(snapshot).join(", ") || "none";
+}
+
+function listSnapshotBadges(snapshot: SubagentUiSnapshot): string[] {
 	return [
+		snapshot.isHistorical ? "history" : undefined,
 		snapshot.isStale ? "stale" : undefined,
 		snapshot.isDegraded ? "degraded" : undefined,
 		snapshot.errorMessage ? "error" : undefined,
-	].filter((value): value is string => value !== undefined).join(", ") || "none";
+	].filter((value): value is string => value !== undefined);
 }
 
 function padLine(value: string, width: number): string {
@@ -766,25 +771,33 @@ function buildSnapshotSummaryLines(snapshot: SubagentUiSnapshot, width: number):
 		fitLine(`state=${snapshot.state} · availability=${snapshot.availability} · badges=${formatSnapshotBadges(snapshot)}`, width),
 	];
 
-	if (snapshot.latestSummary) {
+	if (snapshot.description) {
+		lines.push(fitLine(`Description: ${snapshot.description}`, width));
+	}
+	const elapsed = formatElapsedTime(snapshot.startedAt, snapshot.endedAt, new Date().toISOString());
+	if (elapsed) {
+		lines.push(fitLine(`Elapsed: ${elapsed}`, width));
+	}
+
+	if (snapshot.errorMessage) {
 		lines.push("");
-		lines.push("Latest");
-		lines.push(fitLine(snapshot.latestSummary, width));
+		lines.push("Error");
+		lines.push(fitLine(snapshot.errorMessage, width));
 	}
 	if (snapshot.pendingInputQuestion) {
 		lines.push("");
 		lines.push("Needs input");
 		lines.push(fitLine(snapshot.pendingInputQuestion, width));
 	}
+	if (snapshot.latestSummary) {
+		lines.push("");
+		lines.push("Latest");
+		lines.push(fitLine(snapshot.latestSummary, width));
+	}
 	if (snapshot.finalSummary) {
 		lines.push("");
 		lines.push("Final");
 		lines.push(fitLine(snapshot.finalSummary, width));
-	}
-	if (snapshot.errorMessage) {
-		lines.push("");
-		lines.push("Error");
-		lines.push(fitLine(snapshot.errorMessage, width));
 	}
 	if (snapshot.note) {
 		lines.push("");
@@ -793,6 +806,62 @@ function buildSnapshotSummaryLines(snapshot: SubagentUiSnapshot, width: number):
 	}
 
 	return lines;
+}
+
+function renderWorkspaceLines(
+	snapshot: SubagentUiSnapshot,
+	mode: "peek" | "follow",
+	paneLines: ReadonlyArray<string>,
+	scrollOffset: number,
+	statusMessage: string | undefined,
+	width: number,
+	referenceTime: string,
+): string[] {
+	const contentWidth = Math.max(40, width);
+	const elapsed = formatElapsedTime(snapshot.startedAt, snapshot.endedAt, referenceTime);
+	const header = [
+		fitLine(`Subagent ${snapshot.agentId} · ${snapshot.displayName}`, contentWidth),
+		fitLine(`Workspace · ${snapshot.isHistorical ? "history" : mode}`, contentWidth),
+		fitLine(`Mode: ${snapshot.isHistorical ? "history" : mode} · state=${snapshot.state} · availability=${snapshot.availability}`, contentWidth),
+		fitLine(`Badges: ${formatSnapshotBadges(snapshot)}${elapsed ? ` · elapsed=${elapsed}` : ""}`, contentWidth),
+		"",
+	];
+
+	if (snapshot.isHistorical || mode === "peek") {
+		return [
+			...header,
+			fitLine(snapshot.isHistorical ? "Historical detail" : "Peek is summary-first and read-only.", contentWidth),
+			"",
+			...buildSnapshotSummaryLines(snapshot, contentWidth),
+			"",
+			fitLine(snapshot.isHistorical ? "Esc closes." : "F Follow · T Take Over · Esc back", contentWidth),
+		];
+	}
+
+	const viewportWindow = 28;
+	const maxStart = Math.max(0, paneLines.length - viewportWindow);
+	const start = Math.max(0, maxStart - scrollOffset);
+	const visiblePaneLines = paneLines.slice(start, start + viewportWindow);
+	const leftLines = [
+		"Live child terminal",
+		`Showing ${start + 1}-${Math.min(paneLines.length, start + viewportWindow)} of ${paneLines.length}`,
+		"",
+		...(visiblePaneLines.length > 0 ? visiblePaneLines : ["(no child terminal output yet)"]),
+		"",
+		statusMessage ?? "Follow is read-only in phase 1.",
+	].map((line) => fitLine(line, Math.max(20, contentWidth - 33)));
+
+	const rightLines = [
+		...buildSnapshotSummaryLines(snapshot, 30),
+		"",
+		"Keys",
+		"Up/Down scroll",
+		"PgUp/PgDn jump",
+		"T Take Over",
+		"Esc back",
+	];
+
+	return [...header, ...composeColumns(leftLines, rightLines, contentWidth, 30, 3)];
 }
 
 function extractTmuxSessionName(tmuxTarget: string): string {
@@ -884,47 +953,15 @@ class SubagentWorkspaceComponent {
 
 	public render(width: number): string[] {
 		const snapshot = this.loadSnapshot() ?? this.initialSnapshot;
-		const contentWidth = Math.max(40, width);
-		const header = [
-			fitLine(`Subagent ${snapshot.agentId} · ${snapshot.displayName}`, contentWidth),
-			fitLine(`Mode: ${snapshot.isHistorical ? "history" : this.mode} · state=${snapshot.state} · availability=${snapshot.availability}`, contentWidth),
-			fitLine(`Badges: ${formatSnapshotBadges(snapshot)}`, contentWidth),
-			"",
-		];
-
-		if (snapshot.isHistorical || this.mode === "peek") {
-			return [
-				...header,
-				...buildSnapshotSummaryLines(snapshot, contentWidth),
-				"",
-				fitLine(snapshot.isHistorical ? "Esc closes." : "F opens Follow. T starts full Take Over. Esc closes.", contentWidth),
-			];
-		}
-
-		const viewportWindow = 28;
-		const maxStart = Math.max(0, this.paneLines.length - viewportWindow);
-		const start = Math.max(0, maxStart - this.scrollOffset);
-		const visiblePaneLines = this.paneLines.slice(start, start + viewportWindow);
-		const leftLines = [
-			"Child terminal",
-			`Showing ${start + 1}-${Math.min(this.paneLines.length, start + viewportWindow)} of ${this.paneLines.length}`,
-			"",
-			...(visiblePaneLines.length > 0 ? visiblePaneLines : ["(no child terminal output yet)"]),
-			"",
-			this.statusMessage ?? "Follow is read-only in phase 1.",
-		].map((line) => fitLine(line, Math.max(20, contentWidth - 33)));
-
-		const rightLines = [
-			...buildSnapshotSummaryLines(snapshot, 30),
-			"",
-			"Keys",
-			"Up/Down scroll",
-			"PgUp/PgDn jump",
-			"T Take Over",
-			"Esc back",
-		];
-
-		return [...header, ...composeColumns(leftLines, rightLines, contentWidth, 30, 3)];
+		return renderWorkspaceLines(
+			snapshot,
+			this.mode,
+			this.paneLines,
+			this.scrollOffset,
+			this.statusMessage,
+			width,
+			new Date().toISOString(),
+		);
 	}
 
 	private refreshViewport(): void {
@@ -1000,42 +1037,65 @@ class SubagentBrowserComponent {
 	}
 
 	public render(width: number): string[] {
-		const lines = [
-			fitLine("Subagent Browser", width),
-			fitLine("Enter Peek · F Follow · T Take Over · Esc close", width),
-			"",
-		];
+		return renderBrowserLines(this.snapshots, this.selectedIndex, width, new Date().toISOString());
+	}
+}
 
-		if (this.snapshots.length === 0) {
-			lines.push("No subagents in this session.");
-			return lines;
-		}
+function renderBrowserLines(
+	snapshots: ReadonlyArray<SubagentUiSnapshot>,
+	selectedIndex: number,
+	width: number,
+	referenceTime: string,
+): string[] {
+	const lines = [
+		fitLine("Subagent Browser", width),
+		fitLine("Enter Peek · F Follow · T Take Over · Esc close", width),
+		"",
+	];
 
-		const live = this.snapshots.filter((snapshot) => !snapshot.isHistorical);
-		const history = this.snapshots.filter((snapshot) => snapshot.isHistorical);
-		let rowIndex = 0;
-
-		if (live.length > 0) {
-			lines.push("Live");
-			for (const snapshot of live) {
-				const prefix = rowIndex === this.selectedIndex ? ">" : " ";
-				lines.push(fitLine(`${prefix} ${snapshot.displayName} · ${snapshot.agentId} · ${snapshot.state} · ${formatSnapshotBadges(snapshot)}`, width));
-				rowIndex += 1;
-			}
-			lines.push("");
-		}
-
-		if (history.length > 0) {
-			lines.push("History");
-			for (const snapshot of history) {
-				const prefix = rowIndex === this.selectedIndex ? ">" : " ";
-				lines.push(fitLine(`${prefix} ${snapshot.displayName} · ${snapshot.agentId} · ${snapshot.state}`, width));
-				rowIndex += 1;
-			}
-		}
-
+	if (snapshots.length === 0) {
+		lines.push("No subagents in this session.");
 		return lines;
 	}
+
+	const live = snapshots.filter((snapshot) => !snapshot.isHistorical);
+	const history = snapshots.filter((snapshot) => snapshot.isHistorical);
+	let rowIndex = 0;
+
+	if (live.length > 0) {
+		lines.push(`Live (${live.length})`);
+		for (const snapshot of live) {
+			const prefix = rowIndex === selectedIndex ? ">" : " ";
+			const elapsed = formatElapsedTime(snapshot.startedAt, snapshot.endedAt, referenceTime);
+			const badges = listSnapshotBadges(snapshot).join(", ") || "live";
+			lines.push(fitLine(`${prefix} ${snapshot.displayName} · ${snapshot.agentId}`, width));
+			lines.push(fitLine(`  state=${snapshot.state} · ${badges}${elapsed ? ` · ${elapsed}` : ""}`, width));
+			const summary = summarizeWidgetSnapshot(snapshot) ?? snapshot.note;
+			if (summary) {
+				lines.push(fitLine(`  ${summary}`, width));
+			}
+			rowIndex += 1;
+		}
+		lines.push("");
+	}
+
+	if (history.length > 0) {
+		lines.push(`History (${history.length})`);
+		for (const snapshot of history) {
+			const prefix = rowIndex === selectedIndex ? ">" : " ";
+			const elapsed = formatElapsedTime(snapshot.startedAt, snapshot.endedAt, referenceTime);
+			const badges = listSnapshotBadges(snapshot).join(", ") || "history";
+			lines.push(fitLine(`${prefix} ${snapshot.displayName} · ${snapshot.agentId}`, width));
+			lines.push(fitLine(`  state=${snapshot.state} · ${badges}${elapsed ? ` · ${elapsed}` : ""}`, width));
+			const summary = summarizeWidgetSnapshot(snapshot) ?? snapshot.note;
+			if (summary) {
+				lines.push(fitLine(`  ${summary}`, width));
+			}
+			rowIndex += 1;
+		}
+	}
+
+	return lines;
 }
 
 function sendSessionMessage(
@@ -1592,7 +1652,9 @@ function openSubagentBrowser(
 					}
 				},
 			}, () => tui.requestRender(), () => done(undefined)),
-		{ screen: true },
+		{
+			screen: true,
+		},
 	).catch((error) => {
 		ctx.ui.notify(`Failed to open subagent browser: ${normalizeError(error).message}`, "error");
 	});
@@ -2014,6 +2076,12 @@ export function installParentExtension(
 		},
 	});
 }
+
+export const __testing = {
+	buildSnapshotSummaryLines,
+	renderBrowserLines,
+	renderWorkspaceLines,
+};
 
 export default function parentExtension(pi: ExtensionApiLike): void {
 	installParentExtension(pi);
